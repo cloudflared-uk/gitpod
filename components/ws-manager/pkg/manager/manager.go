@@ -380,7 +380,7 @@ func (m *Manager) StartWorkspace(ctx context.Context, req *api.StartWorkspaceReq
 	// if we reach this point the pod is created
 	err = wait.PollImmediateWithContext(ctx, 100*time.Millisecond, 7*time.Minute, podRunning(m.Clientset, pod.Name, pod.Namespace))
 	if err != nil {
-		clog.WithError(err).WithField("pod", pod.Name).Warn("workspace pod did not transition to running state")
+		clog.WithError(err).WithField("pod", pod.Name).WithField("phase", pod.Status.Phase).Warn("workspace pod did not transition to running state")
 		if err == wait.ErrWaitTimeout && isPodUnschedulable(m.Clientset, pod.Name, pod.Namespace) {
 			// this could be an error due to a scale-up event
 			// delete the PVC object if present
@@ -401,9 +401,12 @@ func (m *Manager) StartWorkspace(ctx context.Context, req *api.StartWorkspaceReq
 			ctx := context.Background()
 			remainingTime := startWorkspaceTimeout - time.Since(startWorkspaceTime)
 			ctx = context.WithValue(ctx, ctxKeyRemainingTime{}, remainingTime)
+
+			span.LogKV("event", "retry starting a workspace")
 			return m.StartWorkspace(ctx, req)
 		}
 
+		clog.WithError(err).WithField("pod", pod.Name).Error("workspace pod never reached Running state")
 		return nil, xerrors.Errorf("workspace pod never reached Running state: %w", err)
 	}
 
@@ -890,6 +893,7 @@ func (m *Manager) deleteWorkspacePVC(ctx context.Context, pvcName string) error 
 	return nil
 }
 
+//nolint:unused
 func (m *Manager) deleteWorkspaceSecrets(ctx context.Context, podName string) error {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -1520,33 +1524,62 @@ func (m *Manager) connectToWorkspaceDaemon(ctx context.Context, wso workspaceObj
 		return nil, xerrors.Errorf("workspace without a valid node name")
 	}
 
-	var podList corev1.PodList
-	err = m.Clientset.List(ctx, &podList,
-		&client.ListOptions{
-			Namespace: m.Config.Namespace,
-			LabelSelector: labels.SelectorFromSet(labels.Set{
-				"component": "ws-daemon",
-				"app":       "gitpod",
-			}),
-		},
-	)
-	if err != nil {
-		return nil, xerrors.Errorf("unexpected error searching for Gitpod ws-daemon pod: %w", err)
-	}
-
 	// find the ws-daemon on this node
-	var hostIP string
-	for _, pod := range podList.Items {
-		if pod.Spec.NodeName == nodeName {
-			hostIP = pod.Status.PodIP
+	var podIP string
+
+	waitErr := wait.PollImmediate(1*time.Second, 1*time.Minute, func() (bool, error) {
+		var podList corev1.PodList
+		err := m.Clientset.List(ctx, &podList,
+			&client.ListOptions{
+				Namespace: m.Config.Namespace,
+				LabelSelector: labels.SelectorFromSet(labels.Set{
+					"component": "ws-daemon",
+					"app":       "gitpod",
+				}),
+			},
+		)
+		if err != nil {
+			log.WithFields(wso.GetOWI()).WithError(err).Warn("cannot connect to Gitpod ws-daemon")
+			return false, xerrors.Errorf("cannot connect to Gitpod ws-daemon")
+		}
+
+		for _, pod := range podList.Items {
+			if pod.Spec.NodeName != nodeName {
+				continue
+			}
+
+			var isReady bool
+			for _, cond := range pod.Status.Conditions {
+				if cond.Type == corev1.PodReady {
+					isReady = cond.Status == corev1.ConditionTrue
+					break
+				}
+			}
+			if !isReady {
+				return false, nil
+			}
+
+			podIP = pod.Status.PodIP
 			break
 		}
+
+		if podIP == "" {
+			return false, nil
+		}
+
+		return true, nil
+	})
+	if waitErr == wait.ErrWaitTimeout {
+		return nil, xerrors.Errorf("timed out attempting to connect to Gitpod ws-daemon")
+	} else if waitErr != nil {
+		log.WithFields(wso.GetOWI()).WithError(waitErr).Warn("cannot connect to Gitpod ws-daemon")
+		return nil, xerrors.Errorf("cannot connect to Gitpod ws-daemon")
 	}
 
-	if hostIP == "" {
+	if podIP == "" {
 		return nil, xerrors.Errorf("no running ws-daemon pod found")
 	}
-	conn, err := m.wsdaemonPool.Get(hostIP)
+	conn, err := m.wsdaemonPool.Get(podIP)
 	if err != nil {
 		return nil, xerrors.Errorf("unexpected error creating connection to Gitpod ws-daemon: %w", err)
 	}
@@ -1554,6 +1587,7 @@ func (m *Manager) connectToWorkspaceDaemon(ctx context.Context, wso workspaceObj
 	return wsdaemon.NewWorkspaceContentServiceClient(conn), nil
 }
 
+//nolint:unused
 func (m *Manager) createWorkspaceSnapshotFromPVC(ctx context.Context, pvcName string, pvcVolumeSnapshotName string, pvcVolumeSnapshotClassName string, workspaceID string, labels map[string]string) error {
 	// create snapshot object out of PVC
 	volumeSnapshot := &volumesnapshotv1.VolumeSnapshot{
@@ -1579,6 +1613,7 @@ func (m *Manager) createWorkspaceSnapshotFromPVC(ctx context.Context, pvcName st
 	return nil
 }
 
+//nolint:unused
 func (m *Manager) waitForWorkspaceVolumeSnapshotReady(ctx context.Context, pvcVolumeSnapshotName string, log *logrus.Entry) (pvcVolumeSnapshotContentName string, readyVolumeSnapshot bool, err error) {
 	log = log.WithField("VolumeSnapshot.Name", pvcVolumeSnapshotName)
 

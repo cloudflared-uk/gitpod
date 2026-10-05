@@ -4,20 +4,18 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useContext, useEffect, useState } from "react";
-import { useHistory } from "react-router-dom";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamsToProtocol, publicApiTeamToProtocol, teamsService } from "../service/public-api";
-import { getGitpodService } from "../service/service";
-import { TeamsContext } from "./teams-context";
+import { useEffect, useMemo, useState } from "react";
+import { useHistory, useLocation } from "react-router-dom";
+import { useOrganizationsInvalidator } from "../data/organizations/orgs-query";
+import { publicApiTeamToProtocol, teamsService } from "../service/public-api";
 
-export default function () {
-    const { setTeams } = useContext(TeamsContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
+export default function JoinTeamPage() {
+    const orgInvalidator = useOrganizationsInvalidator();
     const history = useHistory();
+    const location = useLocation();
 
     const [joinError, setJoinError] = useState<Error>();
-    const inviteId = new URL(window.location.href).searchParams.get("inviteId");
+    const inviteId = useMemo(() => new URLSearchParams(location.search).get("inviteId"), [location]);
 
     useEffect(() => {
         (async () => {
@@ -25,27 +23,19 @@ export default function () {
                 if (!inviteId) {
                     throw new Error("This invite URL is incorrect.");
                 }
+                const team = publicApiTeamToProtocol((await teamsService.joinTeam({ invitationId: inviteId })).team!);
+                orgInvalidator();
 
-                const team = usePublicApiTeamsService
-                    ? publicApiTeamToProtocol((await teamsService.joinTeam({ invitationId: inviteId })).team!)
-                    : await getGitpodService().server.joinTeam(inviteId);
-
-                const teams = usePublicApiTeamsService
-                    ? publicApiTeamsToProtocol((await teamsService.listTeams({})).teams)
-                    : await getGitpodService().server.getTeams();
-
-                setTeams(teams);
-
-                history.push(`/t/${team.slug}/members`);
+                history.push(`/members?org=${team.id}`);
             } catch (error) {
                 console.error(error);
                 setJoinError(error);
             }
         })();
-    }, []);
+    }, [history, inviteId, orgInvalidator]);
 
     useEffect(() => {
-        document.title = "Joining Team — Gitpod";
+        document.title = "Joining Organization — Gitpod";
     }, []);
 
     return joinError ? <div className="mt-16 text-center text-gitpod-red">{String(joinError)}</div> : <></>;

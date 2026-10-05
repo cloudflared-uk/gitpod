@@ -2,14 +2,14 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License.AGPL.txt in the project root for license information.
 
-FROM caddy:2.6.2-builder AS builder
+FROM caddy:2.6.4-builder-alpine AS builder
 
 WORKDIR /plugins
 
 COPY plugins /plugins
 
 # build caddy
-RUN xcaddy build v2.6.2 \
+RUN xcaddy build v2.6.3 \
   --output /caddy \
   --with github.com/gitpod-io/gitpod/proxy/plugins/corsorigin=/plugins/corsorigin \
   --with github.com/gitpod-io/gitpod/proxy/plugins/secwebsocketkey=/plugins/secwebsocketkey \
@@ -18,9 +18,10 @@ RUN xcaddy build v2.6.2 \
   --with github.com/gitpod-io/gitpod/proxy/plugins/configcat=/plugins/configcat \
   --with github.com/gitpod-io/gitpod/proxy/plugins/logif=/plugins/logif \
   --with github.com/gitpod-io/gitpod/proxy/plugins/jsonselect=/plugins/jsonselect \
-  --with github.com/gitpod-io/gitpod/proxy/plugins/sshtunnel=/plugins/sshtunnel
+  --with github.com/gitpod-io/gitpod/proxy/plugins/sshtunnel=/plugins/sshtunnel \
+  --with github.com/gitpod-io/gitpod/proxy/plugins/frontend_dev=/plugins/frontend_dev
 
-FROM alpine:3.16
+FROM cgr.dev/chainguard/wolfi-base@sha256:ad3c07c4f23df2a8082beae4636025dba212b4495aa9faa0b5d8acda914a2673
 
 # Ensure latest packages are present, like security updates.
 RUN  apk upgrade --no-cache \
@@ -34,6 +35,7 @@ COPY --from=builder /caddy /usr/bin/caddy
 
 COPY conf/Caddyfile /etc/caddy/Caddyfile
 COPY conf/vhost.empty /etc/caddy/vhosts/vhost.empty
+COPY conf/workspace-handler.* /etc/caddy/workspace-handler/
 
 ARG __GIT_COMMIT
 ARG VERSION

@@ -4,57 +4,42 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
+import { Project, ProjectSettings } from "@gitpod/gitpod-protocol";
+import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
 import { useCallback, useContext, useEffect, useState } from "react";
-import { useLocation, useHistory } from "react-router";
-import { Project, ProjectSettings, Team } from "@gitpod/gitpod-protocol";
-import CheckBox from "../components/CheckBox";
-import { getGitpodService } from "../service/service";
-import { getCurrentTeam, TeamsContext } from "../teams/teams-context";
+import { useHistory } from "react-router";
+import { Link } from "react-router-dom";
+import Alert from "../components/Alert";
+import { CheckboxInputField } from "../components/forms/CheckboxInputField";
 import { PageWithSubMenu } from "../components/PageWithSubMenu";
 import PillLabel from "../components/PillLabel";
-import { ProjectContext } from "./project-context";
-import SelectWorkspaceClass from "../settings/selectClass";
-import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
-import Alert from "../components/Alert";
-import { Link } from "react-router-dom";
+import { useCurrentOrg } from "../data/organizations/orgs-query";
+import { getGitpodService } from "../service/service";
+import { ProjectContext, useCurrentProject } from "./project-context";
+import { getProjectSettingsMenu, getProjectTabs } from "./projects.routes";
+import { Heading2, Subheading } from "../components/typography/headings";
 import { RemoveProjectModal } from "./RemoveProjectModal";
-
-export function getProjectSettingsMenu(project?: Project, team?: Team) {
-    const teamOrUserSlug = !!team ? "t/" + team.slug : "projects";
-    return [
-        {
-            title: "General",
-            link: [`/${teamOrUserSlug}/${project?.slug || project?.name}/settings`],
-        },
-        {
-            title: "Variables",
-            link: [`/${teamOrUserSlug}/${project?.slug || project?.name}/variables`],
-        },
-    ];
-}
+import SelectWorkspaceClassComponent from "../components/SelectWorkspaceClassComponent";
 
 export function ProjectSettingsPage(props: { project?: Project; children?: React.ReactNode }) {
-    const location = useLocation();
-    const { teams } = useContext(TeamsContext);
-    const team = getCurrentTeam(location, teams);
-
     return (
         <PageWithSubMenu
-            subMenu={getProjectSettingsMenu(props.project, team)}
-            title="Settings"
+            subMenu={getProjectSettingsMenu(props.project)}
+            title={props.project?.name || "Loading..."}
             subtitle="Manage project settings and configuration"
+            tabs={getProjectTabs(props.project)}
         >
             {props.children}
         </PageWithSubMenu>
     );
 }
 
-export default function () {
-    const { project, setProject } = useContext(ProjectContext);
+export default function ProjectSettingsView() {
+    const { setProject } = useContext(ProjectContext);
+    const { project } = useCurrentProject();
     const [billingMode, setBillingMode] = useState<BillingMode | undefined>(undefined);
     const [showRemoveModal, setShowRemoveModal] = useState(false);
-    const { teams } = useContext(TeamsContext);
-    const team = getCurrentTeam(useLocation(), teams);
+    const team = useCurrentOrg().data;
     const history = useHistory();
 
     useEffect(() => {
@@ -101,28 +86,23 @@ export default function () {
     );
 
     const onProjectRemoved = useCallback(() => {
-        // if there's a current team, navigate to team projects
-        if (team) {
-            history.push(`/t/${team.slug}/projects`);
-        } else {
-            history.push("/projects");
-        }
-    }, [history, team]);
+        history.push("/projects");
+    }, [history]);
 
     // TODO: Render a generic error screen for when an entity isn't found
     if (!project) return null;
 
     return (
         <ProjectSettingsPage project={project}>
-            <h3>Prebuilds</h3>
-            <p className="text-base text-gray-500 dark:text-gray-400">
-                Choose the workspace machine type for your prebuilds.
-            </p>
+            <Heading2>Prebuilds</Heading2>
+            <Subheading>Choose the workspace machine type for your prebuilds.</Subheading>
             {BillingMode.canSetWorkspaceClass(billingMode) ? (
-                <SelectWorkspaceClass
-                    workspaceClass={project.settings?.workspaceClasses?.prebuild}
-                    setWorkspaceClass={setWorkspaceClassForPrebuild}
-                />
+                <div className="max-w-md">
+                    <SelectWorkspaceClassComponent
+                        selectedWorkspaceClass={project.settings?.workspaceClasses?.prebuild}
+                        onSelectionChange={setWorkspaceClassForPrebuild}
+                    />
+                </div>
             ) : (
                 <Alert type="message" className="mt-4">
                     <div className="flex flex-col">
@@ -140,15 +120,15 @@ export default function () {
                             </a>
                             , first cancel your existing plan.
                         </span>
-                        <Link className="mt-2" to={project.teamId ? "../billing" : "/plans"}>
-                            <button>Go to {project.teamId ? "Team" : "Personal"} Billing</button>
+                        <Link className="mt-2" to={project.teamId ? "/billing" : "/plans"}>
+                            <button>Go to {project.teamId ? "Organization" : "Personal"} Billing</button>
                         </Link>
                     </div>
                 </Alert>
             )}
-            <CheckBox
-                title={<span>Enable Incremental Prebuilds </span>}
-                desc={
+            <CheckboxInputField
+                label="Enable Incremental Prebuilds"
+                hint={
                     <span>
                         When possible, use an earlier successful prebuild as a base to create new prebuilds. This can
                         make your prebuilds significantly faster, especially if they normally take longer than 10
@@ -159,16 +139,16 @@ export default function () {
                     </span>
                 }
                 checked={project.settings?.useIncrementalPrebuilds ?? false}
-                onChange={({ target }) => updateProjectSettings({ useIncrementalPrebuilds: target.checked })}
+                onChange={(checked) => updateProjectSettings({ useIncrementalPrebuilds: checked })}
             />
-            <CheckBox
-                title={<span>Cancel Prebuilds on Outdated Commits </span>}
-                desc={<span>Cancel pending or running prebuilds on the same branch when new commits are pushed.</span>}
+            <CheckboxInputField
+                label="Cancel Prebuilds on Outdated Commits"
+                hint="Cancel pending or running prebuilds on the same branch when new commits are pushed."
                 checked={!project.settings?.keepOutdatedPrebuildsRunning}
-                onChange={({ target }) => updateProjectSettings({ keepOutdatedPrebuildsRunning: !target.checked })}
+                onChange={(checked) => updateProjectSettings({ keepOutdatedPrebuildsRunning: !checked })}
             />
-            <CheckBox
-                title={
+            <CheckboxInputField
+                label={
                     <span>
                         Use Last Successful Prebuild{" "}
                         <PillLabel type="warn" className="font-semibold mt-2 ml-2 py-0.5 px-2 self-center">
@@ -176,18 +156,14 @@ export default function () {
                         </PillLabel>
                     </span>
                 }
-                desc={
-                    <span>
-                        Skip waiting for prebuilds in progress and use the last successful prebuild from previous
-                        commits on the same branch.
-                    </span>
-                }
+                hint="Skip waiting for prebuilds in progress and use the last successful prebuild from previous
+                    commits on the same branch."
                 checked={!!project.settings?.allowUsingPreviousPrebuilds}
-                onChange={({ target }) =>
+                onChange={(checked) =>
                     updateProjectSettings({
-                        allowUsingPreviousPrebuilds: target.checked,
+                        allowUsingPreviousPrebuilds: checked,
                         // we are disabling prebuild cancellation when incremental workspaces are enabled
-                        keepOutdatedPrebuildsRunning: target.checked || project?.settings?.keepOutdatedPrebuildsRunning,
+                        keepOutdatedPrebuildsRunning: checked || project?.settings?.keepOutdatedPrebuildsRunning,
                     })
                 }
             />
@@ -224,15 +200,15 @@ export default function () {
                 </div>
             </div>
             <div>
-                <h3 className="mt-12">Workspaces</h3>
-                <p className="text-base text-gray-500 dark:text-gray-400">
-                    Choose the workspace machine type for your workspaces.
-                </p>
+                <Heading2 className="mt-12">Workspaces</Heading2>
+                <Subheading>Choose the workspace machine type for your workspaces.</Subheading>
                 {BillingMode.canSetWorkspaceClass(billingMode) ? (
-                    <SelectWorkspaceClass
-                        workspaceClass={project.settings?.workspaceClasses?.regular}
-                        setWorkspaceClass={setWorkspaceClass}
-                    />
+                    <div className="max-w-md">
+                        <SelectWorkspaceClassComponent
+                            selectedWorkspaceClass={project.settings?.workspaceClasses?.regular}
+                            onSelectionChange={setWorkspaceClass}
+                        />
+                    </div>
                 ) : (
                     <Alert type="message" className="mt-4">
                         <div className="flex flex-col">
@@ -254,18 +230,18 @@ export default function () {
                                 , first cancel your existing plan.
                             </span>
                             <Link className="mt-2" to={project.teamId ? "../billing" : "/plans"}>
-                                <button>Go to {project.teamId ? "Team" : "Personal"} Billing</button>
+                                <button>Go to {project.teamId ? "Organization" : "Personal"} Billing</button>
                             </Link>
                         </div>
                     </Alert>
                 )}
             </div>
             <div className="">
-                <h3 className="mt-12">Remove Project</h3>
-                <p className="text-base text-gray-500 dark:text-gray-400 pb-4">
+                <Heading2 className="mt-12">Remove Project</Heading2>
+                <Subheading className="pb-4">
                     This will delete the project and all project-level environment variables you've set for this
                     project.
-                </p>
+                </Subheading>
                 <button className="danger secondary" onClick={() => setShowRemoveModal(true)}>
                     Remove Project
                 </button>

@@ -4,74 +4,84 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import React, { createContext, useContext, useState, useEffect } from "react";
-import { useLocation } from "react-router";
+import React, { createContext, useContext, useState, useEffect, useMemo } from "react";
+import { useCurrentOrg, useOrganizations } from "../data/organizations/orgs-query";
 import { getExperimentsClient } from "../experiments/client";
 import { ProjectContext } from "../projects/project-context";
-import { getCurrentTeam, TeamsContext } from "../teams/teams-context";
 import { UserContext } from "../user-context";
 
 interface FeatureFlagConfig {
     [flagName: string]: { defaultValue: boolean; setter: React.Dispatch<React.SetStateAction<boolean>> };
 }
 
-const FeatureFlagContext = createContext<{
-    showUsageView: boolean;
-    isUsageBasedBillingEnabled: boolean;
-    showUseLastSuccessfulPrebuild: boolean;
-    usePublicApiTeamsService: boolean;
-    usePublicApiProjectsService: boolean;
-    usePublicApiWorkspacesService: boolean;
-    enablePersonalAccessTokens: boolean;
-}>({
+type FeatureFlagsType = {
+    [k in keyof typeof defaultFeatureFlags]: boolean;
+};
+
+const defaultFeatureFlags = {
+    startWithOptions: false,
     showUsageView: false,
     isUsageBasedBillingEnabled: false,
     showUseLastSuccessfulPrebuild: false,
-    usePublicApiTeamsService: false,
-    usePublicApiProjectsService: false,
     usePublicApiWorkspacesService: false,
     enablePersonalAccessTokens: false,
-});
+    oidcServiceEnabled: false,
+    // Default to true to enable on gitpod dedicated until ff support is added for dedicated
+    orgGitAuthProviders: true,
+    userGitAuthProviders: false,
+    newSignupFlow: false,
+    linkedinConnectionForOnboarding: false,
+};
+
+const FeatureFlagContext = createContext<FeatureFlagsType>(defaultFeatureFlags);
 
 const FeatureFlagContextProvider: React.FC = ({ children }) => {
     const { user } = useContext(UserContext);
-    const { teams } = useContext(TeamsContext);
+    const orgs = useOrganizations().data;
     const { project } = useContext(ProjectContext);
-    const location = useLocation();
-    const team = getCurrentTeam(location, teams);
+    const currentOrg = useCurrentOrg();
+    const [startWithOptions, setStartWithOptions] = useState<boolean>(false);
     const [showUsageView, setShowUsageView] = useState<boolean>(false);
     const [isUsageBasedBillingEnabled, setIsUsageBasedBillingEnabled] = useState<boolean>(false);
     const [showUseLastSuccessfulPrebuild, setShowUseLastSuccessfulPrebuild] = useState<boolean>(false);
-    const [usePublicApiTeamsService, setUsePublicApiTeamsService] = useState<boolean>(false);
-    const [usePublicApiProjectsService, setUsePublicApiProjectsService] = useState<boolean>(false);
     const [enablePersonalAccessTokens, setPersonalAccessTokensEnabled] = useState<boolean>(false);
     const [usePublicApiWorkspacesService, setUsePublicApiWorkspacesService] = useState<boolean>(false);
+    const [oidcServiceEnabled, setOidcServiceEnabled] = useState<boolean>(false);
+    const [orgGitAuthProviders, setOrgGitAuthProviders] = useState<boolean>(false);
+    const [userGitAuthProviders, setUserGitAuthProviders] = useState<boolean>(false);
+    const [newSignupFlow, setNewSignupFlow] = useState<boolean>(false);
+    const [linkedinConnectionForOnboarding, setLinkedinConnectionForOnboarding] = useState<boolean>(false);
 
     useEffect(() => {
         if (!user) return;
         (async () => {
             const featureFlags: FeatureFlagConfig = {
+                start_with_options: { defaultValue: false, setter: setStartWithOptions },
                 usage_view: { defaultValue: false, setter: setShowUsageView },
                 isUsageBasedBillingEnabled: { defaultValue: false, setter: setIsUsageBasedBillingEnabled },
                 showUseLastSuccessfulPrebuild: { defaultValue: false, setter: setShowUseLastSuccessfulPrebuild },
-                publicApiExperimentalTeamsService: { defaultValue: false, setter: setUsePublicApiTeamsService },
-                publicApiExperimentalProjectsService: { defaultValue: false, setter: setUsePublicApiProjectsService },
                 personalAccessTokensEnabled: { defaultValue: false, setter: setPersonalAccessTokensEnabled },
                 publicApiExperimentalWorkspaceService: {
                     defaultValue: false,
                     setter: setUsePublicApiWorkspacesService,
                 },
+                oidcServiceEnabled: { defaultValue: false, setter: setOidcServiceEnabled },
+                // Default to true to enable on gitpod dedicated until ff support is added for dedicated
+                orgGitAuthProviders: { defaultValue: true, setter: setOrgGitAuthProviders },
+                userGitAuthProviders: { defaultValue: false, setter: setUserGitAuthProviders },
+                newSignupFlow: { defaultValue: false, setter: setNewSignupFlow },
+                linkedinConnectionForOnboarding: { defaultValue: false, setter: setLinkedinConnectionForOnboarding },
             };
 
             for (const [flagName, config] of Object.entries(featureFlags)) {
                 const value = async () => {
-                    // First check if the flag is non-default for any of the teams
-                    for (const team of teams || []) {
+                    // First check if the flag is non-default for any of the orgs
+                    for (const org of orgs || []) {
                         const flagValue = await getExperimentsClient().getValueAsync(flagName, config.defaultValue, {
                             user,
                             projectId: project?.id,
-                            teamId: team.id,
-                            teamName: team?.name,
+                            teamId: org.id,
+                            teamName: org.name,
                         });
 
                         if (flagValue !== config.defaultValue) {
@@ -84,8 +94,8 @@ const FeatureFlagContextProvider: React.FC = ({ children }) => {
                     const valueForUser = await getExperimentsClient().getValueAsync(flagName, config.defaultValue, {
                         user,
                         projectId: project?.id,
-                        teamId: team?.id,
-                        teamName: team?.name,
+                        teamId: currentOrg.data?.id,
+                        teamName: currentOrg.data?.name,
                     });
 
                     return valueForUser;
@@ -95,23 +105,37 @@ const FeatureFlagContextProvider: React.FC = ({ children }) => {
                 config.setter(val);
             }
         })();
-    }, [user, teams, team, project]);
+    }, [user, orgs, currentOrg, project]);
 
-    return (
-        <FeatureFlagContext.Provider
-            value={{
-                showUsageView,
-                isUsageBasedBillingEnabled,
-                showUseLastSuccessfulPrebuild,
-                usePublicApiTeamsService,
-                enablePersonalAccessTokens,
-                usePublicApiProjectsService,
-                usePublicApiWorkspacesService,
-            }}
-        >
-            {children}
-        </FeatureFlagContext.Provider>
-    );
+    const flags = useMemo(() => {
+        return {
+            startWithOptions,
+            showUsageView,
+            isUsageBasedBillingEnabled,
+            showUseLastSuccessfulPrebuild,
+            enablePersonalAccessTokens,
+            usePublicApiWorkspacesService,
+            oidcServiceEnabled,
+            orgGitAuthProviders,
+            userGitAuthProviders,
+            newSignupFlow,
+            linkedinConnectionForOnboarding,
+        };
+    }, [
+        enablePersonalAccessTokens,
+        isUsageBasedBillingEnabled,
+        linkedinConnectionForOnboarding,
+        newSignupFlow,
+        oidcServiceEnabled,
+        orgGitAuthProviders,
+        showUsageView,
+        showUseLastSuccessfulPrebuild,
+        startWithOptions,
+        usePublicApiWorkspacesService,
+        userGitAuthProviders,
+    ]);
+
+    return <FeatureFlagContext.Provider value={flags}>{children}</FeatureFlagContext.Provider>;
 };
 
 export { FeatureFlagContext, FeatureFlagContextProvider };

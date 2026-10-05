@@ -14,7 +14,7 @@ type GitpodServerMethodType =
     | keyof Omit<GitpodServer, "dispose" | "setClient">
     | typeof accessCodeSyncStorage
     | typeof accessHeadlessLogs;
-type GroupKey = "default" | "startWorkspace" | "createWorkspace" | "phoneVerification";
+type GroupKey = "default" | "startWorkspace" | "createWorkspace" | "phoneVerification" | "sendHeartBeat";
 type GroupsConfig = {
     [key: string]: {
         points: number;
@@ -52,6 +52,10 @@ const defaultFunctions: FunctionsConfig = {
     getOwnAuthProviders: { group: "default", points: 1 },
     updateOwnAuthProvider: { group: "default", points: 1 },
     deleteOwnAuthProvider: { group: "default", points: 1 },
+    createOrgAuthProvider: { group: "default", points: 1 },
+    updateOrgAuthProvider: { group: "default", points: 1 },
+    getOrgAuthProviders: { group: "default", points: 1 },
+    deleteOrgAuthProvider: { group: "default", points: 1 },
     getConfiguration: { group: "default", points: 1 },
     getGitpodTokenScopes: { group: "default", points: 1 },
     getToken: { group: "default", points: 1 },
@@ -67,6 +71,7 @@ const defaultFunctions: FunctionsConfig = {
     getWorkspace: { group: "default", points: 1 },
     isWorkspaceOwner: { group: "default", points: 1 },
     getOwnerToken: { group: "default", points: 1 },
+    getIDECredentials: { group: "default", points: 1 },
     createWorkspace: { group: "createWorkspace", points: 1 },
     startWorkspace: { group: "startWorkspace", points: 1 },
     stopWorkspace: { group: "default", points: 1 },
@@ -74,7 +79,7 @@ const defaultFunctions: FunctionsConfig = {
     setWorkspaceDescription: { group: "default", points: 1 },
     controlAdmission: { group: "default", points: 1 },
     updateWorkspaceUserPin: { group: "default", points: 1 },
-    sendHeartBeat: { group: "default", points: 1 },
+    sendHeartBeat: { group: "sendHeartBeat", points: 1 },
     watchWorkspaceImageBuildLogs: { group: "default", points: 1 },
     isPrebuildDone: { group: "default", points: 1 },
     getHeadlessLog: { group: "default", points: 1 },
@@ -85,6 +90,7 @@ const defaultFunctions: FunctionsConfig = {
     closePort: { group: "default", points: 1 },
     getUserStorageResource: { group: "default", points: 1 },
     updateUserStorageResource: { group: "default", points: 1 },
+    getWorkspaceEnvVars: { group: "default", points: 1 },
     getEnvVars: { group: "default", points: 1 },
     getAllEnvVars: { group: "default", points: 1 },
     setEnvVar: { group: "default", points: 1 },
@@ -97,6 +103,7 @@ const defaultFunctions: FunctionsConfig = {
     getProjectEnvironmentVariables: { group: "default", points: 1 },
     deleteProjectEnvironmentVariable: { group: "default", points: 1 },
     getTeam: { group: "default", points: 1 },
+    updateTeam: { group: "default", points: 1 },
     getTeams: { group: "default", points: 1 },
     getTeamMembers: { group: "default", points: 1 },
     createTeam: { group: "default", points: 1 },
@@ -106,6 +113,8 @@ const defaultFunctions: FunctionsConfig = {
     getGenericInvite: { group: "default", points: 1 },
     resetGenericInvite: { group: "default", points: 1 },
     deleteTeam: { group: "default", points: 1 },
+    getOrgSettings: { group: "default", points: 1 },
+    updateOrgSettings: { group: "default", points: 1 },
     getProviderRepositoriesForUser: { group: "default", points: 1 },
     createProject: { group: "default", points: 1 },
     getTeamProjects: { group: "default", points: 1 },
@@ -130,6 +139,7 @@ const defaultFunctions: FunctionsConfig = {
     getSnapshots: { group: "default", points: 1 },
     guessGitTokenScopes: { group: "default", points: 1 },
     getUsageBalance: { group: "default", points: 1 },
+    resolveContext: { group: "default", points: 1 },
 
     adminGetUsers: { group: "default", points: 1 },
     adminGetUser: { group: "default", points: 1 },
@@ -166,7 +176,6 @@ const defaultFunctions: FunctionsConfig = {
 
     validateLicense: { group: "default", points: 1 },
     getLicenseInfo: { group: "default", points: 1 },
-    licenseIncludesFeature: { group: "default", points: 1 },
 
     accessCodeSyncStorage: { group: "default", points: 1 },
 
@@ -198,7 +207,9 @@ const defaultFunctions: FunctionsConfig = {
     tsAssignSlot: { group: "default", points: 1 },
     tsDeactivateSlot: { group: "default", points: 1 },
     getTeamSubscription: { group: "default", points: 1 },
+    cancelTeamSubscription: { group: "default", points: 1 },
     tsGet: { group: "default", points: 1 },
+    tsCancel: { group: "default", points: 1 },
     tsGetSlots: { group: "default", points: 1 },
     tsGetUnassignedSlot: { group: "default", points: 1 },
     tsReactivateSlot: { group: "default", points: 1 },
@@ -209,9 +220,13 @@ const defaultFunctions: FunctionsConfig = {
     createStripeCustomerIfNeeded: { group: "default", points: 1 },
     subscribeToStripe: { group: "default", points: 1 },
     getStripePortalUrl: { group: "default", points: 1 },
+    getPriceInformation: { group: "default", points: 1 },
     listUsage: { group: "default", points: 1 },
     getBillingModeForTeam: { group: "default", points: 1 },
     getBillingModeForUser: { group: "default", points: 1 },
+    getLinkedInClientId: { group: "default", points: 1 },
+    connectWithLinkedIn: { group: "default", points: 1 },
+    tsAddMembersToOrg: { group: "default", points: 1 },
 
     trackEvent: { group: "default", points: 1 },
     trackLocation: { group: "default", points: 1 },
@@ -222,14 +237,18 @@ const defaultFunctions: FunctionsConfig = {
     listAvailableUsageAttributionIds: { group: "default", points: 1 },
     getCostCenter: { group: "default", points: 1 },
     setUsageLimit: { group: "default", points: 1 },
-    getNotifications: { group: "default", points: 1 },
     getSupportedWorkspaceClasses: { group: "default", points: 1 },
+    maySetTimeout: { group: "default", points: 1 },
+    updateWorkspaceTimeoutSetting: { group: "default", points: 1 },
+    getIDToken: { group: "default", points: 1 },
+    reportErrorBoundary: { group: "default", points: 1 },
 };
 
 function getConfig(config: RateLimiterConfig): RateLimiterConfig {
+    // Be aware that some of our API calls are bound by rate-limits in downstream systems like ws-manager
     const defaultGroups: GroupsConfig = {
         default: {
-            points: 60000, // 1,000 calls per user per second
+            points: 200, // 200 calls per user, per connection, per minute
             durationsSec: 60,
         },
         startWorkspace: {
@@ -243,6 +262,10 @@ function getConfig(config: RateLimiterConfig): RateLimiterConfig {
         phoneVerification: {
             points: 10,
             durationsSec: 10,
+        },
+        sendHeartBeat: {
+            points: 100, // 100 heartbeats per connection per 5 minutes
+            durationsSec: 60 * 5,
         },
     };
 

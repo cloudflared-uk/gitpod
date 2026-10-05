@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/gitpod-io/gitpod/installer/pkg/components/workspace"
+	wsmanager "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager"
+	wsmanagermk2 "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager-mk2"
 	configv1 "github.com/gitpod-io/gitpod/installer/pkg/config/v1"
 	"github.com/gitpod-io/gitpod/installer/pkg/config/v1/experimental"
 
@@ -36,8 +38,17 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 	gitpodInstallationWorkspaceHostSuffix := fmt.Sprintf(".ws%s.%s", installationShortNameSuffix, ctx.Config.Domain)
 	gitpodInstallationWorkspaceHostSuffixRegex := fmt.Sprintf("\\.ws[^\\.]*\\.%s", ctx.Config.Domain)
 
+	wsmanagerAddr := fmt.Sprintf("ws-manager:%d", wsmanager.RPCPort)
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		if cfg.Workspace == nil || !cfg.Workspace.UseWsmanagerMk2 {
+			return nil
+		}
+		wsmanagerAddr = fmt.Sprintf("ws-manager-mk2:%d", wsmanagermk2.RPCPort)
+		return nil
+	})
+
 	wsManagerConfig := &config.WorkspaceManagerConn{
-		Addr: "ws-manager:8080",
+		Addr: wsmanagerAddr,
 		TLS: struct {
 			CA   string "json:\"ca\""
 			Cert string "json:\"crt\""
@@ -49,11 +60,9 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		},
 	}
 
+	var enableWorkspaceCRD bool
+
 	ctx.WithExperimental(func(ucfg *experimental.Config) error {
-		if ucfg.WebApp != nil && ucfg.WebApp.WithoutWorkspaceComponents {
-			// No ws-manager exists in the application cluster, don't try to connect to it.
-			wsManagerConfig = nil
-		}
 		if ucfg.Workspace == nil {
 			return nil
 		}
@@ -72,9 +81,13 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		if ucfg.Workspace.WSProxy.GitpodInstallationWorkspaceHostSuffixRegex != "" {
 			gitpodInstallationWorkspaceHostSuffixRegex = ucfg.Workspace.WSProxy.GitpodInstallationWorkspaceHostSuffixRegex
 		}
+
+		enableWorkspaceCRD = ucfg.Workspace.UseWsmanagerMk2
+
 		return nil
 	})
 
+	// todo(sje): wsManagerProxy seems to be unused
 	wspcfg := config.Config{
 		Namespace: ctx.Namespace,
 		Ingress: proxy.HostBasedIngressConfig{
@@ -108,11 +121,12 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 				WorkspaceHostSuffixRegex: gitpodInstallationWorkspaceHostSuffixRegex,
 			},
 			WorkspacePodConfig: &proxy.WorkspacePodConfig{
-				TheiaPort:           workspace.ContainerPort,
-				IDEDebugPort:        workspace.IDEDebugPort,
-				SupervisorPort:      workspace.SupervisorPort,
-				SupervisorDebugPort: workspace.SupervisorDebugPort,
-				SupervisorImage:     ctx.ImageName(ctx.Config.Repository, workspace.SupervisorImage, ctx.VersionManifest.Components.Workspace.Supervisor.Version),
+				TheiaPort:               workspace.ContainerPort,
+				IDEDebugPort:            workspace.IDEDebugPort,
+				SupervisorPort:          workspace.SupervisorPort,
+				SupervisorDebugPort:     workspace.SupervisorDebugPort,
+				DebugWorkspaceProxyPort: workspace.DebugWorkspaceProxyPort,
+				SupervisorImage:         ctx.ImageName(ctx.Config.Repository, workspace.SupervisorImage, ctx.VersionManifest.Components.Workspace.Supervisor.Version),
 			},
 			BuiltinPages: proxy.BuiltinPagesConfig{
 				Location: "/app/public",
@@ -122,6 +136,7 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		PrometheusAddr:     common.LocalhostPrometheusAddr(),
 		ReadinessProbeAddr: fmt.Sprintf(":%v", ReadinessPort),
 		WorkspaceManager:   wsManagerConfig,
+		EnableWorkspaceCRD: enableWorkspaceCRD,
 	}
 
 	fc, err := common.ToJSONString(wspcfg)

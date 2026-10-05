@@ -16,28 +16,56 @@ export class PeriodicDbDeleter {
     @inject(GitpodTableDescriptionProvider) protected readonly tableProvider: GitpodTableDescriptionProvider;
     @inject(TypeORM) protected readonly typeORM: TypeORM;
 
-    start() {
-        log.error("[PeriodicDbDeleter] Start ...");
-        this.sync().catch((err) => log.error("[PeriodicDbDeleter] sync failed", err));
+    start(shouldRunFn: () => Promise<boolean>) {
+        log.info("[PeriodicDbDeleter] Start ...");
+        this.sync(shouldRunFn).catch((err) => log.error("[PeriodicDbDeleter] sync failed", err));
     }
 
-    protected async sync() {
+    protected async sync(shouldRunFn: () => Promise<boolean>) {
         const doSync = async () => {
+            const shouldRun = await shouldRunFn();
+            if (!shouldRun) {
+                return;
+            }
+
+            const tickID = new Date().toISOString();
+            log.info("[PeriodicDbDeleter] Starting to collect deleted rows.", {
+                periodicDeleterTickId: tickID,
+            });
             const sortedTables = this.tableProvider.getSortedTables();
             const toBeDeleted: { table: string; deletions: string[] }[] = [];
             for (const table of sortedTables) {
-                toBeDeleted.push(await this.collectRowsToBeDeleted(table));
+                const rowsForTableToDelete = await this.collectRowsToBeDeleted(table);
+                log.info(
+                    `[PeriodicDbDeleter] Identified ${rowsForTableToDelete.deletions.length} entries in ${rowsForTableToDelete.table} to be deleted.`,
+                    {
+                        periodicDeleterTickId: tickID,
+                    },
+                );
+                toBeDeleted.push(rowsForTableToDelete);
             }
             // when collecting the deletions do so in the inverse order as during update (delete dependency targes first)
             const pendingDeletions: Promise<void>[] = [];
             for (const { deletions } of toBeDeleted.reverse()) {
                 for (const deletion of deletions) {
                     pendingDeletions.push(
-                        this.query(deletion).catch((err) => log.error(`[PeriodicDbDeleter] sync error`, err)),
+                        this.query(deletion).catch((err) =>
+                            log.error(
+                                `[PeriodicDbDeleter] sync error`,
+                                {
+                                    periodicDeleterTickId: tickID,
+                                    query: deletion,
+                                },
+                                err,
+                            ),
+                        ),
                     );
                 }
             }
             await Promise.all(pendingDeletions);
+            log.info("[PeriodicDbDeleter] Finished deleting records.", {
+                periodicDeleterTickId: tickID,
+            });
         };
         repeat(doSync, 30000); // deletion is never time-critical, so we should ensure we do not spam ourselves
     }
@@ -58,14 +86,14 @@ export class PeriodicDbDeleter {
         const { deletionColumn, primaryKeys } = table;
         const markedAsDeletedQuery = `SELECT ${primaryKeys.join(", ")} FROM ${
             table.name
-        } WHERE ${deletionColumn} = true ;`;
+        } WHERE ${deletionColumn} = true LIMIT 100;`;
         const rows = await this.query(markedAsDeletedQuery);
 
         const whereClauseFn = (row: any) => primaryKeys.map((pk) => `${pk}='${row[pk]}'`).join(" AND ");
         for (const i in rows) {
             const row = rows[i];
             const whereClause = whereClauseFn(row);
-            deletions.push(`DELETE FROM ${table.name} WHERE ${whereClause};`);
+            deletions.push(`DELETE FROM ${table.name} WHERE ${whereClause} AND ${deletionColumn} = true;`);
         }
 
         return result;

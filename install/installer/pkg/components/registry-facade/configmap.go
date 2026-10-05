@@ -10,6 +10,7 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	"github.com/gitpod-io/gitpod/installer/pkg/common"
 	wsmanager "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager"
+	wsmanagermk2 "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager-mk2"
 	"github.com/gitpod-io/gitpod/installer/pkg/config/v1/experimental"
 	regfac "github.com/gitpod-io/gitpod/registry-facade/api/config"
 
@@ -19,17 +20,21 @@ import (
 )
 
 func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
-	var tls regfac.TLS
-	if ctx.Config.Certificate.Name != "" {
-		tls = regfac.TLS{
-			Certificate: "/mnt/certificates/tls.crt",
-			PrivateKey:  "/mnt/certificates/tls.key",
-		}
+	var (
+		ipfsCache  *regfac.IPFSCacheConfig
+		redisCache *regfac.RedisCacheConfig
+	)
+
+	remoteSpecProviders := []*regfac.RSProvider{
+		{
+			Addr: fmt.Sprintf("dns:///ws-manager:%d", wsmanager.RPCPort),
+			TLS: &regfac.TLS{
+				Authority:   "/ws-manager-client-tls-certs/ca.crt",
+				Certificate: "/ws-manager-client-tls-certs/tls.crt",
+				PrivateKey:  "/ws-manager-client-tls-certs/tls.key",
+			},
+		},
 	}
-
-	var ipfsCache *regfac.IPFSCacheConfig
-	var redisCache *regfac.RedisCacheConfig
-
 	_ = ctx.WithExperimental(func(ucfg *experimental.Config) error {
 		if ucfg.Workspace == nil {
 			return nil
@@ -54,21 +59,30 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 			}
 		}
 
+		if ucfg.Workspace.UseWsmanagerMk2 {
+			remoteSpecProviders = []*regfac.RSProvider{
+				{
+					Addr: fmt.Sprintf("dns:///ws-manager-mk2:%d", wsmanagermk2.RPCPort),
+					TLS: &regfac.TLS{
+						Authority:   "/ws-manager-mk2-client-tls-certs/ca.crt",
+						Certificate: "/ws-manager-mk2-client-tls-certs/tls.crt",
+						PrivateKey:  "/ws-manager-mk2-client-tls-certs/tls.key",
+					},
+				},
+			}
+		}
+
 		return nil
 	})
 
 	rfcfg := regfac.ServiceConfig{
 		Registry: regfac.Config{
-			Port: ContainerPort,
-			RemoteSpecProvider: &regfac.RSProvider{
-				Addr: fmt.Sprintf("dns:///ws-manager:%d", wsmanager.RPCPort),
-				TLS: &regfac.TLS{
-					Authority:   "/ws-manager-client-tls-certs/ca.crt",
-					Certificate: "/ws-manager-client-tls-certs/tls.crt",
-					PrivateKey:  "/ws-manager-client-tls-certs/tls.key",
-				},
+			Port:               ServicePort,
+			RemoteSpecProvider: remoteSpecProviders,
+			TLS: &regfac.TLS{
+				Certificate: "/mnt/certificates/tls.crt",
+				PrivateKey:  "/mnt/certificates/tls.key",
 			},
-			TLS:         &tls,
 			Store:       "/mnt/cache/registry",
 			RequireAuth: false,
 			StaticLayer: []regfac.StaticLayerCfg{

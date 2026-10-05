@@ -4,37 +4,31 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useContext, useEffect, useState } from "react";
-import { getGitpodService, gitpodHostUrl } from "../service/service";
-import { iconForAuthProvider, openAuthorizeWindow, simplifyProviderName } from "../provider-utils";
-import { AuthProviderInfo, Project, ProviderRepository, Team, TeamMemberInfo, User } from "@gitpod/gitpod-protocol";
-import { TeamsContext } from "../teams/teams-context";
-import { useLocation } from "react-router";
+import { AuthProviderInfo, Project, ProviderRepository, Team, User } from "@gitpod/gitpod-protocol";
+import dayjs from "dayjs";
+import { useCallback, useContext, useEffect, useState } from "react";
+import { trackEvent } from "../Analytics";
 import ContextMenu, { ContextMenuEntry } from "../components/ContextMenu";
+import ErrorMessage from "../components/ErrorMessage";
+import { useCurrentOrg } from "../data/organizations/orgs-query";
+import { useRefreshProjects } from "../data/projects/list-projects-query";
 import CaretDown from "../icons/CaretDown.svg";
 import Plus from "../icons/Plus.svg";
-import Switch from "../icons/Switch.svg";
 import search from "../icons/search.svg";
-import dayjs from "dayjs";
-import { UserContext } from "../user-context";
-import { trackEvent } from "../Analytics";
-import exclamation from "../images/exclamation.svg";
-import ErrorMessage from "../components/ErrorMessage";
 import Spinner from "../icons/Spinner.svg";
-import {
-    publicApiTeamMembersToProtocol,
-    publicApiTeamsToProtocol,
-    publicApiTeamToProtocol,
-    teamsService,
-} from "../service/public-api";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { ConnectError } from "@bufbuild/connect-web";
+import Switch from "../icons/Switch.svg";
+import exclamation from "../images/exclamation.svg";
+import { iconForAuthProvider, openAuthorizeWindow, simplifyProviderName } from "../provider-utils";
+import { getGitpodService, gitpodHostUrl } from "../service/service";
+import { UserContext } from "../user-context";
+import { projectsPathNew } from "./projects.routes";
+import { Heading1, Subheading } from "../components/typography/headings";
+import { useAuthProviders } from "../data/auth-providers/auth-provider-query";
 
 export default function NewProject() {
-    const location = useLocation();
-    const { teams } = useContext(TeamsContext);
+    const currentTeam = useCurrentOrg()?.data;
     const { user, setUser } = useContext(UserContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
+    const refreshProjects = useRefreshProjects();
 
     const [selectedProviderHost, setSelectedProviderHost] = useState<string | undefined>();
     const [reposInAccounts, setReposInAccounts] = useState<ProviderRepository[]>([]);
@@ -42,31 +36,29 @@ export default function NewProject() {
     const [selectedAccount, setSelectedAccount] = useState<string | undefined>(undefined);
     const [showGitProviders, setShowGitProviders] = useState<boolean>(false);
     const [selectedRepo, setSelectedRepo] = useState<ProviderRepository | undefined>(undefined);
-    const [selectedTeamOrUser, setSelectedTeamOrUser] = useState<Team | User | undefined>(undefined);
-
-    const [showNewTeam, setShowNewTeam] = useState<boolean>(false);
     const [loaded, setLoaded] = useState<boolean>(false);
 
     const [project, setProject] = useState<Project | undefined>();
 
-    const [authProviders, setAuthProviders] = useState<AuthProviderInfo[]>([]);
+    const authProviders = useAuthProviders();
     const [isGitHubAppEnabled, setIsGitHubAppEnabled] = useState<boolean>();
     const [isGitHubWebhooksUnauthorized, setIsGitHubWebhooksUnauthorized] = useState<boolean>();
 
     useEffect(() => {
         const { server } = getGitpodService();
-        Promise.all([
-            server.getAuthProviders().then((v) => () => setAuthProviders(v)),
-            server.isGitHubAppEnabled().then((v) => () => setIsGitHubAppEnabled(v)),
-        ]).then((setters) => setters.forEach((s) => s()));
+        Promise.all([server.isGitHubAppEnabled().then((v) => () => setIsGitHubAppEnabled(v))]).then((setters) =>
+            setters.forEach((s) => s()),
+        );
     }, []);
 
     useEffect(() => {
-        if (user && authProviders && selectedProviderHost === undefined) {
+        if (user && authProviders.data && selectedProviderHost === undefined) {
             for (let i = user.identities.length - 1; i >= 0; i--) {
                 const candidate = user.identities[i];
                 if (candidate) {
-                    const authProvider = authProviders.find((ap) => ap.authProviderId === candidate.authProviderId);
+                    const authProvider = authProviders.data.find(
+                        (ap) => ap.authProviderId === candidate.authProviderId,
+                    );
                     const host = authProvider?.host;
                     if (host) {
                         setSelectedProviderHost(host);
@@ -75,14 +67,14 @@ export default function NewProject() {
                 }
             }
         }
-    }, [user, authProviders, selectedProviderHost]);
+    }, [user, authProviders.data, selectedProviderHost]);
 
     useEffect(() => {
         setIsGitHubWebhooksUnauthorized(false);
-        if (!authProviders || !selectedProviderHost || isGitHubAppEnabled) {
+        if (!authProviders.data || !selectedProviderHost || isGitHubAppEnabled) {
             return;
         }
-        const ap = authProviders.find((ap) => ap.host === selectedProviderHost);
+        const ap = authProviders.data?.find((ap) => ap.host === selectedProviderHost);
         if (!ap || ap.authProviderType !== "GitHub") {
             return;
         }
@@ -93,51 +85,14 @@ export default function NewProject() {
                     setIsGitHubWebhooksUnauthorized(true);
                 }
             });
-    }, [authProviders, isGitHubAppEnabled, selectedProviderHost]);
+    }, [authProviders.data, isGitHubAppEnabled, selectedProviderHost]);
 
     useEffect(() => {
-        const params = new URLSearchParams(location.search);
-        const teamParam = params.get("team");
-        if (teamParam) {
-            window.history.replaceState({}, "", window.location.pathname);
-            const team = teams?.find((t) => t.slug === teamParam);
-            setSelectedTeamOrUser(team);
+        if (selectedRepo && user) {
+            createProject(currentTeam, user, selectedRepo);
         }
-        if (params.get("user")) {
-            window.history.replaceState({}, "", window.location.pathname);
-            setSelectedTeamOrUser(user);
-        }
-    }, []);
-
-    const [teamMembers, setTeamMembers] = useState<Record<string, TeamMemberInfo[]>>({});
-    useEffect(() => {
-        if (!teams) {
-            return;
-        }
-        (async () => {
-            const members: Record<string, TeamMemberInfo[]> = {};
-            await Promise.all(
-                teams.map(async (team) => {
-                    try {
-                        members[team.id] = usePublicApiTeamsService
-                            ? await publicApiTeamMembersToProtocol(
-                                  (await teamsService.getTeam({ teamId: team!.id })).team?.members || [],
-                              )
-                            : await getGitpodService().server.getTeamMembers(team.id);
-                    } catch (error) {
-                        console.error("Could not get members of team", team, error);
-                    }
-                }),
-            );
-            setTeamMembers(members);
-        })();
-    }, [teams]);
-
-    useEffect(() => {
-        if (selectedTeamOrUser && selectedRepo) {
-            createProject(selectedTeamOrUser, selectedRepo);
-        }
-    }, [selectedTeamOrUser, selectedRepo]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [selectedRepo, currentTeam, user]);
 
     useEffect(() => {
         if (reposInAccounts.length === 0) {
@@ -166,6 +121,7 @@ export default function NewProject() {
         (async () => {
             await updateReposInAccounts();
         })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [selectedProviderHost]);
 
     useEffect(() => {
@@ -210,7 +166,7 @@ export default function NewProject() {
     };
 
     const authorize = () => {
-        const ap = authProviders.find((ap) => ap.host === selectedProviderHost);
+        const ap = authProviders.data?.find((ap) => ap.host === selectedProviderHost);
         if (!ap) {
             return;
         }
@@ -228,27 +184,34 @@ export default function NewProject() {
         });
     };
 
-    const createProject = async (teamOrUser: Team | User, repo: ProviderRepository) => {
-        if (!selectedProviderHost) {
-            return;
-        }
-        const repoSlug = repo.path || repo.name;
+    // TODO: Look into making this a react-query mutation
+    const createProject = useCallback(
+        async (team: Team | undefined, user: User, repo: ProviderRepository) => {
+            if (!selectedProviderHost) {
+                return;
+            }
+            const repoSlug = repo.path || repo.name;
 
-        try {
-            const project = await getGitpodService().server.createProject({
-                name: repo.name,
-                slug: repoSlug,
-                cloneUrl: repo.cloneUrl,
-                ...(User.is(teamOrUser) ? { userId: teamOrUser.id } : { teamId: teamOrUser.id }),
-                appInstallationId: String(repo.installationId),
-            });
+            try {
+                const project = await getGitpodService().server.createProject({
+                    name: repo.name,
+                    slug: repoSlug,
+                    cloneUrl: repo.cloneUrl,
+                    ...(team ? { teamId: team.id } : { userId: user.id }),
+                    appInstallationId: String(repo.installationId),
+                });
 
-            setProject(project);
-        } catch (error) {
-            const message = (error && error?.message) || "Failed to create new project.";
-            window.alert(message);
-        }
-    };
+                // TODO: After converting this to a mutation, we can handle invalidating/updating the query in a side effect
+                refreshProjects(project.teamId ? { teamId: project.teamId } : { userId: project.userId || "" });
+
+                setProject(project);
+            } catch (error) {
+                const message = (error && error?.message) || "Failed to create new project.";
+                window.alert(message);
+            }
+        },
+        [refreshProjects, selectedProviderHost],
+    );
 
     const toSimpleName = (fullName: string) => {
         const splitted = fullName.split("/");
@@ -270,7 +233,7 @@ export default function NewProject() {
     const getDropDownEntries = (accounts: Map<string, { avatarUrl: string }>) => {
         const renderItemContent = (label: string, icon: string, addClasses?: string) => (
             <div className="w-full flex">
-                <img src={icon} className="rounded-full w-6 h-6 my-auto" />
+                <img src={icon} className="rounded-full w-6 h-6 my-auto" alt="icon" />
                 <span className={"pl-2 text-gray-600 dark:text-gray-100 text-base " + (addClasses || "")}>{label}</span>
             </div>
         );
@@ -328,17 +291,17 @@ export default function NewProject() {
 
         const projectText = () => {
             return (
-                <p className="text-gray-500 text-center text-base">
+                <Subheading className="text-center">
                     Projects allow you to manage prebuilds and workspaces for your repository.{" "}
                     <a
-                        href="https://www.gitpod.io/docs/teams-and-projects"
+                        href="https://www.gitpod.io/docs/configure/projects"
                         target="_blank"
                         rel="noreferrer"
                         className="gp-link"
                     >
                         Learn more
                     </a>
-                </p>
+                </Subheading>
             );
         };
 
@@ -365,6 +328,7 @@ export default function NewProject() {
                                         <img
                                             src={user?.avatarUrl}
                                             className="rounded-full w-6 h-6 absolute my-2.5 left-3"
+                                            alt="user avatar"
                                         />
                                         <input
                                             className="w-full px-12 cursor-pointer font-semibold"
@@ -379,6 +343,7 @@ export default function NewProject() {
                                         <img
                                             src={icon ? icon : ""}
                                             className="rounded-full w-6 h-6 absolute my-2.5 left-3"
+                                            alt="icon"
                                         />
                                         <input
                                             className="w-full px-12 cursor-pointer font-semibold"
@@ -392,15 +357,21 @@ export default function NewProject() {
                                     src={CaretDown}
                                     title="Select Account"
                                     className="filter-grayscale absolute top-1/2 right-3"
+                                    alt="down caret icon"
                                 />
                             </div>
                         </ContextMenu>
                         {showSearchInput && (
-                            <div className="w-full relative ">
-                                <img src={search} title="Search" className="filter-grayscale absolute top-1/3 left-3" />
+                            <div className="w-full relative h-10 my-auto">
+                                <img
+                                    src={search}
+                                    title="Search"
+                                    className="filter-grayscale absolute top-1/3 left-3"
+                                    alt="search icon"
+                                />
                                 <input
                                     className="w-96 pl-10 border-0"
-                                    type="text"
+                                    type="search"
                                     placeholder="Search Repositories"
                                     value={repoSearchFilter}
                                     onChange={(e) => setRepoSearchFilter(e.target.value)}
@@ -496,7 +467,7 @@ export default function NewProject() {
                     <div>
                         <div className="px-12 py-16 text-center text-gray-500 bg-gray-50 dark:bg-gray-800 rounded-xl w-96 h-h96 flex items-center justify-center">
                             <div className="flex items-center justify-center space-x-2 text-gray-400 text-sm">
-                                <img className="h-4 w-4 animate-spin" src={Spinner} />
+                                <img className="h-4 w-4 animate-spin" src={Spinner} alt="loading spinner" />
                                 <span>Fetching repositories...</span>
                             </div>
                         </div>
@@ -518,74 +489,10 @@ export default function NewProject() {
         }
 
         if (showGitProviders) {
-            return <GitProviders onHostSelected={onGitProviderSeleted} authProviders={authProviders} />;
+            return <GitProviders onHostSelected={onGitProviderSeleted} authProviders={authProviders.data || []} />;
         }
 
         return renderRepos();
-    };
-
-    const renderSelectTeam = () => {
-        const userFullName = user?.fullName || user?.name || "...";
-        const teamsToRender = teams || [];
-        return (
-            <>
-                <p className="mt-2 text-gray-500 text-center text-base">Select team or personal account</p>
-                <div className="mt-14 flex flex-col space-y-2">
-                    <label
-                        key={`user-${userFullName}`}
-                        className={`w-80 px-4 py-3 flex space-x-3 items-center cursor-pointer rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800`}
-                        onClick={() => setSelectedTeamOrUser(user)}
-                    >
-                        <input type="radio" />
-                        <div className="flex-grow overflow-ellipsis truncate flex flex-col">
-                            <span className="font-semibold">{userFullName}</span>
-                            <span className="text-sm text-gray-400">Personal account</span>
-                        </div>
-                    </label>
-                    {teamsToRender.map((t) => (
-                        <label
-                            key={`team-${t.name}`}
-                            className={`w-80 px-4 py-3 flex space-x-3 items-center cursor-pointer rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800`}
-                            onClick={() => setSelectedTeamOrUser(t)}
-                        >
-                            <input type="radio" />
-                            <div className="flex-grow overflow-ellipsis truncate flex flex-col">
-                                <span className="font-semibold">{t.name}</span>
-                                <span className="text-sm text-gray-400">
-                                    {!!teamMembers[t.id]
-                                        ? `${teamMembers[t.id].length} member${
-                                              teamMembers[t.id].length === 1 ? "" : "s"
-                                          }`
-                                        : "Team"}
-                                </span>
-                            </div>
-                        </label>
-                    ))}
-                    <label className="w-80 px-4 py-3 flex flex-col cursor-pointer rounded-xl hover:bg-gray-100 dark:hover:bg-gray-800">
-                        <div className="flex space-x-3 items-center relative">
-                            <input type="radio" onChange={() => setShowNewTeam(!showNewTeam)} />
-                            <div className="flex-grow overflow-ellipsis truncate flex flex-col">
-                                <span className="font-semibold">Create new team</span>
-                                <span className="text-sm text-gray-400">Collaborate with others</span>
-                            </div>
-                            {teamsToRender.length > 0 && (
-                                <img
-                                    alt=""
-                                    src={CaretDown}
-                                    title="Select Account"
-                                    className={`${
-                                        showNewTeam ? "transform rotate-180" : ""
-                                    } filter-grayscale absolute top-1/2 right-3 cursor-pointer`}
-                                />
-                            )}
-                        </div>
-                        {(showNewTeam || teamsToRender.length === 0) && (
-                            <NewTeam onSuccess={(t) => setSelectedTeamOrUser(t)} />
-                        )}
-                    </label>
-                </div>
-            </>
-        );
     };
 
     const onNewWorkspace = async () => {
@@ -603,28 +510,22 @@ export default function NewProject() {
         return (
             <div className="flex flex-col w-96 mt-24 mx-auto items-center">
                 <>
-                    <h1>New Project</h1>
+                    <Heading1>New Project</Heading1>
 
                     {!selectedRepo && renderSelectRepository()}
-
-                    {selectedRepo && !selectedTeamOrUser && renderSelectTeam()}
-
-                    {selectedRepo && selectedTeamOrUser && <div></div>}
                 </>
             </div>
         );
     } else {
-        const projectLink = User.is(selectedTeamOrUser)
-            ? `/projects/${project.slug}`
-            : `/t/${selectedTeamOrUser?.slug}/${project.slug}`;
-        const location = User.is(selectedTeamOrUser) ? (
+        const projectLink = `/projects/${Project.slug(project!)}`;
+        const location = !currentTeam ? (
             ""
         ) : (
             <>
                 {" "}
-                in team{" "}
-                <a className="gp-link" href={`/t/${selectedTeamOrUser?.slug}/projects`}>
-                    {selectedTeamOrUser?.name}
+                in organization{" "}
+                <a className="gp-link" href={`/projects`}>
+                    {currentTeam?.name}
                 </a>
             </>
         );
@@ -632,15 +533,15 @@ export default function NewProject() {
         return (
             <div className="flex flex-col w-96 mt-24 mx-auto items-center">
                 <>
-                    <h1>Project Created</h1>
+                    <Heading1>Project Created</Heading1>
 
-                    <p className="mt-2 text-gray-500 text-center text-base">
+                    <Subheading className="mt-2 text-center">
                         Created{" "}
                         <a className="gp-link" href={projectLink}>
                             {project.name}
                         </a>{" "}
                         {location}
-                    </p>
+                    </Subheading>
 
                     <div className="mt-12">
                         <button onClick={onNewWorkspace}>New Workspace</button>
@@ -726,65 +627,9 @@ function GitProviders(props: {
     );
 }
 
-function NewTeam(props: { onSuccess: (team: Team) => void }) {
-    const { setTeams } = useContext(TeamsContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
-
-    const [teamName, setTeamName] = useState<string | undefined>();
-    const [error, setError] = useState<string | undefined>();
-
-    const onNewTeam = async () => {
-        if (!teamName) {
-            return;
-        }
-
-        try {
-            const team = usePublicApiTeamsService
-                ? publicApiTeamToProtocol((await teamsService.createTeam({ name: teamName })).team!)
-                : await getGitpodService().server.createTeam(teamName);
-            const teams = usePublicApiTeamsService
-                ? publicApiTeamsToProtocol((await teamsService.listTeams({})).teams)
-                : await getGitpodService().server.getTeams();
-
-            setTeams(teams);
-            props.onSuccess(team);
-        } catch (error) {
-            console.error(error);
-            if (error instanceof ConnectError) {
-                setError(error.rawMessage);
-            } else {
-                setError(error?.message || "Failed to create new team!");
-            }
-        }
-    };
-
-    const onTeamNameChanged = (name: string) => {
-        setTeamName(name);
-        setError(undefined);
-    };
-
-    return (
-        <>
-            <div className="mt-6 mb-1 flex flex-row space-x-2">
-                <input
-                    type="text"
-                    className="py-1 min-w-0"
-                    name="new-team-inline"
-                    value={teamName}
-                    onChange={(e) => onTeamNameChanged(e.target.value)}
-                />
-                <button key={`new-team-inline-create`} disabled={!teamName} onClick={() => onNewTeam()}>
-                    Continue
-                </button>
-            </div>
-            {error && <p className="text-gitpod-red">{error}</p>}
-        </>
-    );
-}
-
 async function openReconfigureWindow(params: { account?: string; onSuccess: (p: any) => void }) {
     const { account, onSuccess } = params;
-    const state = btoa(JSON.stringify({ from: "/reconfigure", next: "/new" }));
+    const state = btoa(JSON.stringify({ from: "/reconfigure", next: projectsPathNew }));
     const url = gitpodHostUrl
         .withApi({
             pathname: "/apps/github/reconfigure",

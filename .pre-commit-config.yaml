@@ -4,6 +4,7 @@ repos:
     hooks:
       #- id: check-yaml
       #  args: [--allow-multiple-documents]
+      - id: check-json
       - id: end-of-file-fixer
       - id: trailing-whitespace
       - id: check-symlinks
@@ -48,6 +49,14 @@ repos:
       - id: license-header
         name: license-header
         entry: leeway run components:update-license-header
+        language: system
+        pass_filenames: false
+
+  - repo: local
+    hooks:
+      - id: mocha-tests-only
+        name: mocha-tests-only
+        entry: leeway run components:check-mocha-no-only
         language: system
         pass_filenames: false
 

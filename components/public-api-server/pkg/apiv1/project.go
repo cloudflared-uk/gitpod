@@ -145,7 +145,7 @@ func (s *ProjectsService) ListProjects(ctx context.Context, req *connect.Request
 }
 
 func (s *ProjectsService) DeleteProject(ctx context.Context, req *connect.Request[v1.DeleteProjectRequest]) (*connect.Response[v1.DeleteProjectResponse], error) {
-	projectID, err := validateProjectID(req.Msg.GetProjectId())
+	projectID, err := validateProjectID(ctx, req.Msg.GetProjectId())
 	if err != nil {
 		return nil, err
 	}
@@ -171,7 +171,7 @@ func (s *ProjectsService) getConnection(ctx context.Context) (protocol.APIInterf
 
 	conn, err := s.connectionPool.Get(ctx, token)
 	if err != nil {
-		log.Log.WithError(err).Error("Failed to get connection to server.")
+		log.Extract(ctx).WithError(err).Error("Failed to get connection to server.")
 		return nil, connect.NewError(connect.CodeInternal, errors.New("Failed to establish connection to downstream services. If this issue persists, please contact Gitpod Support."))
 	}
 
@@ -193,9 +193,8 @@ func projectToAPIResponse(p *protocol.Project) *v1.Project {
 		TeamId:       p.TeamID,
 		UserId:       p.UserID,
 		Name:         p.Name,
-		Slug:         p.Slug,
 		CloneUrl:     p.CloneURL,
-		CreationTime: parseTimeStamp(p.CreationTime),
+		CreationTime: parseGitpodTimeStampOrDefault(p.CreationTime),
 		Settings:     projectSettingsToAPIResponse(p.Settings),
 	}
 }
@@ -228,19 +227,4 @@ func workspaceClassesToAPIResponse(s *protocol.WorkspaceClassesSettings) *v1.Wor
 		Regular:  s.Regular,
 		Prebuild: s.Prebuild,
 	}
-}
-
-func validateProjectID(id string) (uuid.UUID, error) {
-	trimmed := strings.TrimSpace(id)
-
-	if trimmed == "" {
-		return uuid.Nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("Project ID is a required argument."))
-	}
-
-	projectID, err := uuid.Parse(trimmed)
-	if err != nil {
-		return uuid.Nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("Project ID must be a valid UUID."))
-	}
-
-	return projectID, nil
 }

@@ -27,6 +27,10 @@ import {
     UserSSHPublicKeyValue,
     SSHPublicKeyValue,
     IDESettings,
+    EnvVarWithValue,
+    WorkspaceTimeoutSetting,
+    WorkspaceContext,
+    LinkedInProfile,
 } from "./protocol";
 import {
     Team,
@@ -38,6 +42,7 @@ import {
     StartPrebuildResult,
     PartialProject,
     PrebuildEvent,
+    OrganizationSettings,
 } from "./teams-projects-protocol";
 import { JsonRpcProxy, JsonRpcServer } from "./messaging/proxy-factory";
 import { Disposable, CancellationTokenSource } from "vscode-jsonrpc";
@@ -62,14 +67,13 @@ import { IDEServer } from "./ide-protocol";
 import { ListUsageRequest, ListUsageResponse, CostCenterJSON } from "./usage";
 import { SupportedWorkspaceClass } from "./workspace-class";
 import { BillingMode } from "./billing-mode";
+import { WorkspaceRegion } from "./workspace-cluster";
 
 export interface GitpodClient {
     onInstanceUpdate(instance: WorkspaceInstance): void;
     onWorkspaceImageBuildLogs: WorkspaceImageBuild.LogCallback;
 
     onPrebuildUpdate(update: PrebuildWithStatus): void;
-
-    onNotificationUpdated(): void;
 
     onCreditAlert(creditAlert: CreditAlert): void;
 
@@ -116,6 +120,7 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getWorkspace(id: string): Promise<WorkspaceInfo>;
     isWorkspaceOwner(workspaceId: string): Promise<boolean>;
     getOwnerToken(workspaceId: string): Promise<string>;
+    getIDECredentials(workspaceId: string): Promise<string>;
 
     /**
      * Creates and starts a workspace for the given context URL.
@@ -128,6 +133,7 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     deleteWorkspace(id: string): Promise<void>;
     setWorkspaceDescription(id: string, desc: string): Promise<void>;
     controlAdmission(id: string, level: GitpodServer.AdmissionLevel): Promise<void>;
+    resolveContext(contextUrl: string): Promise<WorkspaceContext>;
 
     updateWorkspaceUserPin(id: string, action: GitpodServer.PinAction): Promise<void>;
     sendHeartBeat(options: GitpodServer.SendHeartBeatOptions): Promise<void>;
@@ -151,6 +157,9 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getUserStorageResource(options: GitpodServer.GetUserStorageResourceOptions): Promise<string>;
     updateUserStorageResource(options: GitpodServer.UpdateUserStorageResourceOptions): Promise<void>;
 
+    // Workspace env vars
+    getWorkspaceEnvVars(workspaceId: string): Promise<EnvVarWithValue[]>;
+
     // User env vars
     getEnvVars(): Promise<UserEnvVarValue[]>;
     getAllEnvVars(): Promise<UserEnvVarValue[]>;
@@ -165,6 +174,7 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
 
     // Teams
     getTeam(teamId: string): Promise<Team>;
+    updateTeam(teamId: string, team: Pick<Team, "name" | "slug">): Promise<Team>;
     getTeams(): Promise<Team[]>;
     getTeamMembers(teamId: string): Promise<TeamMemberInfo[]>;
     createTeam(name: string): Promise<Team>;
@@ -174,6 +184,12 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getGenericInvite(teamId: string): Promise<TeamMembershipInvite>;
     resetGenericInvite(inviteId: string): Promise<TeamMembershipInvite>;
     deleteTeam(teamId: string): Promise<void>;
+    getOrgSettings(orgId: string): Promise<OrganizationSettings>;
+    updateOrgSettings(teamId: string, settings: Partial<OrganizationSettings>): Promise<OrganizationSettings>;
+    createOrgAuthProvider(params: GitpodServer.CreateOrgAuthProviderParams): Promise<AuthProviderEntry>;
+    updateOrgAuthProvider(params: GitpodServer.UpdateOrgAuthProviderParams): Promise<AuthProviderEntry>;
+    getOrgAuthProviders(params: GitpodServer.GetOrgAuthProviderParams): Promise<AuthProviderEntry[]>;
+    deleteOrgAuthProvider(params: GitpodServer.DeleteOrgAuthProviderParams): Promise<void>;
 
     // Projects
     getProviderRepositoriesForUser(params: GetProviderRepositoriesParams): Promise<ProviderRepository[]>;
@@ -254,6 +270,8 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     subscriptionCancelDowngrade(subscriptionId: string): Promise<void>;
 
     getTeamSubscription(teamId: string): Promise<TeamSubscription2 | undefined>;
+    cancelTeamSubscription(teamId: string): Promise<void>;
+    tsCancel(teamSubscriptionId: string): Promise<void>;
     tsGet(): Promise<TeamSubscription[]>;
     tsGetSlots(): Promise<TeamSubscriptionSlotResolved[]>;
     tsGetUnassignedSlot(teamSubscriptionId: string): Promise<TeamSubscriptionSlot | undefined>;
@@ -266,12 +284,14 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     tsReassignSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string, newIdentityStr: string): Promise<void>;
     tsDeactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void>;
     tsReactivateSlot(teamSubscriptionId: string, teamSubscriptionSlotId: string): Promise<void>;
+    tsAddMembersToOrg(teamSubscriptionId: string, organizationId: string): Promise<void>;
 
     getGithubUpgradeUrls(): Promise<GithubUpgradeURL[]>;
 
     getStripePublishableKey(): Promise<string>;
     getStripeSetupIntentClientSecret(): Promise<string>;
     findStripeSubscriptionId(attributionId: string): Promise<string | undefined>;
+    getPriceInformation(attributionId: string): Promise<string | undefined>;
     createStripeCustomerIfNeeded(attributionId: string, currency: string): Promise<void>;
     subscribeToStripe(attributionId: string, setupIntentId: string, usageLimit: number): Promise<number | undefined>;
     getStripePortalUrl(attributionId: string): Promise<string>;
@@ -287,6 +307,9 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     getBillingModeForUser(): Promise<BillingMode>;
     getBillingModeForTeam(teamId: string): Promise<BillingMode>;
 
+    getLinkedInClientId(): Promise<string>;
+    connectWithLinkedIn(code: string): Promise<LinkedInProfile>;
+
     /**
      * Analytics
      */
@@ -295,11 +318,18 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
     identifyUser(event: RemoteIdentifyMessage): Promise<void>;
 
     /**
-     * Frontend notifications
+     * Frontend metrics
      */
-    getNotifications(): Promise<string[]>;
+    reportErrorBoundary(url: string, message: string): Promise<void>;
 
     getSupportedWorkspaceClasses(): Promise<SupportedWorkspaceClass[]>;
+    maySetTimeout(): Promise<boolean>;
+    updateWorkspaceTimeoutSetting(setting: Partial<WorkspaceTimeoutSetting>): Promise<void>;
+
+    /**
+     * getIDToken - doesn't actually do anything, just used to authenticat/authorise
+     */
+    getIDToken(): Promise<void>;
 }
 
 export interface RateLimiterError {
@@ -352,16 +382,33 @@ export interface ClientHeaderFields {
     clientRegion?: string;
 }
 
-export const WORKSPACE_TIMEOUT_DEFAULT_SHORT = "short";
-export const WORKSPACE_TIMEOUT_DEFAULT_LONG = "long";
-export const WORKSPACE_TIMEOUT_EXTENDED = "extended";
-export const WORKSPACE_TIMEOUT_EXTENDED_ALT = "180m"; // for backwards compatibility since the IDE uses this
-export const WorkspaceTimeoutValues = [
-    WORKSPACE_TIMEOUT_DEFAULT_SHORT,
-    WORKSPACE_TIMEOUT_DEFAULT_LONG,
-    WORKSPACE_TIMEOUT_EXTENDED,
-    WORKSPACE_TIMEOUT_EXTENDED_ALT,
-] as const;
+const WORKSPACE_MAXIMUM_TIMEOUT_HOURS = 24;
+
+export type WorkspaceTimeoutDuration = string;
+export namespace WorkspaceTimeoutDuration {
+    export function validate(duration: string): WorkspaceTimeoutDuration {
+        duration = duration.toLowerCase();
+        const unit = duration.slice(-1);
+        if (!["m", "h"].includes(unit)) {
+            throw new Error(`Invalid timeout unit: ${unit}`);
+        }
+        const value = parseInt(duration.slice(0, -1), 10);
+        if (isNaN(value) || value <= 0) {
+            throw new Error(`Invalid timeout value: ${duration}`);
+        }
+        if (
+            (unit === "h" && value > WORKSPACE_MAXIMUM_TIMEOUT_HOURS) ||
+            (unit === "m" && value > WORKSPACE_MAXIMUM_TIMEOUT_HOURS * 60)
+        ) {
+            throw new Error("Workspace inactivity timeout cannot exceed 24h");
+        }
+        return duration;
+    }
+}
+
+export const WORKSPACE_TIMEOUT_DEFAULT_SHORT: WorkspaceTimeoutDuration = "30m";
+export const WORKSPACE_TIMEOUT_DEFAULT_LONG: WorkspaceTimeoutDuration = "60m";
+export const WORKSPACE_TIMEOUT_EXTENDED: WorkspaceTimeoutDuration = "180m";
 
 export const createServiceMock = function <C extends GitpodClient, S extends GitpodServer>(
     methods: Partial<JsonRpcProxy<S>>,
@@ -386,17 +433,15 @@ export const createServerMock = function <C extends GitpodClient, S extends Gitp
     });
 };
 
-type WorkspaceTimeoutDurationTuple = typeof WorkspaceTimeoutValues;
-export type WorkspaceTimeoutDuration = WorkspaceTimeoutDurationTuple[number];
-
 export interface SetWorkspaceTimeoutResult {
     resetTimeoutOnWorkspaces: string[];
+    humanReadableDuration: string;
 }
 
 export interface GetWorkspaceTimeoutResult {
     duration: WorkspaceTimeoutDuration;
-    durationRaw: string;
     canChange: boolean;
+    humanReadableDuration: string;
 }
 
 export interface StartWorkspaceResult {
@@ -417,8 +462,10 @@ export namespace GitpodServer {
     }
     export interface CreateWorkspaceOptions extends StartWorkspaceOptions {
         contextUrl: string;
+        organizationId?: string;
 
         // whether running workspaces on the same context should be ignored. If false (default) users will be asked.
+        //TODO(se) remove this option and let clients do that check if they like. The new create workspace page does it already
         ignoreRunningWorkspaceOnSameCommit?: boolean;
         ignoreRunningPrebuild?: boolean;
         allowUsingPreviousPrebuilds?: boolean;
@@ -429,6 +476,7 @@ export namespace GitpodServer {
         forceDefaultImage?: boolean;
         workspaceClass?: string;
         ideSettings?: IDESettings;
+        region?: WorkspaceRegion;
     }
     export interface TakeSnapshotOptions {
         workspaceId: string;
@@ -455,6 +503,20 @@ export namespace GitpodServer {
     }
     export interface DeleteOwnAuthProviderParams {
         readonly id: string;
+    }
+    export interface CreateOrgAuthProviderParams {
+        // ownerId is automatically set to the authenticated user
+        readonly entry: Omit<AuthProviderEntry.NewOrgEntry, "ownerId">;
+    }
+    export interface UpdateOrgAuthProviderParams {
+        readonly entry: AuthProviderEntry.UpdateOrgEntry;
+    }
+    export interface GetOrgAuthProviderParams {
+        readonly organizationId: string;
+    }
+    export interface DeleteOrgAuthProviderParams {
+        readonly id: string;
+        readonly organizationId: string;
     }
     export type AdmissionLevel = "owner" | "everyone";
     export type PinAction = "pin" | "unpin" | "toggle";
@@ -553,18 +615,6 @@ export class GitpodCompositeClient<Client extends GitpodClient> implements Gitpo
             if (client.onCreditAlert) {
                 try {
                     client.onCreditAlert(creditAlert);
-                } catch (error) {
-                    console.error(error);
-                }
-            }
-        }
-    }
-
-    onNotificationUpdated(): void {
-        for (const client of this.clients) {
-            if (client.onNotificationUpdated) {
-                try {
-                    client.onNotificationUpdated();
                 } catch (error) {
                     console.error(error);
                 }

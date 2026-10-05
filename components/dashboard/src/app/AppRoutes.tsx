@@ -4,66 +4,67 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import React, { FunctionComponent, useContext, useState } from "react";
-import { ContextURL, User, Team } from "@gitpod/gitpod-protocol";
-import SelectIDEModal from "../settings/SelectIDEModal";
-import { StartPage, StartPhase } from "../start/StartPage";
-import { getURLHash, isGitpodIo, isLocalPreview } from "../utils";
-import { shouldSeeWhatsNew, WhatsNew } from "../whatsnew/WhatsNew";
-import { Redirect, Route, Switch } from "react-router";
-import Menu from "../Menu";
+import { User } from "@gitpod/gitpod-protocol";
+import React, { useContext, useState } from "react";
+import { Redirect, Route, Switch, useLocation } from "react-router";
+import Menu from "../menu/Menu";
+import OAuthClientApproval from "../OauthClientApproval";
+import { projectsPathInstallGitHubApp, projectsPathNew } from "../projects/projects.routes";
 import { parseProps } from "../start/StartWorkspace";
-import { AppNotifications } from "../AppNotifications";
-import { AdminRoute } from "./AdminRoute";
-import { StartWorkspaceModal } from "../workspaces/StartWorkspaceModal";
 import {
     settingsPathAccount,
     settingsPathBilling,
     settingsPathIntegrations,
     settingsPathMain,
     settingsPathNotifications,
-    settingsPathPlans,
-    settingsPathPreferences,
-    settingsPathTeams,
-    settingsPathTeamsJoin,
-    settingsPathTeamsNew,
-    settingsPathVariables,
-    settingsPathSSHKeys,
-    usagePathMain,
-    settingsPathPersonalAccessTokens,
     settingsPathPersonalAccessTokenCreate,
     settingsPathPersonalAccessTokenEdit,
-} from "../settings/settings.routes";
-import {
-    projectsPathInstallGitHubApp,
-    projectsPathMain,
-    projectsPathMainWithParams,
-    projectsPathNew,
-} from "../projects/projects.routes";
+    settingsPathPersonalAccessTokens,
+    settingsPathPlans,
+    settingsPathPreferences,
+    settingsPathSSHKeys,
+    settingsPathVariables,
+    switchToPAYGPathMain,
+    usagePathMain,
+} from "../user-settings/settings.routes";
+import { getURLHash, isGitpodIo, isLocalPreview } from "../utils";
+import { shouldSeeWhatsNew, WhatsNew } from "../whatsnew/WhatsNew";
+import { StartWorkspaceModal } from "../workspaces/StartWorkspaceModal";
 import { workspacesPathMain } from "../workspaces/workspaces.routes";
-import { LocalPreviewAlert } from "./LocalPreviewAlert";
-import OAuthClientApproval from "../OauthClientApproval";
+import { AdminRoute } from "./AdminRoute";
 import { Blocked } from "./Blocked";
+import { LocalPreviewAlert } from "./LocalPreviewAlert";
 
 // TODO: Can we bundle-split/lazy load these like other pages?
 import { BlockedRepositories } from "../admin/BlockedRepositories";
-import PersonalAccessTokenCreateView from "../settings/PersonalAccessTokensCreateView";
+import PersonalAccessTokenCreateView from "../user-settings/PersonalAccessTokensCreateView";
+import { CreateWorkspacePage, useNewCreateWorkspacePage } from "../workspaces/CreateWorkspacePage";
 import { StartWorkspaceModalContext } from "../workspaces/start-workspace-modal-context";
+import { OrgRequiredRoute } from "./OrgRequiredRoute";
+import { WebsocketClients } from "./WebsocketClients";
 import { StartWorkspaceOptions } from "../start/start-workspace-options";
+import { useFeatureFlags } from "../contexts/FeatureFlagContext";
+import { FORCE_ONBOARDING_PARAM, FORCE_ONBOARDING_PARAM_VALUE } from "../onboarding/UserOnboarding";
+import { Heading1, Subheading } from "../components/typography/headings";
+import { useCurrentUser } from "../user-context";
+import { LinkedInCallback } from "react-linkedin-login-oauth2";
 
 const Setup = React.lazy(() => import(/* webpackPrefetch: true */ "../Setup"));
 const Workspaces = React.lazy(() => import(/* webpackPrefetch: true */ "../workspaces/Workspaces"));
-const Account = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Account"));
-const Notifications = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Notifications"));
-const Billing = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Billing"));
-const Plans = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Plans"));
-const Teams = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Teams"));
-const EnvironmentVariables = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/EnvironmentVariables"));
-const SSHKeys = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/SSHKeys"));
-const Integrations = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Integrations"));
-const Preferences = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/Preferences"));
-const PersonalAccessTokens = React.lazy(() => import(/* webpackPrefetch: true */ "../settings/PersonalAccessTokens"));
-const Open = React.lazy(() => import(/* webpackPrefetch: true */ "../start/Open"));
+const Account = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Account"));
+const Notifications = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Notifications"));
+const Billing = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Billing"));
+const Plans = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Plans"));
+const ChargebeeTeams = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/ChargebeeTeams"));
+const EnvironmentVariables = React.lazy(
+    () => import(/* webpackPrefetch: true */ "../user-settings/EnvironmentVariables"),
+);
+const SSHKeys = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/SSHKeys"));
+const Integrations = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Integrations"));
+const Preferences = React.lazy(() => import(/* webpackPrefetch: true */ "../user-settings/Preferences"));
+const PersonalAccessTokens = React.lazy(
+    () => import(/* webpackPrefetch: true */ "../user-settings/PersonalAccessTokens"),
+);
 const StartWorkspace = React.lazy(() => import(/* webpackPrefetch: true */ "../start/StartWorkspace"));
 const CreateWorkspace = React.lazy(() => import(/* webpackPrefetch: true */ "../start/CreateWorkspace"));
 const NewTeam = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/NewTeam"));
@@ -71,7 +72,8 @@ const JoinTeam = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/J
 const Members = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/Members"));
 const TeamSettings = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/TeamSettings"));
 const TeamBilling = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/TeamBilling"));
-const TeamUsage = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/TeamUsage"));
+const SSO = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/SSO"));
+const TeamGitIntegrations = React.lazy(() => import(/* webpackPrefetch: true */ "../teams/GitIntegrationsPage"));
 const NewProject = React.lazy(() => import(/* webpackPrefetch: true */ "../projects/NewProject"));
 const Projects = React.lazy(() => import(/* webpackPrefetch: true */ "../projects/Projects"));
 const Project = React.lazy(() => import(/* webpackPrefetch: true */ "../projects/Project"));
@@ -89,29 +91,29 @@ const ProjectsSearch = React.lazy(() => import(/* webpackPrefetch: true */ "../a
 const TeamsSearch = React.lazy(() => import(/* webpackPrefetch: true */ "../admin/TeamsSearch"));
 const License = React.lazy(() => import(/* webpackPrefetch: true */ "../admin/License"));
 const Usage = React.lazy(() => import(/* webpackPrefetch: true */ "../Usage"));
+const UserOnboarding = React.lazy(() => import(/* webpackPrefetch: true */ "../onboarding/UserOnboarding"));
 
-type AppRoutesProps = {
-    user: User;
-    teams?: Team[];
-};
-export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) => {
+export const AppRoutes = () => {
     const hash = getURLHash();
+    const user = useCurrentUser();
     const { startWorkspaceModalProps, setStartWorkspaceModalProps } = useContext(StartWorkspaceModalContext);
-    const [isWhatsNewShown, setWhatsNewShown] = useState(shouldSeeWhatsNew(user));
+    const [isWhatsNewShown, setWhatsNewShown] = useState(user && shouldSeeWhatsNew(user));
+    const newCreateWsPage = useNewCreateWorkspacePage();
+    const location = useLocation();
+    const { newSignupFlow } = useFeatureFlags();
 
-    // Prefix with `/#referrer` will specify an IDE for workspace
-    // We don't need to show IDE preference in this case
-    const [showUserIdePreference, setShowUserIdePreference] = useState(
-        User.isOnboardingUser(user) && !hash.startsWith(ContextURL.REFERRER_PREFIX),
-    );
+    if (!user) {
+        return <></>;
+    }
+    const search = new URLSearchParams(location.search);
 
     // TODO: Add a Route for this instead of inspecting location manually
-    if (window.location.pathname.startsWith("/blocked")) {
+    if (location.pathname.startsWith("/blocked")) {
         return <Blocked />;
     }
 
     // TODO: Add a Route for this instead of inspecting location manually
-    if (window.location.pathname.startsWith("/oauth-approval")) {
+    if (location.pathname.startsWith("/oauth-approval")) {
         return <OAuthClientApproval />;
     }
 
@@ -119,30 +121,26 @@ export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) =>
         return <WhatsNew onClose={() => setWhatsNewShown(false)} />;
     }
 
+    if (location.pathname === "/linkedin" && search.get("code") && search.get("state")) {
+        return <LinkedInCallback />;
+    }
+
+    // Show new signup flow if:
+    // * feature flag enabled
+    // * User is onboarding (no ide selected yet) OR query param `onboarding=force` is set
+    const showNewSignupFlow =
+        newSignupFlow &&
+        (User.isOnboardingUser(user) || search.get(FORCE_ONBOARDING_PARAM) === FORCE_ONBOARDING_PARAM_VALUE);
+    if (showNewSignupFlow) {
+        return <UserOnboarding user={user} />;
+    }
+
     // TODO: Try and encapsulate this in a route for "/" (check for hash in route component, render or redirect accordingly)
-    const isCreation = window.location.pathname === "/" && hash !== "";
+    const isCreation = location.pathname === "/" && hash !== "";
     if (isCreation) {
-        if (showUserIdePreference) {
-            return (
-                <StartPage phase={StartPhase.Checking}>
-                    <SelectIDEModal location="workspace_start" onClose={() => setShowUserIdePreference(false)} />
-                </StartPage>
-            );
-        } else if (new URLSearchParams(window.location.search).has("showOptions")) {
-            const props = StartWorkspaceOptions.parseSearchParams(window.location.search);
-            return (
-                <StartWorkspaceModal
-                    {...{
-                        contextUrl: hash,
-                        ide: props?.ideSettings?.defaultIde,
-                        uselatestIde: props?.ideSettings?.useLatestVersion,
-                        workspaceClass: props.workspaceClass,
-                        onClose: undefined,
-                    }}
-                />
-            );
+        if (new URLSearchParams(location.search).has("showOptions") || newCreateWsPage) {
+            return <Redirect to={"/new" + location.pathname + location.search + location.hash} />;
         } else {
-            // return <div>create workspace yay {hash}</div>;
             return <CreateWorkspace contextUrl={hash} />;
         }
     }
@@ -162,15 +160,34 @@ export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) =>
         return <div></div>;
     }
 
+    if (newCreateWsPage && startWorkspaceModalProps) {
+        const search = StartWorkspaceOptions.toSearchParams({
+            ideSettings: {
+                defaultIde: startWorkspaceModalProps.ide,
+                useLatestVersion: startWorkspaceModalProps.uselatestIde,
+            },
+            workspaceClass: startWorkspaceModalProps.workspaceClass,
+        });
+        const hash = startWorkspaceModalProps.contextUrl ? "#" + startWorkspaceModalProps.contextUrl : "";
+        setStartWorkspaceModalProps(undefined);
+        return <Redirect to={"/new/" + search + hash} />;
+    }
+
     return (
         <Route>
             <div className="container">
                 <Menu />
                 {isLocalPreview() && <LocalPreviewAlert />}
-                <AppNotifications />
                 <Switch>
+                    <Route path="/new" exact component={CreateWorkspacePage} />
                     <Route path={projectsPathNew} exact component={NewProject} />
-                    <Route path="/open" exact component={Open} />
+                    <Route path="/open">
+                        <Redirect to="/new" />
+                    </Route>
+                    {/* TODO(gpl): Remove once we don't need the redirect anymore */}
+                    <Route path={[switchToPAYGPathMain]} exact>
+                        <Redirect to={"/billing"} />
+                    </Route>
                     <Route path="/setup" exact component={Setup} />
                     <Route path={workspacesPathMain} exact component={Workspaces} />
                     <Route path={settingsPathAccount} exact component={Account} />
@@ -197,7 +214,7 @@ export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) =>
                     <Route path="/from-referrer" exact component={FromReferrer} />
 
                     <AdminRoute path="/admin/users" component={UserSearch} />
-                    <AdminRoute path="/admin/teams" component={TeamsSearch} />
+                    <AdminRoute path="/admin/orgs" component={TeamsSearch} />
                     <AdminRoute path="/admin/workspaces" component={WorkspacesSearch} />
                     <AdminRoute path="/admin/projects" component={ProjectsSearch} />
                     <AdminRoute path="/admin/blocked-repositories" component={BlockedRepositories} />
@@ -221,79 +238,69 @@ export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) =>
                     </Route>
                     <Route path="/sorry" exact>
                         <div className="mt-48 text-center">
-                            <h1 className="text-gray-500 text-3xl">Oh, no! Something went wrong!</h1>
-                            <p className="mt-4 text-lg text-gitpod-red">{decodeURIComponent(getURLHash())}</p>
+                            <Heading1 color="light">Oh, no! Something went wrong!</Heading1>
+                            <Subheading className="mt-4 text-gitpod-red">{decodeURIComponent(getURLHash())}</Subheading>
                         </div>
                     </Route>
-                    <Route path={projectsPathMain}>
-                        <Route exact path={projectsPathMain} component={Projects} />
-                        <Route
-                            exact
-                            path={projectsPathMainWithParams}
-                            render={({ match }) => {
-                                const { resourceOrPrebuild } = match.params;
-                                switch (resourceOrPrebuild) {
-                                    case "events":
-                                        return <Events />;
-                                    case "prebuilds":
-                                        return <Prebuilds />;
-                                    case "settings":
-                                        return <ProjectSettings />;
-                                    case "variables":
-                                        return <ProjectVariables />;
-                                    default:
-                                        return resourceOrPrebuild ? <Prebuild /> : <Project />;
-                                }
-                            }}
-                        />
+                    <Route exact path="/teams">
+                        <Redirect to="/old-team-plans" />
                     </Route>
-                    <Route path={settingsPathTeams}>
-                        <Route exact path={settingsPathTeams} component={Teams} />
-                        <Route exact path={settingsPathTeamsNew} component={NewTeam} />
-                        <Route exact path={settingsPathTeamsJoin} component={JoinTeam} />
+                    <Route exact path="/old-team-plans" component={ChargebeeTeams} />
+                    {/* TODO remove the /teams/join navigation after a few weeks */}
+                    <Route exact path="/teams/join" component={JoinTeam} />
+                    <Route exact path="/orgs/new" component={NewTeam} />
+                    <Route exact path="/orgs/join" component={JoinTeam} />
+                    <Route exact path="/projects" component={Projects} />
+
+                    {/* These routes that require a selected organization, otherwise they redirect to "/" */}
+                    <OrgRequiredRoute exact path="/members" component={Members} />
+                    <OrgRequiredRoute exact path="/settings" component={TeamSettings} />
+                    <OrgRequiredRoute exact path="/settings/git" component={TeamGitIntegrations} />
+                    {/* TODO: migrate other org settings pages underneath /settings prefix so we can utilize nested routes */}
+                    <OrgRequiredRoute exact path="/billing" component={TeamBilling} />
+                    <OrgRequiredRoute exact path="/sso" component={SSO} />
+
+                    <Route exact path={`/projects/:projectSlug`} component={Project} />
+                    <Route exact path={`/projects/:projectSlug/events`} component={Events} />
+                    <Route exact path={`/projects/:projectSlug/prebuilds`} component={Prebuilds} />
+                    <Route exact path={`/projects/:projectSlug/settings`} component={ProjectSettings} />
+                    <Route exact path={`/projects/:projectSlug/variables`} component={ProjectVariables} />
+                    <Route exact path={`/projects/:projectSlug/:prebuildId`} component={Prebuild} />
+                    {/* basic redirect for old team slugs */}
+                    <Route path={["/t/"]} exact>
+                        <Redirect to="/projects" />
                     </Route>
-                    {(teams || []).map((team) => (
-                        <Route path={`/t/${team.slug}`} key={team.slug}>
-                            <Route exact path={`/t/${team.slug}`}>
-                                <Redirect to={`/t/${team.slug}/projects`} />
-                            </Route>
-                            <Route
-                                exact
-                                path={`/t/${team.slug}/:maybeProject/:resourceOrPrebuild?`}
-                                render={({ match }) => {
-                                    const { maybeProject, resourceOrPrebuild } = match.params;
-                                    switch (maybeProject) {
-                                        case "projects":
-                                            return <Projects />;
-                                        case "workspaces":
-                                            return <Workspaces />;
-                                        case "members":
-                                            return <Members />;
-                                        case "settings":
-                                            return <TeamSettings />;
-                                        case "billing":
-                                            return <TeamBilling />;
-                                        case "usage":
-                                            return <TeamUsage />;
-                                        default:
-                                            break;
-                                    }
-                                    switch (resourceOrPrebuild) {
-                                        case "events":
-                                            return <Events />;
-                                        case "prebuilds":
-                                            return <Prebuilds />;
-                                        case "settings":
-                                            return <ProjectSettings />;
-                                        case "variables":
-                                            return <ProjectVariables />;
-                                        default:
-                                            return resourceOrPrebuild ? <Prebuild /> : <Project />;
-                                    }
-                                }}
-                            />
-                        </Route>
-                    ))}
+                    {/* redirect for old user settings slugs */}
+                    <Route path="/account" exact>
+                        <Redirect to={settingsPathAccount} />
+                    </Route>
+                    <Route path="/integrations" exact>
+                        <Redirect to={settingsPathIntegrations} />
+                    </Route>
+                    <Route path="/notifications" exact>
+                        <Redirect to={settingsPathNotifications} />
+                    </Route>
+                    <Route path="/billing" exact>
+                        <Redirect to={settingsPathBilling} />
+                    </Route>
+                    <Route path="/plans" exact>
+                        <Redirect to={settingsPathPlans} />
+                    </Route>
+                    <Route path="/preferences" exact>
+                        <Redirect to={settingsPathPreferences} />
+                    </Route>
+                    <Route path="/variables" exact>
+                        <Redirect to={settingsPathVariables} />
+                    </Route>
+                    <Route path="/tokens" exact>
+                        <Redirect to={settingsPathPersonalAccessTokens} />
+                    </Route>
+                    <Route path="/tokens/create" exact>
+                        <Redirect to={settingsPathPersonalAccessTokenCreate} />
+                    </Route>
+                    <Route path="/keys" exact>
+                        <Redirect to={settingsPathSSHKeys} />
+                    </Route>
                     <Route
                         path="*"
                         render={(_match) => {
@@ -302,20 +309,21 @@ export const AppRoutes: FunctionComponent<AppRoutesProps> = ({ user, teams }) =>
                                 (window.location.host = "www.gitpod.io")
                             ) : (
                                 <div className="mt-48 text-center">
-                                    <h1 className="text-gray-500 text-3xl">404</h1>
-                                    <p className="mt-4 text-lg">Page not found.</p>
+                                    <Heading1>404</Heading1>
+                                    <Subheading className="mt-4">Page not found.</Subheading>
                                 </div>
                             );
                         }}
                     ></Route>
                 </Switch>
-                {startWorkspaceModalProps && (
+                {startWorkspaceModalProps && !newCreateWsPage && (
                     <StartWorkspaceModal
                         {...startWorkspaceModalProps}
                         onClose={startWorkspaceModalProps.onClose || (() => setStartWorkspaceModalProps(undefined))}
                     />
                 )}
             </div>
+            <WebsocketClients />
         </Route>
     );
 };

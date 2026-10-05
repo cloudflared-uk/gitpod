@@ -22,13 +22,7 @@ const StorageMount = "/mnt/secrets/storage"
 
 func useMinio(context *RenderContext) bool {
 	// Minio is used for in-cluster storage and as a facade to non-GCP providers
-	if pointer.BoolDeref(context.Config.ObjectStorage.InCluster, false) {
-		return true
-	}
-	if context.Config.ObjectStorage.Azure != nil {
-		return true
-	}
-	return false
+	return pointer.BoolDeref(context.Config.ObjectStorage.InCluster, false)
 }
 
 func StorageConfig(context *RenderContext) storageconfig.StorageConfig {
@@ -48,10 +42,13 @@ func StorageConfig(context *RenderContext) storageconfig.StorageConfig {
 		res = &storageconfig.StorageConfig{
 			Kind: storageconfig.S3Storage,
 			S3Config: &storageconfig.S3Config{
-				Region:          context.Config.Metadata.Region,
-				Bucket:          context.Config.ObjectStorage.S3.BucketName,
-				CredentialsFile: filepath.Join(StorageMount, "credentials"),
+				Region: context.Config.Metadata.Region,
+				Bucket: context.Config.ObjectStorage.S3.BucketName,
 			},
+		}
+
+		if context.Config.ObjectStorage.S3.Credentials != nil && context.Config.ObjectStorage.S3.Credentials.Kind != "" {
+			res.S3Config.CredentialsFile = filepath.Join(StorageMount, "credentials")
 		}
 	}
 
@@ -142,7 +139,9 @@ func AddStorageMounts(ctx *RenderContext, pod *corev1.PodSpec, container ...stri
 	}
 
 	if ctx.Config.ObjectStorage.S3 != nil {
-		MountStorage(pod, ctx.Config.ObjectStorage.S3.Credentials.Name, container...)
+		if ctx.Config.ObjectStorage.S3.Credentials != nil {
+			MountStorage(pod, ctx.Config.ObjectStorage.S3.Credentials.Name, container...)
+		}
 
 		return nil
 	}

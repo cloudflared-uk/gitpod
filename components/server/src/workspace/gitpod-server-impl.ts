@@ -92,7 +92,6 @@ import {
 } from "@gitpod/gitpod-protocol/lib/admin-protocol";
 import {
     GetLicenseInfoResult,
-    LicenseFeature,
     LicenseInfo,
     LicenseValidationResult,
 } from "@gitpod/gitpod-protocol/lib/license-protocol";
@@ -133,7 +132,7 @@ import {
 import * as crypto from "crypto";
 import { inject, injectable } from "inversify";
 import { URL } from "url";
-import { v4 as uuidv4 } from "uuid";
+import { v4 as uuidv4, validate as uuidValidate } from "uuid";
 import { Disposable, ResponseError } from "vscode-jsonrpc";
 import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
 import { AuthProviderService } from "../auth/auth-provider-service";
@@ -159,29 +158,52 @@ import { InvalidGitpodYMLError } from "./config-provider";
 import { ProjectsService } from "../projects/projects-service";
 import { LocalMessageBroker } from "../messaging/local-message-broker";
 import { IDEOptions } from "@gitpod/gitpod-protocol/lib/ide-protocol";
-import { PartialProject } from "@gitpod/gitpod-protocol/src/teams-projects-protocol";
-import { ClientMetadata, traceClientMetadata } from "../websocket/websocket-connection-manager";
+import { PartialProject, OrganizationSettings } from "@gitpod/gitpod-protocol/lib/teams-projects-protocol";
+import { ClientMetadata } from "../websocket/websocket-connection-manager";
 import { ConfigurationService } from "../config/configuration-service";
-import { ProjectEnvVar } from "@gitpod/gitpod-protocol/src/protocol";
+import {
+    AdditionalUserData,
+    EnvVarWithValue,
+    LinkedInProfile,
+    ProjectEnvVar,
+    WorkspaceTimeoutSetting,
+} from "@gitpod/gitpod-protocol/lib/protocol";
 import { InstallationAdminSettings, TelemetryData } from "@gitpod/gitpod-protocol";
 import { Deferred } from "@gitpod/gitpod-protocol/lib/util/deferred";
 import { InstallationAdminTelemetryDataProvider } from "../installation-admin/telemetry-data-provider";
-import { LicenseEvaluator } from "@gitpod/licensor/lib";
-import { Feature } from "@gitpod/licensor/lib/api";
-import { getExperimentsClientForBackend } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
 import { ListUsageRequest, ListUsageResponse } from "@gitpod/gitpod-protocol/lib/usage";
-import { WorkspaceClusterImagebuilderClientProvider } from "./workspace-cluster-imagebuilder-client-provider";
 import { VerificationService } from "../auth/verification-service";
 import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
 import { EntitlementService } from "../billing/entitlement-service";
 import { formatPhoneNumber } from "../user/phone-numbers";
 import { IDEService } from "../ide-service";
-import { MessageBusIntegration } from "./messagebus-integration";
 import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
 import * as grpc from "@grpc/grpc-js";
 import { CachingBlobServiceClientProvider } from "../util/content-service-sugar";
 import { CostCenterJSON } from "@gitpod/gitpod-protocol/lib/usage";
 import { createCookielessId, maskIp } from "../analytics";
+import {
+    ConfigCatClientFactory,
+    getExperimentsClientForBackend,
+} from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
+import {
+    Authorizer,
+    CheckResult,
+    OrganizationOperation,
+    NotPermitted,
+    PermissionChecker,
+} from "../authorization/perms";
+import {
+    ReadOrganizationMembers,
+    ReadOrganizationMetadata,
+    WriteOrganizationMembers,
+    WriteOrganizationMetadata,
+} from "../authorization/checks";
+import { increaseDashboardErrorBoundaryCounter, reportCentralizedPermsValidation } from "../prometheus-metrics";
+import { RegionService } from "./region-service";
+import { isWorkspaceRegion, WorkspaceRegion } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
+import { EnvVarService } from "./env-var-service";
+import { LinkedInService } from "../linkedin-service";
 
 // shortcut
 export const traceWI = (ctx: TraceContext, wi: Omit<LogContext, "userId">) => TraceContext.setOWI(ctx, wi); // userId is already taken care of in WebsocketConnectionManager
@@ -208,14 +230,11 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     @inject(InstallationAdminDB) protected readonly installationAdminDb: InstallationAdminDB;
     @inject(InstallationAdminTelemetryDataProvider)
     protected readonly telemetryDataProvider: InstallationAdminTelemetryDataProvider;
-    @inject(LicenseEvaluator) protected readonly licenseEvaluator: LicenseEvaluator;
 
     @inject(WorkspaceStarter) protected readonly workspaceStarter: WorkspaceStarter;
     @inject(WorkspaceManagerClientProvider)
     protected readonly workspaceManagerClientProvider: WorkspaceManagerClientProvider;
     @inject(ImageBuilderClientProvider) protected imagebuilderClientProvider: ImageBuilderClientProvider;
-    @inject(WorkspaceClusterImagebuilderClientProvider)
-    protected readonly wsClusterImageBuilderClientProvider: ImageBuilderClientProvider;
 
     @inject(UserDB) protected readonly userDB: UserDB;
     @inject(BlockedRepositoryDB) protected readonly blockedRepostoryDB: BlockedRepositoryDB;
@@ -227,6 +246,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     @inject(IAnalyticsWriter) protected readonly analytics: IAnalyticsWriter;
     @inject(AuthorizationService) protected readonly authorizationService: AuthorizationService;
     @inject(TeamDB) protected readonly teamDB: TeamDB;
+    @inject(LinkedInService) protected readonly linkedInService: LinkedInService;
 
     @inject(AppInstallationDB) protected readonly appInstallationDB: AppInstallationDB;
 
@@ -252,7 +272,13 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
 
     @inject(VerificationService) protected readonly verificationService: VerificationService;
     @inject(EntitlementService) protected readonly entitlementService: EntitlementService;
-    @inject(MessageBusIntegration) protected readonly messageBus: MessageBusIntegration;
+
+    @inject(ConfigCatClientFactory) protected readonly configCatClientFactory: ConfigCatClientFactory;
+
+    @inject(PermissionChecker) protected readonly authorizer: Authorizer;
+
+    @inject(EnvVarService)
+    private readonly envVarService: EnvVarService;
 
     /** Id the uniquely identifies this server instance */
     public readonly uuid: string = uuidv4();
@@ -309,16 +335,8 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     }
 
     protected forwardInstanceUpdateToClient(ctx: TraceContext, instance: WorkspaceInstance) {
-        TraceContext.withSpan(
-            "forwardInstanceUpdateToClient",
-            (ctx) => {
-                traceClientMetadata(ctx, this.clientMetadata);
-                TraceContext.setJsonRPCMetadata(ctx, "onInstanceUpdate");
-
-                this.client?.onInstanceUpdate(this.censorInstance(instance));
-            },
-            ctx,
-        );
+        // gpl: We decided against tracing updates here, because it create far too much noise (cmp. history)
+        this.client?.onInstanceUpdate(this.censorInstance(instance));
     }
 
     setClient(ctx: TraceContext, client: GitpodApiClient | undefined): void {
@@ -408,6 +426,9 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     protected async doUpdateUser(): Promise<void> {
         // execute the check for the setup to be shown until the setup is not required.
         // cf. evaluation of the condition in `checkUser`
+        if (!this.config.showSetupModal) {
+            this.showSetupCondition = { value: false };
+        }
         if (!this.showSetupCondition || this.showSetupCondition.value === true) {
             const hasAnyStaticProviders = this.hostContextProvider
                 .getAll()
@@ -474,6 +495,33 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         return user;
     }
 
+    public async maySetTimeout(ctx: TraceContext): Promise<boolean> {
+        const user = this.checkUser("maySetTimeout");
+        await this.guardAccess({ kind: "user", subject: user }, "get");
+
+        return await this.entitlementService.maySetTimeout(user, new Date());
+    }
+
+    public async updateWorkspaceTimeoutSetting(
+        ctx: TraceContext,
+        setting: Partial<WorkspaceTimeoutSetting>,
+    ): Promise<void> {
+        traceAPIParams(ctx, { setting });
+        if (setting.workspaceTimeout) {
+            WorkspaceTimeoutDuration.validate(setting.workspaceTimeout);
+        }
+
+        const user = this.checkAndBlockUser("updateWorkspaceTimeoutSetting");
+        await this.guardAccess({ kind: "user", subject: user }, "update");
+
+        if (!(await this.entitlementService.maySetTimeout(user, new Date()))) {
+            throw new Error("configure workspace timeout only available for paid user.");
+        }
+
+        AdditionalUserData.set(user, setting);
+        await this.userDB.updateUserPartial(user);
+    }
+
     public async sendPhoneNumberVerificationToken(ctx: TraceContext, rawPhoneNumber: string): Promise<void> {
         this.checkUser("sendPhoneNumberVerificationToken");
         return this.verificationService.sendVerificationToken(formatPhoneNumber(rawPhoneNumber));
@@ -519,6 +567,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         const isBuiltIn = (info: AuthProviderInfo) => !info.ownerId;
         const isNotHidden = (info: AuthProviderInfo) => !info.hiddenOnDashboard;
         const isVerified = (info: AuthProviderInfo) => info.verified;
+        const isNotOrgProvider = (info: AuthProviderInfo) => !info.organizationId;
 
         // if no user session is available, compute public information only
         if (!this.user) {
@@ -531,7 +580,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                     icon: info.icon,
                     description: info.description,
                 };
-            let result = authProviders.filter(isNotHidden).filter(isVerified);
+            let result = authProviders.filter(isNotHidden).filter(isVerified).filter(isNotOrgProvider);
             if (builtinAuthProvidersConfigured) {
                 result = result.filter(isBuiltIn);
             }
@@ -669,6 +718,28 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         return ownerToken;
     }
 
+    public async getIDECredentials(ctx: TraceContext, workspaceId: string): Promise<string> {
+        traceAPIParams(ctx, { workspaceId });
+        traceWI(ctx, { workspaceId });
+
+        this.checkAndBlockUser("getIDECredentials");
+
+        const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
+        if (!workspace) {
+            throw new Error("workspace not found");
+        }
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+        if (workspace.config.ideCredentials) {
+            return workspace.config.ideCredentials;
+        }
+        return this.workspaceDb.trace(ctx).transaction(async (db) => {
+            const ws = await this.internalGetWorkspace(workspaceId, db);
+            ws.config.ideCredentials = crypto.randomBytes(32).toString("base64");
+            await db.store(ws);
+            return ws.config.ideCredentials;
+        });
+    }
+
     public async startWorkspace(
         ctx: TraceContext,
         workspaceId: string,
@@ -684,7 +755,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         const mayStartPromise = this.mayStartWorkspace(
             ctx,
             user,
-            workspace,
+            workspace.organizationId,
             this.workspaceDb.trace(ctx).findRegularRunningInstances(user.id),
         );
         await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
@@ -718,13 +789,14 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         if (workspace.deleted) {
             throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Cannot (re-)start a deleted workspace.");
         }
-        const userEnvVars = this.userDB.getEnvVars(user.id);
-        const projectEnvVarsPromise = this.internalGetProjectEnvVars(workspace.projectId);
+        const envVarsPromise = this.envVarService.resolve(workspace);
         const projectPromise = workspace.projectId
             ? this.projectDB.findProjectById(workspace.projectId)
             : Promise.resolve(undefined);
 
         await mayStartPromise;
+
+        options.region = await this.determineWorkspaceRegion(workspace, options.region || "");
 
         // at this point we're about to actually start a new workspace
         const result = await this.workspaceStarter.startWorkspace(
@@ -732,8 +804,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             workspace,
             user,
             await projectPromise,
-            await userEnvVars,
-            await projectEnvVarsPromise,
+            await envVarsPromise,
             options,
         );
         traceWI(ctx, { instanceId: result.instanceID });
@@ -933,7 +1004,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             req.setId(instanceId);
             req.setClosed(wasClosed);
 
-            const client = await this.workspaceManagerClientProvider.get(wsi.region, this.config.installationShortname);
+            const client = await this.workspaceManagerClientProvider.get(wsi.region);
             await client.markActive(ctx, req);
 
             if (options && options.roundTripTime && Number.isFinite(options.roundTripTime)) {
@@ -948,6 +1019,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 // This is an old tab with open workspace: drop silently
                 return;
             } else {
+                e = this.mapGrpcError(e);
                 throw e;
             }
         }
@@ -1062,9 +1134,9 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             const user = this.checkAndBlockUser("createWorkspace", { options });
             await this.checkTermsAcceptance();
 
-            const envVars = this.userDB.getEnvVars(user.id);
             logContext = { userId: user.id };
 
+            //TODO(se) remove this implicit check and let instead clients do the checking.
             // Credit check runs in parallel with the other operations up until we start consuming resources.
             // Make sure to await for the creditCheck promise in the right places.
             const runningInstancesPromise = this.workspaceDb.trace(ctx).findRegularRunningInstances(user.id);
@@ -1163,6 +1235,19 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             const project = CommitContext.is(context)
                 ? await this.projectDB.findProjectByCloneUrl(context.repository.cloneUrl)
                 : undefined;
+
+            let organizationId = options.organizationId;
+            if (!organizationId) {
+                if (!user.additionalData?.isMigratedToTeamOnlyAttribution) {
+                    const attributionId = await this.userService.getWorkspaceUsageAttributionId(user, project?.id);
+                    organizationId = attributionId.kind === "team" ? attributionId.teamId : undefined;
+                } else {
+                    throw new ResponseError(ErrorCodes.BAD_REQUEST, "No organizationId provided.");
+                }
+            }
+            const mayStartWorkspacePromise = this.mayStartWorkspace(ctx, user, organizationId, runningInstancesPromise);
+
+            // TODO (se) findPrebuiltWorkspace also needs the organizationId once we limit prebuild reuse to the same org
             const prebuiltWorkspace = await this.findPrebuiltWorkspace(
                 ctx,
                 user,
@@ -1182,11 +1267,12 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             const workspace = await this.workspaceFactory.createForContext(
                 ctx,
                 user,
+                organizationId,
                 project,
                 context,
                 normalizedContextUrl,
             );
-            await this.mayStartWorkspace(ctx, user, workspace, runningInstancesPromise);
+            await mayStartWorkspacePromise;
             try {
                 await this.guardAccess({ kind: "workspace", subject: workspace }, "create");
             } catch (err) {
@@ -1194,7 +1280,8 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 throw err;
             }
 
-            let projectEnvVarsPromise = this.internalGetProjectEnvVars(workspace.projectId);
+            const envVarsPromise = this.envVarService.resolve(workspace);
+            options.region = await this.determineWorkspaceRegion(workspace, options.region || "");
 
             logContext.workspaceId = workspace.id;
             traceWI(ctx, { workspaceId: workspace.id });
@@ -1203,8 +1290,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 workspace,
                 user,
                 project,
-                await envVars,
-                await projectEnvVarsPromise,
+                await envVarsPromise,
                 options,
             );
             ctx.span?.log({ event: "startWorkspaceComplete", ...startWorkspaceResult });
@@ -1214,27 +1300,43 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 createdWorkspaceId: workspace.id,
             };
         } catch (error) {
-            if (NotFoundError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_FOUND, "Repository not found.", error.data);
-            }
-            if (UnauthorizedError.is(error)) {
-                throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
-            }
-            if (InvalidGitpodYMLError.is(error)) {
-                throw new ResponseError(ErrorCodes.INVALID_GITPOD_YML, error.message);
-            }
-
-            const errorCode = this.parseErrorCode(error);
-            if (errorCode) {
-                // specific errors will be handled in create-workspace.tsx
-                throw error;
-            }
-            log.debug(logContext, error);
-            throw new ResponseError(
-                ErrorCodes.CONTEXT_PARSE_ERROR,
-                error && error.message ? error.message : `Cannot create workspace for URL: ${normalizedContextUrl}`,
-            );
+            this.handleError(error, logContext, normalizedContextUrl);
+            throw error;
         }
+    }
+
+    public async resolveContext(ctx: TraceContextWithSpan, contextUrl: string): Promise<WorkspaceContext> {
+        const user = this.checkAndBlockUser("resolveContext");
+        const normalizedCtxURL = this.contextParser.normalizeContextURL(contextUrl);
+        try {
+            return await this.contextParser.handle(ctx, user, normalizedCtxURL);
+        } catch (error) {
+            this.handleError(error, { userId: user.id }, normalizedCtxURL);
+            throw error;
+        }
+    }
+
+    private handleError(error: any, logContext: LogContext, normalizedContextUrl: string) {
+        if (NotFoundError.is(error)) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Repository not found.", error.data);
+        }
+        if (UnauthorizedError.is(error)) {
+            throw new ResponseError(ErrorCodes.NOT_AUTHENTICATED, "Unauthorized", error.data);
+        }
+        if (InvalidGitpodYMLError.is(error)) {
+            throw new ResponseError(ErrorCodes.INVALID_GITPOD_YML, error.message);
+        }
+
+        const errorCode = this.parseErrorCode(error);
+        if (errorCode) {
+            // specific errors will be handled in create-workspace.tsx
+            throw error;
+        }
+        log.debug(logContext, error);
+        throw new ResponseError(
+            ErrorCodes.CONTEXT_PARSE_ERROR,
+            error && error.message ? error.message : `Cannot create workspace for URL: ${normalizedContextUrl}`,
+        );
     }
 
     /**
@@ -1300,7 +1402,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     protected async mayStartWorkspace(
         ctx: TraceContext,
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         runningInstances: Promise<WorkspaceInstance[]>,
     ): Promise<void> {}
 
@@ -1491,10 +1593,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
 
         const req = new DescribeWorkspaceRequest();
         req.setId(instance.id);
-        const client = await this.workspaceManagerClientProvider.get(
-            instance.region,
-            this.config.installationShortname,
-        );
+        const client = await this.workspaceManagerClientProvider.get(instance.region);
         const desc = await client.describeWorkspace(ctx, req);
 
         if (!desc.hasStatus()) {
@@ -1547,10 +1646,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         req.setExpose(true);
 
         try {
-            const client = await this.workspaceManagerClientProvider.get(
-                runningInstance.region,
-                this.config.installationShortname,
-            );
+            const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
             await client.controlPort(ctx, req);
         } catch (e) {
             throw this.mapGrpcError(e);
@@ -1602,10 +1698,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         req.setSpec(spec);
         req.setExpose(false);
 
-        const client = await this.workspaceManagerClientProvider.get(
-            instance.region,
-            this.config.installationShortname,
-        );
+        const client = await this.workspaceManagerClientProvider.get(instance.region);
         await client.controlPort(ctx, req);
     }
 
@@ -1805,7 +1898,27 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         return [];
     }
 
+    async getWorkspaceEnvVars(ctx: TraceContext, workspaceId: string): Promise<EnvVarWithValue[]> {
+        this.checkUser("getWorkspaceEnvVars");
+        const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
+        await this.guardAccess({ kind: "workspace", subject: workspace }, "get");
+        const envVars = await this.envVarService.resolve(workspace);
+
+        const result: EnvVarWithValue[] = [];
+        for (const value of envVars.workspace) {
+            if (
+                "repositoryPattern" in value &&
+                !(await this.resourceAccessGuard.canAccess({ kind: "envVar", subject: value }, "get"))
+            ) {
+                continue;
+            }
+            result.push(value);
+        }
+        return result;
+    }
+
     // Get environment variables (filter by repository pattern precedence)
+    // TODO remove then latsest gitpod-cli is deployed
     async getEnvVars(ctx: TraceContext): Promise<UserEnvVarValue[]> {
         const user = this.checkUser("getEnvVars");
         const result = new Map<string, { value: UserEnvVar; score: number }>();
@@ -1977,10 +2090,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 const req = new UpdateSSHKeyRequest();
                 req.setId(instance.id);
                 req.setKeysList(keys);
-                const cli = await this.workspaceManagerClientProvider.get(
-                    instance.region,
-                    this.config.installationShortname,
-                );
+                const cli = await this.workspaceManagerClientProvider.get(instance.region);
                 await cli.updateSSHPublicKey(ctx, req);
             } catch (err) {
                 const logCtx = { userId, instanceId: instance.id };
@@ -2028,14 +2138,111 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         return await this.projectsService.getProjectEnvironmentVariables(projectId);
     }
 
-    protected async guardTeamOperation(teamId: string | undefined, op: ResourceAccessOp): Promise<Team> {
-        const team = await this.teamDB.findTeamById(teamId || "");
-        if (!team) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "Team not found");
+    protected async guardTeamOperation(
+        teamId: string,
+        op: ResourceAccessOp,
+        fineGrainedOp: OrganizationOperation,
+    ): Promise<{ team: Team; members: TeamMemberInfo[] }> {
+        if (!uuidValidate(teamId)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "organization ID must be a valid UUID");
         }
-        const members = await this.teamDB.findMembersByTeam(team.id);
-        await this.guardAccess({ kind: "team", subject: team, members }, op);
-        return team;
+
+        const user = this.checkUser();
+        const centralizedPermissionsEnabled = await getExperimentsClientForBackend().getValueAsync(
+            "centralizedPermissions",
+            false,
+            {
+                user: user,
+                teamId: teamId,
+            },
+        );
+
+        const checkAgainstDB = async (): Promise<{ team: Team; members: TeamMemberInfo[] }> => {
+            // We deliberately wrap the entiry check in try-catch, because we're using Promise.all, which rejects if any of the promises reject.
+            const team = await this.teamDB.findTeamById(teamId);
+            if (!team) {
+                // We return Permission Denied because we don't want to leak the existence, or not of the Organization.
+                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, `No access to Organization ID: ${teamId}`);
+            }
+
+            const members = await this.teamDB.findMembersByTeam(team.id);
+            await this.guardAccess({ kind: "team", subject: team, members }, op);
+
+            return { team, members };
+        };
+
+        const checkWithCentralizedPerms = async (): Promise<CheckResult> => {
+            if (centralizedPermissionsEnabled) {
+                log.info("[perms] Checking team operations.", {
+                    org: teamId,
+                    operations: fineGrainedOp,
+                    user: user.id,
+                });
+
+                return await this.guardOrganizationOperationWithCentralizedPerms(teamId, fineGrainedOp);
+            }
+
+            throw new Error("Centralized permissions feature not enabled.");
+        };
+
+        const [fromDB, fromCentralizedPerms] = await Promise.allSettled([
+            // Permission checks against the DB will throw, if the user is not permitted to perform the action, or if iteraction with
+            // dependencies (DB) fail.
+            checkAgainstDB(),
+
+            // Centralized perms checks only throw, when an interaction error occurs - connection not available or similar.
+            // When the user is not permitted to perform the action, the call will resolve, encoding the result in the response.
+            checkWithCentralizedPerms(),
+        ]);
+
+        // check against DB resolved, which means the user is permitted to perform the action
+        if (fromDB.status === "fulfilled") {
+            if (fromCentralizedPerms.status === "fulfilled") {
+                // we got a result from centralized perms, but we still need to check if the outcome was such that the user is permitted
+                reportCentralizedPermsValidation(fineGrainedOp, fromCentralizedPerms.value.permitted === true);
+            } else {
+                // centralized perms promise rejected, we do not have an agreement
+                reportCentralizedPermsValidation(fineGrainedOp, false);
+            }
+
+            // Always return the result from the DB check
+            return fromDB.value;
+        } else {
+            // The check agains the DB failed. This means the user does not have access.
+
+            if (fromCentralizedPerms.status === "fulfilled") {
+                // we got a result from centralized perms, but we still need to check if the outcome was such that the user is NOT permitted
+                reportCentralizedPermsValidation(fineGrainedOp, fromCentralizedPerms.value.permitted === false);
+            } else {
+                // centralized perms promise rejected, we do not have an agreement
+                reportCentralizedPermsValidation(fineGrainedOp, false);
+            }
+
+            // We re-throw the error from the DB permission check, to propagate it upstream.
+            throw fromDB.reason;
+        }
+    }
+
+    protected async guardOrganizationOperationWithCentralizedPerms(
+        orgId: string,
+        op: OrganizationOperation,
+    ): Promise<CheckResult> {
+        const user = this.checkUser();
+
+        switch (op) {
+            case "org_metadata_read":
+                return await this.authorizer.check(ReadOrganizationMetadata(user.id, orgId));
+            case "org_metadata_write":
+                return await this.authorizer.check(WriteOrganizationMetadata(user.id, orgId));
+
+            case "org_members_read":
+                return await this.authorizer.check(ReadOrganizationMembers(user.id, orgId));
+            case "org_members_write":
+                return await this.authorizer.check(WriteOrganizationMembers(user.id, orgId));
+
+            default:
+                return NotPermitted;
+        }
     }
 
     public async getTeams(ctx: TraceContext): Promise<Team[]> {
@@ -2046,23 +2253,29 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
 
     public async getTeam(ctx: TraceContext, teamId: string): Promise<Team> {
         traceAPIParams(ctx, { teamId });
+
         this.checkAndBlockUser("getTeam");
 
-        const team = await this.teamDB.findTeamById(teamId);
-        if (!team) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, `Team ${teamId} does not exist`);
-        }
-
+        const { team } = await this.guardTeamOperation(teamId, "get", "org_members_read");
         return team;
+    }
+
+    public async updateTeam(ctx: TraceContext, teamId: string, team: Pick<Team, "name" | "slug">): Promise<Team> {
+        traceAPIParams(ctx, { teamId });
+        this.checkUser("updateTeam");
+
+        await this.guardTeamOperation(teamId, "update", "org_metadata_write");
+
+        const updatedTeam = await this.teamDB.updateTeam(teamId, team);
+        return updatedTeam;
     }
 
     public async getTeamMembers(ctx: TraceContext, teamId: string): Promise<TeamMemberInfo[]> {
         traceAPIParams(ctx, { teamId });
 
         this.checkUser("getTeamMembers");
-        const team = await this.getTeam(ctx, teamId);
-        const members = await this.teamDB.findMembersByTeam(team.id);
-        await this.guardAccess({ kind: "team", subject: team, members }, "get");
+        const { members } = await this.guardTeamOperation(teamId, "get", "org_members_read");
+
         return members;
     }
 
@@ -2071,6 +2284,15 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
 
         // Note: this operation is per-user only, hence needs no resource guard
         const user = this.checkAndBlockUser("createTeam");
+
+        const mayCreateOrganization = await this.userService.mayCreateOrJoinOrganization(user);
+        if (!mayCreateOrganization) {
+            throw new ResponseError(
+                ErrorCodes.PERMISSION_DENIED,
+                "Organizational accounts are not allowed to create new organizations",
+            );
+        }
+
         const team = await this.teamDB.createTeam(user.id, name);
         const invite = await this.getGenericInvite(ctx, team.id);
         ctx.span?.setTag("teamId", team.id);
@@ -2080,7 +2302,6 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             properties: {
                 id: team.id,
                 name: team.name,
-                slug: team.slug,
                 created_at: team.creationTime,
                 invite_id: invite.id,
             },
@@ -2092,6 +2313,15 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         traceAPIParams(ctx, { inviteId });
 
         const user = this.checkAndBlockUser("joinTeam");
+
+        const mayCreateOrganization = await this.userService.mayCreateOrJoinOrganization(user);
+        if (!mayCreateOrganization) {
+            throw new ResponseError(
+                ErrorCodes.PERMISSION_DENIED,
+                "Organizational accounts are not allowed to join other organizations",
+            );
+        }
+
         // Invites can be used by anyone, as long as they know the invite ID, hence needs no resource guard
         const invite = await this.teamDB.findTeamMembershipInviteById(inviteId);
         if (!invite || invite.invalidationTime !== "") {
@@ -2108,7 +2338,6 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 properties: {
                     team_id: invite.teamId,
                     team_name: team?.name,
-                    team_slug: team?.slug,
                     invite_id: inviteId,
                 },
             });
@@ -2125,20 +2354,40 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     ): Promise<void> {
         traceAPIParams(ctx, { teamId, userId, role });
 
+        if (!uuidValidate(userId)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "user ID must be a valid UUID");
+        }
+
+        if (!TeamMemberRole.isValid(role)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "invalid role name");
+        }
+
         this.checkAndBlockUser("setTeamMemberRole");
-        await this.guardTeamOperation(teamId, "update");
+        await this.guardTeamOperation(teamId, "update", "org_members_write");
+
         await this.teamDB.setTeamMemberRole(userId, teamId, role);
     }
 
     public async removeTeamMember(ctx: TraceContext, teamId: string, userId: string): Promise<void> {
         traceAPIParams(ctx, { teamId, userId });
 
+        if (!uuidValidate(userId)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "user ID must be a valid UUID");
+        }
+
         const user = this.checkAndBlockUser("removeTeamMember");
-        // Users are free to leave any team themselves, but only owners can remove others from their teams.
-        await this.guardTeamOperation(teamId, user.id === userId ? "get" : "update");
+        // The user is leaving a team, if they are removing themselves from the team.
+        const userLeavingTeam = user.id === userId;
+
+        if (!userLeavingTeam) {
+            await this.guardTeamOperation(teamId, "update", "not_implemented");
+        } else {
+            await this.guardTeamOperation(teamId, "get", "org_members_write");
+        }
+
         const membership = await this.teamDB.findTeamMembership(userId, teamId);
         if (!membership) {
-            throw new Error(`Could not find membership for user '${userId}' in team '${teamId}'`);
+            throw new Error(`Could not find membership for user '${userId}' in organization '${teamId}'`);
         }
         await this.teamDB.removeMemberFromTeam(userId, teamId);
         await this.onTeamMemberRemoved(userId, teamId, membership.id);
@@ -2156,7 +2405,8 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         traceAPIParams(ctx, { teamId });
 
         this.checkUser("getGenericInvite");
-        await this.guardTeamOperation(teamId, "get");
+        await this.guardTeamOperation(teamId, "get", "org_members_write");
+
         const invite = await this.teamDB.findGenericInviteByTeamId(teamId);
         if (invite) {
             return invite;
@@ -2168,7 +2418,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         traceAPIParams(ctx, { teamId });
 
         this.checkAndBlockUser("resetGenericInvite");
-        await this.guardTeamOperation(teamId, "update");
+        await this.guardTeamOperation(teamId, "update", "org_members_write");
         return this.teamDB.resetGenericInvite(teamId);
     }
 
@@ -2185,7 +2435,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             }
         } else {
             // Anyone who can read a team's information (i.e. any team member) can manage team projects
-            await this.guardTeamOperation(project.teamId, "get");
+            await this.guardTeamOperation(project.teamId || "", "get", "not_implemented");
         }
     }
 
@@ -2212,7 +2462,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             }
         } else {
             // Anyone who can read a team's information (i.e. any team member) can create a new project.
-            await this.guardTeamOperation(params.teamId, "get");
+            await this.guardTeamOperation(params.teamId || "", "get", "not_implemented");
         }
 
         return this.projectsService.createProject(params, user);
@@ -2237,7 +2487,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         const user = this.checkAndBlockUser("deleteTeam");
         traceAPIParams(ctx, { teamId, userId: user.id });
 
-        await this.guardTeamOperation(teamId, "delete");
+        await this.guardTeamOperation(teamId, "delete", "org_write");
 
         const teamProjects = await this.projectsService.getTeamProjects(teamId);
         teamProjects.forEach((project) => {
@@ -2253,6 +2503,7 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             });
         });
 
+        // TODO: delete setting
         await this.teamDB.deleteTeam(teamId);
         await this.onTeamDeleted(teamId);
 
@@ -2265,12 +2516,33 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         });
     }
 
+    async getOrgSettings(ctx: TraceContextWithSpan, orgId: string): Promise<OrganizationSettings> {
+        const user = this.checkAndBlockUser("getOrgSettings");
+        traceAPIParams(ctx, { orgId, userId: user.id });
+        await this.guardTeamOperation(orgId, "get", "org_write");
+        const settings = await this.teamDB.findOrgSettings(orgId);
+        // TODO: make a default in protocol
+        return settings ?? { workspaceSharingDisabled: false };
+    }
+
+    async updateOrgSettings(
+        ctx: TraceContextWithSpan,
+        orgId: string,
+        settings: Partial<OrganizationSettings>,
+    ): Promise<OrganizationSettings> {
+        const user = this.checkAndBlockUser("updateOrgSettings");
+        traceAPIParams(ctx, { orgId, userId: user.id });
+        await this.guardTeamOperation(orgId, "update", "org_write");
+        await this.teamDB.setOrgSettings(orgId, settings);
+        return (await this.teamDB.findOrgSettings(orgId))!;
+    }
+
     public async getTeamProjects(ctx: TraceContext, teamId: string): Promise<Project[]> {
         traceAPIParams(ctx, { teamId });
 
         this.checkUser("getTeamProjects");
 
-        await this.guardTeamOperation(teamId, "get");
+        await this.guardTeamOperation(teamId, "get", "not_implemented");
         return this.projectsService.getTeamProjects(teamId);
     }
 
@@ -2697,44 +2969,11 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
 
         await this.guardAdminAccess("adminGetLicense", {}, Permission.ADMIN_API);
 
-        const licenseData = this.licenseEvaluator.getLicenseData();
-        const licensePayload = licenseData.payload;
-        const licenseValid = this.licenseEvaluator.validate();
-
         const userCount = await this.userDB.getUserCount(true);
 
-        const features = Object.keys(Feature);
-        const enabledFeatures = await this.licenseFeatures(ctx, features, userCount);
-
         return {
-            key: licensePayload.id,
-            seats: licensePayload.seats,
             userCount: userCount,
-            plan: licenseData.plan,
-            fallbackAllowed: licenseData.fallbackAllowed,
-            valid: licenseValid.valid,
-            errorMsg: licenseValid.msg,
-            type: licenseData.type,
-            validUntil: licensePayload.validUntil,
-            features: features.map((feat) => Feature[feat as keyof typeof Feature]),
-            enabledFeatures: enabledFeatures,
         };
-    }
-
-    protected async licenseFeatures(ctx: TraceContext, features: string[], userCount: number): Promise<string[]> {
-        var enabledFeatures: string[] = [];
-        for (const feature of features) {
-            const featureName: Feature = Feature[feature as keyof typeof Feature];
-            if (this.licenseEvaluator.isEnabled(featureName, userCount)) {
-                enabledFeatures.push(featureName);
-            }
-        }
-
-        return enabledFeatures;
-    }
-
-    async licenseIncludesFeature(ctx: TraceContext, feature: LicenseFeature): Promise<boolean> {
-        return false;
     }
 
     protected censorUser(user: User): User {
@@ -2858,6 +3097,159 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         } catch (error) {
             const message = error && error.message ? error.message : "Failed to delete the provider.";
             throw new ResponseError(ErrorCodes.CONFLICT, message);
+        }
+    }
+
+    async createOrgAuthProvider(
+        ctx: TraceContext,
+        { entry }: GitpodServer.CreateOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, {}); // entry contains PII
+
+        let user = this.checkAndBlockUser("createOrgAuthProvider");
+
+        // map params to a new provider
+        const newProvider = <AuthProviderEntry.NewOrgEntry>{
+            host: entry.host,
+            type: entry.type,
+            clientId: entry.clientId,
+            clientSecret: entry.clientSecret,
+            ownerId: user.id,
+            organizationId: entry.organizationId,
+        };
+
+        if (!newProvider.organizationId || !uuidValidate(newProvider.organizationId)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", newProvider.organizationId);
+
+        if (!newProvider.host) {
+            throw new ResponseError(
+                ErrorCodes.BAD_REQUEST,
+                "Must provider a host value when creating a new auth provider.",
+            );
+        }
+
+        // Ensure user can perform this operation on this organization
+        await this.guardTeamOperation(newProvider.organizationId, "create", "org_authprovider_write");
+
+        try {
+            // on creating we're are checking for already existing runtime providers
+            const host = newProvider.host && newProvider.host.toLowerCase();
+
+            if (!(await this.authProviderService.isHostReachable(host))) {
+                log.debug(`Host could not be reached.`, { entry, newProvider });
+                throw new Error("Host could not be reached.");
+            }
+
+            const hostContext = this.hostContextProvider.get(host);
+            if (hostContext) {
+                const builtInExists = hostContext.authProvider.params.ownerId === undefined;
+                log.debug(`Attempt to override existing auth provider.`, { entry, newProvider, builtInExists });
+                throw new Error("Provider for this host already exists.");
+            }
+
+            const result = await this.authProviderService.createOrgAuthProvider(newProvider);
+            return AuthProviderEntry.redact(result);
+        } catch (error) {
+            const message = error && error.message ? error.message : "Failed to create the provider.";
+            throw new ResponseError(ErrorCodes.CONFLICT, message);
+        }
+    }
+
+    async updateOrgAuthProvider(
+        ctx: TraceContext,
+        { entry }: GitpodServer.UpdateOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry> {
+        traceAPIParams(ctx, {}); // entry contains PII
+
+        this.checkAndBlockUser("updateOrgAuthProvider");
+
+        // map params to a provider update
+        const providerUpdate: AuthProviderEntry.UpdateOrgEntry = {
+            id: entry.id,
+            clientId: entry.clientId,
+            clientSecret: entry.clientSecret,
+            organizationId: entry.organizationId,
+        };
+
+        if (!providerUpdate.organizationId || !uuidValidate(providerUpdate.organizationId)) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", providerUpdate.organizationId);
+
+        await this.guardTeamOperation(providerUpdate.organizationId, "update", "org_authprovider_write");
+
+        try {
+            const result = await this.authProviderService.updateOrgAuthProvider(providerUpdate);
+            return AuthProviderEntry.redact(result);
+        } catch (error) {
+            const message = error && error.message ? error.message : "Failed to update the provider.";
+            throw new ResponseError(ErrorCodes.CONFLICT, message);
+        }
+    }
+
+    async getOrgAuthProviders(
+        ctx: TraceContext,
+        params: GitpodServer.GetOrgAuthProviderParams,
+    ): Promise<AuthProviderEntry[]> {
+        traceAPIParams(ctx, { params });
+
+        this.checkAndBlockUser("getOrgAuthProviders");
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", params.organizationId);
+
+        await this.guardTeamOperation(params.organizationId, "get", "org_authprovider_read");
+
+        try {
+            const result = await this.authProviderService.getAuthProvidersOfOrg(params.organizationId);
+            return result.map(AuthProviderEntry.redact.bind(AuthProviderEntry));
+        } catch (error) {
+            const message =
+                error && error.message ? error.message : "Error retreiving auth providers for organization.";
+            throw new ResponseError(ErrorCodes.INTERNAL_SERVER_ERROR, message);
+        }
+    }
+
+    async deleteOrgAuthProvider(ctx: TraceContext, params: GitpodServer.DeleteOrgAuthProviderParams): Promise<void> {
+        traceAPIParams(ctx, { params });
+
+        this.checkAndBlockUser("deleteOrgAuthProvider");
+
+        const team = await this.getTeam(ctx, params.organizationId);
+        if (!team) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, "Invalid organizationId");
+        }
+
+        await this.guardWithFeatureFlag("orgGitAuthProviders", team.id);
+
+        // Find the matching auth provider we're attempting to delete
+        const orgProviders = await this.authProviderService.getAuthProvidersOfOrg(team.id);
+        const authProvider = orgProviders.find((p) => p.id === params.id);
+        if (!authProvider) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Provider resource not found.");
+        }
+
+        await this.guardTeamOperation(authProvider.organizationId || "", "delete", "org_authprovider_write");
+
+        try {
+            await this.authProviderService.deleteAuthProvider(authProvider);
+        } catch (error) {
+            const message = error && error.message ? error.message : "Failed to delete the provider.";
+            throw new ResponseError(ErrorCodes.CONFLICT, message);
+        }
+    }
+
+    protected async guardWithFeatureFlag(flagName: string, teamId: string) {
+        // Guard method w/ a feature flag check
+        const isEnabled = await this.configCatClientFactory().getValueAsync(flagName, false, {
+            user: this.user,
+            teamId,
+        });
+        if (!isEnabled) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Method not available");
         }
     }
 
@@ -3034,6 +3426,9 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     async getTeamSubscription(ctx: TraceContext, teamId: string): Promise<TeamSubscription2 | undefined> {
         throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
     }
+    async cancelTeamSubscription(ctx: TraceContext, teamId: string): Promise<void> {
+        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+    }
     protected async onTeamMemberAdded(userId: string, teamId: string): Promise<void> {
         // Extension point for EE
     }
@@ -3046,7 +3441,13 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     async tsGet(ctx: TraceContext): Promise<TeamSubscription[]> {
         throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
     }
+    async tsCancel(ctx: TraceContext, teamSubscriptionId: string): Promise<void> {
+        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+    }
     async tsGetSlots(ctx: TraceContext): Promise<TeamSubscriptionSlotResolved[]> {
+        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+    }
+    async tsAddMembersToOrg(ctx: TraceContext, teamSubscriptionId: string, organizationId: string): Promise<void> {
         throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
     }
     async tsGetUnassignedSlot(
@@ -3114,6 +3515,9 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
     async getStripePortalUrl(ctx: TraceContext, attributionId: string): Promise<string> {
         throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
     }
+    async getPriceInformation(ctx: TraceContext, attributionId: string): Promise<string | undefined> {
+        throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
+    }
 
     async listUsage(ctx: TraceContext, req: ListUsageRequest): Promise<ListUsageResponse> {
         throw new ResponseError(ErrorCodes.SAAS_FEATURE, `Not implemented in this version`);
@@ -3162,7 +3566,6 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
             const attrId = AttributionId.parse(usageAttributionId);
             if (attrId) {
                 await this.userService.setUsageAttribution(user, usageAttributionId);
-                this.messageBus.notifyOnSubscriptionUpdate(ctx, attrId).catch();
             }
         } catch (error) {
             log.error({ userId: user.id }, "Cannot set usage attribution", error, { usageAttributionId });
@@ -3189,6 +3592,26 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
         return BillingMode.NONE;
     }
 
+    async getLinkedInClientId(ctx: TraceContextWithSpan): Promise<string> {
+        traceAPIParams(ctx, {});
+        this.checkAndBlockUser("getLinkedInClientID");
+        const clientId = this.config.linkedInSecrets?.clientId;
+        if (!clientId) {
+            throw new ResponseError(
+                ErrorCodes.INTERNAL_SERVER_ERROR,
+                "LinkedIn is not properly configured (no Client ID)",
+            );
+        }
+        return clientId;
+    }
+
+    async connectWithLinkedIn(ctx: TraceContextWithSpan, code: string): Promise<LinkedInProfile> {
+        traceAPIParams(ctx, { code });
+        const user = this.checkAndBlockUser("connectWithLinkedIn");
+        const profile = await this.linkedInService.connectWithLinkedIn(user, code);
+        return profile;
+    }
+
     //
     //#endregion
 
@@ -3200,43 +3623,17 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
      * @returns
      */
     protected async getImageBuilderClient(user: User, workspace: Workspace, instance?: WorkspaceInstance) {
-        // If cluster does not contain workspace components, must use workspace image builder client. Otherwise, check experiment value.
-        const isMovedImageBuilder =
-            this.config.withoutWorkspaceComponents ||
-            (await getExperimentsClientForBackend().getValueAsync("movedImageBuilder", true, {
-                user,
-                projectId: workspace.projectId,
-            }));
-
-        log.info(
-            { userId: user.id, workspaceId: workspace.id, instanceId: instance?.id },
-            "image-builder in workspace cluster?",
-            {
-                userId: user.id,
-                projectId: workspace.projectId,
-                isMovedImageBuilder,
-            },
-        );
-        if (isMovedImageBuilder) {
-            return this.wsClusterImageBuilderClientProvider.getClient(
-                this.config.installationShortname,
-                user,
-                workspace,
-                instance,
-            );
-        } else {
-            return this.imagebuilderClientProvider.getClient(
-                this.config.installationShortname,
-                user,
-                workspace,
-                instance,
-            );
-        }
+        return this.imagebuilderClientProvider.getClient(user, workspace, instance);
     }
 
-    async getNotifications(ctx: TraceContext): Promise<string[]> {
-        this.checkAndBlockUser("getNotifications");
-        return [];
+    async reportErrorBoundary(ctx: TraceContextWithSpan, url: string, message: string): Promise<void> {
+        // Cap message and url length so the entries aren't of unbounded length
+        log.warn("dashboard error boundary", {
+            message: (message || "").substring(0, 200),
+            url: (url || "").substring(0, 200),
+            userId: this.user?.id,
+        });
+        increaseDashboardErrorBoundaryCounter();
     }
 
     protected mapGrpcError(err: Error): Error {
@@ -3255,4 +3652,50 @@ export class GitpodServerImpl implements GitpodServerWithTracing, Disposable {
                 return new ResponseError(ErrorCodes.INTERNAL_SERVER_ERROR, err.details);
         }
     }
+
+    private async determineWorkspaceRegion(ws: Workspace, preference: WorkspaceRegion): Promise<WorkspaceRegion> {
+        const guessWorkspaceRegionEnabled = await getExperimentsClientForBackend().getValueAsync(
+            "guessWorkspaceRegion",
+            false,
+            {
+                user: this.user,
+            },
+        );
+
+        const regionLogContext = {
+            requested_region: preference,
+            client_region_from_header: this.clientHeaderFields.clientRegion,
+            experiment_enabled: false,
+            guessed_region: "",
+        };
+
+        let targetRegion = preference;
+        if (!isWorkspaceRegion(preference)) {
+            targetRegion = "";
+        } else {
+            targetRegion = preference;
+        }
+
+        if (guessWorkspaceRegionEnabled) {
+            regionLogContext.experiment_enabled = true;
+
+            if (!preference) {
+                // Attempt to identify the region based on LoadBalancer headers, if there was no explicit choice on the request.
+                // The Client region contains the two letter country code.
+                if (this.clientHeaderFields.clientRegion) {
+                    const countryCode = this.clientHeaderFields.clientRegion;
+
+                    targetRegion = RegionService.countryCodeToNearestWorkspaceRegion(countryCode);
+                    regionLogContext.guessed_region = targetRegion;
+                }
+            }
+        }
+
+        const logCtx = { userId: this.user?.id, workspaceId: ws.id };
+        log.info(logCtx, "[guessWorkspaceRegion] Workspace with region selection", regionLogContext);
+
+        return targetRegion;
+    }
+
+    async getIDToken(): Promise<void> {}
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Copyright (c) 2023 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
 // See License.AGPL.txt in the project root for license information.
 
@@ -11,6 +11,7 @@ package protocol
 import (
 	context "context"
 	reflect "reflect"
+	time "time"
 
 	gomock "github.com/golang/mock/gomock"
 )
@@ -357,10 +358,10 @@ func (mr *MockAPIInterfaceMockRecorder) GetContentBlobUploadURL(ctx, name interf
 }
 
 // GetEnvVars mocks base method.
-func (m *MockAPIInterface) GetEnvVars(ctx context.Context) ([]*UserEnvVarValue, error) {
+func (m *MockAPIInterface) GetEnvVars(ctx context.Context) ([]*EnvVar, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "GetEnvVars", ctx)
-	ret0, _ := ret[0].([]*UserEnvVarValue)
+	ret0, _ := ret[0].([]*EnvVar)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -429,6 +430,20 @@ func (m *MockAPIInterface) GetGitpodTokens(ctx context.Context) ([]*APIToken, er
 func (mr *MockAPIInterfaceMockRecorder) GetGitpodTokens(ctx interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetGitpodTokens", reflect.TypeOf((*MockAPIInterface)(nil).GetGitpodTokens), ctx)
+}
+
+// GetIDToken mocks base method.
+func (m *MockAPIInterface) GetIDToken(ctx context.Context) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetIDToken", ctx)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// GetIDToken indicates an expected call of GetIDToken.
+func (mr *MockAPIInterfaceMockRecorder) GetIDToken(ctx interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetIDToken", reflect.TypeOf((*MockAPIInterface)(nil).GetIDToken), ctx)
 }
 
 // GetLoggedInUser mocks base method.
@@ -669,6 +684,21 @@ func (m *MockAPIInterface) GetWorkspace(ctx context.Context, id string) (*Worksp
 func (mr *MockAPIInterfaceMockRecorder) GetWorkspace(ctx, id interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkspace", reflect.TypeOf((*MockAPIInterface)(nil).GetWorkspace), ctx, id)
+}
+
+// GetWorkspaceEnvVars mocks base method.
+func (m *MockAPIInterface) GetWorkspaceEnvVars(ctx context.Context, workspaceID string) ([]*EnvVar, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWorkspaceEnvVars", ctx, workspaceID)
+	ret0, _ := ret[0].([]*EnvVar)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetWorkspaceEnvVars indicates an expected call of GetWorkspaceEnvVars.
+func (mr *MockAPIInterfaceMockRecorder) GetWorkspaceEnvVars(ctx, workspaceID interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkspaceEnvVars", reflect.TypeOf((*MockAPIInterface)(nil).GetWorkspaceEnvVars), ctx, workspaceID)
 }
 
 // GetWorkspaceOwner mocks base method.
@@ -951,7 +981,7 @@ func (mr *MockAPIInterfaceMockRecorder) SetWorkspaceDescription(ctx, id, desc in
 }
 
 // SetWorkspaceTimeout mocks base method.
-func (m *MockAPIInterface) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration *WorkspaceTimeoutDuration) (*SetWorkspaceTimeoutResult, error) {
+func (m *MockAPIInterface) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration time.Duration) (*SetWorkspaceTimeoutResult, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "SetWorkspaceTimeout", ctx, workspaceID, duration)
 	ret0, _ := ret[0].(*SetWorkspaceTimeoutResult)

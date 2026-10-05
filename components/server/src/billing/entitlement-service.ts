@@ -6,17 +6,17 @@
 
 import {
     User,
-    Workspace,
     WorkspaceInstance,
     WorkspaceTimeoutDuration,
     WORKSPACE_TIMEOUT_DEFAULT_SHORT,
 } from "@gitpod/gitpod-protocol";
 import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
-import { BillingTier } from "@gitpod/gitpod-protocol/src/protocol";
+import { BillingTier } from "@gitpod/gitpod-protocol/lib/protocol";
 import { injectable } from "inversify";
 
 export interface MayStartWorkspaceResult {
     hitParallelWorkspaceLimit?: HitParallelWorkspaceLimit;
+    //** Out of Chargebee credits? */
     oufOfCredits?: boolean;
 
     needsVerification?: boolean;
@@ -42,7 +42,7 @@ export interface EntitlementService {
      */
     mayStartWorkspace(
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         date: Date,
         runningInstances: Promise<WorkspaceInstance[]>,
     ): Promise<MayStartWorkspaceResult>;
@@ -88,7 +88,7 @@ export interface EntitlementService {
 export class CommunityEntitlementService implements EntitlementService {
     async mayStartWorkspace(
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         date: Date,
         runningInstances: Promise<WorkspaceInstance[]>,
     ): Promise<MayStartWorkspaceResult> {

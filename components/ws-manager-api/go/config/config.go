@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"time"
 
 	ozzo "github.com/go-ozzo/ozzo-validation"
 	"github.com/go-ozzo/ozzo-validation/is"
@@ -68,12 +69,17 @@ type ServiceConfiguration struct {
 	Prometheus struct {
 		Addr string `json:"addr"`
 	} `json:"prometheus"`
+	Health struct {
+		Addr string `json:"addr"`
+	} `json:"health"`
 }
 
 // Configuration is the configuration of the ws-manager
 type Configuration struct {
 	// Namespace is the kubernetes namespace the workspace manager operates in
 	Namespace string `json:"namespace"`
+	// SecretsNamespace is the kubernetes namespace which contains workspace secrets
+	SecretsNamespace string `json:"secretsNamespace"`
 	// SchedulerName is the name of the workspace scheduler all pods are created with
 	SchedulerName string `json:"schedulerName"`
 	// SeccompProfile names the seccomp profile workspaces will use
@@ -83,9 +89,6 @@ type Configuration struct {
 	Timeouts WorkspaceTimeoutConfiguration `json:"timeouts"`
 	// InitProbe configures the ready-probe of workspaces which signal when the initialization is finished
 	InitProbe InitProbeConfiguration `json:"initProbe"`
-	// WorkspaceCACertSecret optionally names a secret which is mounted in `/etc/ssl/certs/gp-custom.crt`
-	// in all workspace pods.
-	WorkspaceCACertSecret string `json:"caCertSecret,omitempty"`
 	// WorkspaceURLTemplate is a Go template which resolves to the external URL of the
 	// workspace. Available fields are:
 	// - `ID` which is the workspace ID,
@@ -122,6 +125,14 @@ type Configuration struct {
 	WorkspaceClasses map[string]*WorkspaceClass `json:"workspaceClass"`
 	// DebugWorkspacePod adds extra finalizer to workspace to prevent it from shutting down. Helps to debug.
 	DebugWorkspacePod bool `json:"debugWorkspacePod,omitempty"`
+	// WorkspaceMaxConcurrentReconciles configures the max amount of concurrent workspace reconciliations on
+	// the workspace controller.
+	WorkspaceMaxConcurrentReconciles int `json:"workspaceMaxConcurrentReconciles,omitempty"`
+	// TimeoutMaxConcurrentReconciles configures the max amount of concurrent workspace reconciliations on
+	// the timeout controller.
+	TimeoutMaxConcurrentReconciles int `json:"timeoutMaxConcurrentReconciles,omitempty"`
+	// ExperimentalMode controls if experimental features are enabled
+	ExperimentalMode bool `json:"experimentalMode"`
 }
 
 type WorkspaceClass struct {
@@ -559,4 +570,8 @@ func (r *ResourceLimitConfiguration) StorageQuantity() (resource.Quantity, error
 type CpuResourceLimit struct {
 	MinLimit   string `json:"min"`
 	BurstLimit string `json:"burst"`
+}
+
+type MaintenanceConfig struct {
+	EnabledUntil *time.Time `json:"enabledUntil"`
 }

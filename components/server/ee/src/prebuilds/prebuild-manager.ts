@@ -4,13 +4,12 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { DBWithTracing, TracedWorkspaceDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
+import { DBWithTracing, TeamDB, TracedWorkspaceDB, WorkspaceDB } from "@gitpod/gitpod-db/lib";
 import {
     CommitContext,
     CommitInfo,
     PrebuiltWorkspace,
     Project,
-    ProjectEnvVar,
     StartPrebuildContext,
     StartPrebuildResult,
     TaskConfig,
@@ -37,6 +36,9 @@ import { IncrementalPrebuildsService } from "./incremental-prebuilds-service";
 import { PrebuildRateLimiterConfig } from "../../../src/workspace/prebuild-rate-limiter";
 import { ResponseError } from "vscode-ws-jsonrpc";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { UserService } from "../../../src/user/user-service";
+import { EntitlementService, MayStartWorkspaceResult } from "../../../src/billing/entitlement-service";
+import { EnvVarService } from "../../../src/workspace/env-var-service";
 
 export class WorkspaceRunningError extends Error {
     constructor(msg: string, public instance: WorkspaceInstance) {
@@ -62,6 +64,10 @@ export class PrebuildManager {
     @inject(Config) protected readonly config: Config;
     @inject(ProjectsService) protected readonly projectService: ProjectsService;
     @inject(IncrementalPrebuildsService) protected readonly incrementalPrebuildsService: IncrementalPrebuildsService;
+    @inject(UserService) protected readonly userService: UserService;
+    @inject(TeamDB) protected readonly teamDB: TeamDB;
+    @inject(EntitlementService) protected readonly entitlementService: EntitlementService;
+    @inject(EnvVarService) private readonly envVarService: EnvVarService;
 
     async abortPrebuildsForBranch(ctx: TraceContext, project: Project, user: User, branch: string): Promise<void> {
         const span = TraceContext.startSpan("abortPrebuildsForBranch", ctx);
@@ -134,6 +140,7 @@ export class PrebuildManager {
                     `Running prebuilds without a project is no longer supported. Please add '${cloneURL}' as a project in a team.`,
                 );
             }
+            await this.checkUsageLimitReached(user, project.teamId); // throws if out of credits
 
             const config = await this.fetchConfig({ span }, user, context);
 
@@ -215,15 +222,24 @@ export class PrebuildManager {
                 }
             }
 
-            const projectEnvVarsPromise = project ? this.projectService.getProjectEnvironmentVariables(project.id) : [];
+            let organizationId = (await this.teamDB.findTeamById(project.id))?.id;
+            if (!user.additionalData?.isMigratedToTeamOnlyAttribution) {
+                // If the user is not migrated to team-only attribution, we retrieve the organization from the attribution logic.
+                const attributionId = await this.userService.getWorkspaceUsageAttributionId(user, project.id);
+                organizationId = attributionId.kind === "team" ? attributionId.teamId : undefined;
+            }
 
             const workspace = await this.workspaceFactory.createForContext(
                 { span },
                 user,
+                organizationId,
                 project,
                 prebuildContext,
                 context.normalizedContextURL!,
             );
+
+            const envVarsPromise = this.envVarService.resolve(workspace);
+
             const prebuild = await this.workspaceDB.trace({ span }).findPrebuildByWorkspaceID(workspace.id)!;
             if (!prebuild) {
                 throw new Error(`Failed to create a prebuild for: ${context.normalizedContextURL}`);
@@ -267,8 +283,8 @@ export class PrebuildManager {
                 await this.workspaceDB.trace({ span }).storePrebuiltWorkspace(prebuild);
             } else {
                 span.setTag("starting", true);
-                const projectEnvVars = await projectEnvVarsPromise;
-                await this.workspaceStarter.startWorkspace({ span }, workspace, user, project, [], projectEnvVars, {
+                const envVars = await envVarsPromise;
+                await this.workspaceStarter.startWorkspace({ span }, workspace, user, project, envVars, {
                     excludeFeatureFlags: ["full_workspace_backup"],
                 });
             }
@@ -279,6 +295,26 @@ export class PrebuildManager {
             throw err;
         } finally {
             span.finish();
+        }
+    }
+
+    protected async checkUsageLimitReached(user: User, organizationId?: string): Promise<void> {
+        let result: MayStartWorkspaceResult = {};
+        try {
+            result = await this.entitlementService.mayStartWorkspace(
+                user,
+                organizationId,
+                new Date(),
+                Promise.resolve([]),
+            );
+        } catch (err) {
+            log.error({ userId: user.id }, "EntitlementService.mayStartWorkspace error", err);
+            return; // we don't want to block workspace starts because of internal errors
+        }
+        if (!!result.usageLimitReachedOnCostCenter) {
+            throw new ResponseError(ErrorCodes.PAYMENT_SPENDING_LIMIT_REACHED, "Increase usage limit and try again.", {
+                attributionId: result.usageLimitReachedOnCostCenter,
+            });
         }
     }
 
@@ -307,11 +343,8 @@ export class PrebuildManager {
             if (!prebuild) {
                 throw new Error("No prebuild found for workspace " + workspaceId);
             }
-            let projectEnvVars: ProjectEnvVar[] = [];
-            if (workspace.projectId) {
-                projectEnvVars = await this.projectService.getProjectEnvironmentVariables(workspace.projectId);
-            }
-            await this.workspaceStarter.startWorkspace({ span }, workspace, user, project, [], projectEnvVars);
+            const envVars = await this.envVarService.resolve(workspace);
+            await this.workspaceStarter.startWorkspace({ span }, workspace, user, project, envVars);
             return { prebuildId: prebuild.id, wsid: workspace.id, done: false };
         } catch (err) {
             TraceContext.setError({ span }, err);

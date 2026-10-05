@@ -107,7 +107,7 @@ func renderAllKubernetesObject(cfgVersion string, cfg *configv1.Config) ([]strin
 				InCluster: pointer.Bool(false),
 				External: &configv1.ContainerRegistryExternal{
 					URL: "some-url",
-					Certificate: configv1.ObjectRef{
+					Certificate: &configv1.ObjectRef{
 						Kind: configv1.ObjectRefSecret,
 						Name: "value",
 					},
@@ -116,7 +116,7 @@ func renderAllKubernetesObject(cfgVersion string, cfg *configv1.Config) ([]strin
 					Bucket:   "some-bucket",
 					Region:   "some-region",
 					Endpoint: "some-url",
-					Certificate: configv1.ObjectRef{
+					Certificate: &configv1.ObjectRef{
 						Kind: configv1.ObjectRefSecret,
 						Name: "value",
 					},
@@ -127,37 +127,12 @@ func renderAllKubernetesObject(cfgVersion string, cfg *configv1.Config) ([]strin
 				S3: &configv1.ObjectStorageS3{
 					Endpoint:   "endpoint",
 					BucketName: "some-bucket",
-					Credentials: configv1.ObjectRef{
+					Credentials: &configv1.ObjectRef{
 						Kind: configv1.ObjectRefSecret,
 						Name: "value",
 					},
 				},
 			}
-			return renderKubernetesObjects(cfgVersion, cfg)
-		},
-		func() ([]string, error) {
-			// Render for external depedencies - Azure
-			cfg.Database.CloudSQL = nil
-			cfg.ContainerRegistry = configv1.ContainerRegistry{
-				InCluster: pointer.Bool(false),
-				External: &configv1.ContainerRegistryExternal{
-					URL: "some-url",
-					Certificate: configv1.ObjectRef{
-						Kind: configv1.ObjectRefSecret,
-						Name: "value",
-					},
-				},
-			}
-			cfg.ObjectStorage = configv1.ObjectStorage{
-				InCluster: pointer.Bool(false),
-				Azure: &configv1.ObjectStorageAzure{
-					Credentials: configv1.ObjectRef{
-						Kind: configv1.ObjectRefSecret,
-						Name: "value",
-					},
-				},
-			}
-
 			return renderKubernetesObjects(cfgVersion, cfg)
 		},
 		func() ([]string, error) {

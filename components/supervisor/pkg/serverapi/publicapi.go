@@ -9,7 +9,9 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"reflect"
+	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	backoff "github.com/cenkalti/backoff/v4"
@@ -19,21 +21,18 @@ import (
 	gitpod "github.com/gitpod-io/gitpod/gitpod-protocol"
 	"github.com/gitpod-io/gitpod/supervisor/api"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
-	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
 	"github.com/prometheus/client_golang/prometheus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 type APIInterface interface {
-	GetOwnerID(ctx context.Context, workspaceID string) (ownerID string, err error)
 	GetToken(ctx context.Context, query *gitpod.GetTokenSearchOptions) (res *gitpod.Token, err error)
-	OpenPort(ctx context.Context, workspaceID string, port *gitpod.WorkspaceInstancePort) (res *gitpod.WorkspaceInstancePort, err error)
-	InstanceUpdates(ctx context.Context, instanceID string, workspaceID string) (<-chan *gitpod.WorkspaceInstance, error)
-
-	// Remove this and use segment client directly
-	TrackEvent(ctx context.Context, event *gitpod.RemoteTrackMessage) (err error)
+	OpenPort(ctx context.Context, port *gitpod.WorkspaceInstancePort) (res *gitpod.WorkspaceInstancePort, err error)
+	InstanceUpdates(ctx context.Context) (<-chan *gitpod.WorkspaceInstance, error)
 
 	// Metrics
 	RegisterMetrics(registry *prometheus.Registry) error
@@ -51,25 +50,32 @@ type ServiceConfig struct {
 	Endpoint          string
 	InstanceID        string
 	WorkspaceID       string
+	OwnerID           string
 	SupervisorVersion string
+	ConfigcatEnabled  bool
 }
 
 type Service struct {
 	cfg         *ServiceConfig
 	experiments experiments.Client
 
-	token   string
-	ownerID string
-
-	lastServerInstance *gitpod.WorkspaceInstance
+	token string
 
 	// gitpodService server API
 	gitpodService gitpod.APIInterface
 	// publicAPIConn public API publicAPIConn
-	publicAPIConn    *grpc.ClientConn
-	publicApiMetrics *grpc_prometheus.ClientMetrics
+	publicAPIConn *grpc.ClientConn
 
-	previousUsingPublicAPI bool
+	// usingPublicAPI is using atomic type to avoid reconnect when configcat value change
+	usingPublicAPI atomic.Bool
+	// onUsingPublicAPI which will only used in instanceUpdate config change notify
+	onUsingPublicAPI chan struct{}
+
+	// subs is the subscribers of instanceUpdates
+	subs     map[chan *gitpod.WorkspaceInstance]struct{}
+	subMutex sync.Mutex
+
+	apiMetrics *ClientMetrics
 }
 
 var _ APIInterface = (*Service)(nil)
@@ -104,39 +110,45 @@ func NewServerApiService(ctx context.Context, cfg *ServiceConfig, tknsrv api.Tok
 		return nil
 	}
 
+	opts := []experiments.ClientOpt{}
+	if cfg.ConfigcatEnabled {
+		opts = append(opts, experiments.WithGitpodProxy(cfg.Host))
+	}
 	service := &Service{
 		token:            tknres.Token,
 		gitpodService:    gitpodService,
 		cfg:              cfg,
-		experiments:      experiments.NewClient(),
-		publicApiMetrics: grpc_prometheus.NewClientMetrics(),
+		experiments:      experiments.NewClient(opts...),
+		apiMetrics:       NewClientMetrics(),
+		onUsingPublicAPI: make(chan struct{}),
+		subs:             make(map[chan *gitpod.WorkspaceInstance]struct{}),
 	}
-
-	service.publicApiMetrics.EnableClientHandlingTimeHistogram(
-		// it should be aligned with https://github.com/gitpod-io/gitpod/blob/84ed1a0672d91446ba33cb7b504cfada769271a8/install/installer/pkg/components/ide-metrics/configmap.go#L315
-		grpc_prometheus.WithHistogramBuckets([]float64{0.1, 0.2, 0.5, 1, 2, 5, 10}),
-	)
 
 	// public api
-	service.tryConnToPublicAPI()
-	// listen to server instance update
-	go service.listenInstanceUpdate(ctx, cfg.InstanceID)
+	service.tryConnToPublicAPI(ctx)
 
-	if wsInfo, err := gitpodService.GetWorkspace(ctx, cfg.WorkspaceID); err != nil {
-		log.WithError(err).Error("cannot get workspace info")
-	} else {
-		service.ownerID = wsInfo.Workspace.OwnerID
-	}
+	service.usingPublicAPI.Store(experiments.SupervisorUsePublicAPI(ctx, service.experiments, experiments.Attributes{
+		UserID: cfg.OwnerID,
+	}))
+	// start to listen on real instance updates
+	go service.onInstanceUpdates(ctx)
+	go service.observeConfigcatValue(ctx)
+
 	return service
 }
 
-func (s *Service) tryConnToPublicAPI() {
+func (s *Service) tryConnToPublicAPI(ctx context.Context) {
 	endpoint := fmt.Sprintf("api.%s:443", s.cfg.Host)
 	log.WithField("endpoint", endpoint).Info("connecting to PublicAPI...")
 	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS13})),
+		grpc.WithTransportCredentials(credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})),
+		grpc.WithStreamInterceptor(grpc_middleware.ChainStreamClient([]grpc.StreamClientInterceptor{
+			func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+				withAuth := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+s.token)
+				return streamer(withAuth, desc, cc, method, opts...)
+			},
+		}...)),
 		grpc.WithUnaryInterceptor(grpc_middleware.ChainUnaryClient([]grpc.UnaryClientInterceptor{
-			s.publicApiMetrics.UnaryClientInterceptor(),
 			func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
 				withAuth := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+s.token)
 				return invoker(withAuth, method, req, reply, cc, opts...)
@@ -147,42 +159,56 @@ func (s *Service) tryConnToPublicAPI() {
 		log.WithError(err).Errorf("failed to dial public api %s", endpoint)
 	} else {
 		s.publicAPIConn = conn
+		go func() {
+			<-ctx.Done()
+			s.publicAPIConn.Close()
+		}()
 	}
 }
 
-func (s *Service) persistServerAPIChannelWhenStart(ctx context.Context) bool {
-	if s.publicAPIConn == nil || s.ownerID == "" {
-		return true
+func (s *Service) observeConfigcatValue(ctx context.Context) {
+	ticker := time.NewTicker(time.Second * 10)
+	for {
+		select {
+		case <-ctx.Done():
+			ticker.Stop()
+			return
+		case <-ticker.C:
+			usePublicAPI := experiments.SupervisorUsePublicAPI(ctx, s.experiments, experiments.Attributes{
+				UserID: s.cfg.OwnerID,
+			})
+			if prev := s.usingPublicAPI.Swap(usePublicAPI); prev != usePublicAPI {
+				if usePublicAPI {
+					log.Info("switch to use PublicAPI")
+				} else {
+					log.Info("switch to use ServerAPI")
+				}
+				select {
+				case s.onUsingPublicAPI <- struct{}{}:
+				default:
+				}
+			}
+		}
 	}
-	return experiments.SupervisorPersistServerAPIChannelWhenStart(ctx, s.experiments, experiments.Attributes{
-		UserID: s.ownerID,
-	})
 }
 
 func (s *Service) usePublicAPI(ctx context.Context) bool {
-	if s.publicAPIConn == nil || s.ownerID == "" {
+	if s.publicAPIConn == nil {
 		return false
 	}
-	usePublicAPI := experiments.SupervisorUsePublicAPI(ctx, s.experiments, experiments.Attributes{
-		UserID: s.ownerID,
-	})
-	if usePublicAPI != s.previousUsingPublicAPI {
-		if usePublicAPI {
-			log.Info("switch to use PublicAPI")
-		} else {
-			log.Info("switch to use ServerAPI")
-		}
-		s.previousUsingPublicAPI = usePublicAPI
-	}
-	return usePublicAPI
+	return s.usingPublicAPI.Load()
 }
 
-// GetToken implements protocol.APIInterface
 func (s *Service) GetToken(ctx context.Context, query *gitpod.GetTokenSearchOptions) (res *gitpod.Token, err error) {
+	startTime := time.Now()
+	usePublicApi := s.usePublicAPI(ctx)
+	defer func() {
+		s.apiMetrics.ProcessMetrics(usePublicApi, "GetToken", err, startTime)
+	}()
 	if s == nil {
 		return nil, errNotConnected
 	}
-	if !s.usePublicAPI(ctx) {
+	if !usePublicApi {
 		return s.gitpodService.GetToken(ctx, query)
 	}
 
@@ -205,12 +231,17 @@ func (s *Service) GetToken(ctx context.Context, query *gitpod.GetTokenSearchOpti
 	}, nil
 }
 
-// OpenPort implements protocol.APIInterface
-func (s *Service) OpenPort(ctx context.Context, workspaceID string, port *gitpod.WorkspaceInstancePort) (res *gitpod.WorkspaceInstancePort, err error) {
+func (s *Service) OpenPort(ctx context.Context, port *gitpod.WorkspaceInstancePort) (res *gitpod.WorkspaceInstancePort, err error) {
+	startTime := time.Now()
+	usePublicApi := s.usePublicAPI(ctx)
+	defer func() {
+		s.apiMetrics.ProcessMetrics(usePublicApi, "OpenPort", err, startTime)
+	}()
 	if s == nil {
 		return nil, errNotConnected
 	}
-	if !s.usePublicAPI(ctx) {
+	workspaceID := s.cfg.WorkspaceID
+	if !usePublicApi {
 		return s.gitpodService.OpenPort(ctx, workspaceID, port)
 	}
 	service := v1.NewWorkspacesServiceClient(s.publicAPIConn)
@@ -236,142 +267,211 @@ func (s *Service) OpenPort(ctx context.Context, workspaceID string, port *gitpod
 	return port, nil
 }
 
-func (s *Service) listenInstanceUpdate(ctx context.Context, instanceID string) {
-	for {
-		uptChan, err := backoff.RetryWithData(
-			func() (<-chan *gitpod.WorkspaceInstance, error) {
-				return s.gitpodService.InstanceUpdates(ctx, instanceID)
-			},
-			backoff.NewExponentialBackOff(),
-		)
-		if err != nil {
-			log.WithError(err).Error("failed to get workspace instance chan several retries")
-			continue
+// onInstanceUpdates listen to server and public API instanceUpdates and publish to subscribers once Service created.
+func (s *Service) onInstanceUpdates(ctx context.Context) {
+	errChan := make(chan error)
+	processUpdate := func(usePublicAPI bool) context.CancelFunc {
+		childCtx, cancel := context.WithCancel(ctx)
+		if usePublicAPI {
+			go s.publicAPIInstanceUpdate(childCtx, errChan)
+		} else {
+			go s.serverInstanceUpdate(childCtx, errChan)
 		}
+		return cancel
+	}
+	go func() {
+		cancel := processUpdate(s.usePublicAPI(ctx))
+		defer func() {
+			cancel()
+		}()
+		// force reconnect after 7m to avoid unexpected 10m reconnection (internal error)
+		ticker := time.NewTicker(7 * time.Minute)
 		for {
 			select {
 			case <-ctx.Done():
+				ticker.Stop()
 				return
-			case instance := <-uptChan:
-				s.lastServerInstance = instance
+			case <-ticker.C:
+				cancel()
+				cancel = processUpdate(s.usePublicAPI(ctx))
+			case <-s.onUsingPublicAPI:
+				cancel()
+				cancel = processUpdate(s.usePublicAPI(ctx))
+			case err := <-errChan:
+				if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+					continue
+				}
+				code := status.Code(err)
+				if code == codes.PermissionDenied {
+					log.WithError(err).Fatalf("failed to on instance update: have no permission")
+				}
+				log.WithField("method", "InstanceUpdates").WithError(err).Error("failed to listen")
+				cancel()
+				time.Sleep(time.Second * 2)
+				cancel = processUpdate(s.usePublicAPI(ctx))
 			}
 		}
-	}
+	}()
 }
 
-func (s *Service) getWorkspaceInfo(ctx context.Context, instanceID, workspaceID string) (*gitpod.WorkspaceInstance, error) {
-	getData := func() (*gitpod.WorkspaceInstance, error) {
-		if !s.usePublicAPI(ctx) {
-			return s.lastServerInstance, nil
-		}
-		service := v1.NewWorkspacesServiceClient(s.publicAPIConn)
-		resp, err := service.GetWorkspace(ctx, &v1.GetWorkspaceRequest{
-			WorkspaceId: workspaceID,
-		})
-		if err != nil {
-			log.WithField("method", "GetWorkspace").WithError(err).Error("failed to call PublicAPI")
-			return nil, err
-		}
-		instance := &gitpod.WorkspaceInstance{
-			CreationTime: resp.Result.Status.Instance.CreatedAt.String(),
-			ID:           resp.Result.Status.Instance.InstanceId,
-			Status: &gitpod.WorkspaceInstanceStatus{
-				ExposedPorts: []*gitpod.WorkspaceInstancePort{},
-				Message:      resp.Result.Status.Instance.Status.Message,
-				// OwnerToken:   "", not used so ignore
-				Phase:   resp.Result.Status.Instance.Status.Phase.String(),
-				Timeout: resp.Result.Status.Instance.Status.Conditions.Timeout,
-				Version: int(resp.Result.Status.Instance.Status.StatusVersion),
-			},
-			WorkspaceID: resp.Result.WorkspaceId,
-		}
-		for _, port := range resp.Result.Status.Instance.Status.Ports {
-			info := &gitpod.WorkspaceInstancePort{
-				Port: float64(port.Port),
-				URL:  port.Url,
-			}
-			if port.Policy == v1.PortPolicy_PORT_POLICY_PUBLIC {
-				info.Visibility = gitpod.PortVisibilityPublic
-			} else {
-				info.Visibility = gitpod.PortVisibilityPrivate
-			}
-			instance.Status.ExposedPorts = append(instance.Status.ExposedPorts, info)
-		}
-		return instance, nil
-	}
-	exp := &backoff.ExponentialBackOff{
-		InitialInterval:     2 * time.Second,
-		RandomizationFactor: 0.5,
-		Multiplier:          1.5,
-		MaxInterval:         30 * time.Second,
-		MaxElapsedTime:      0,
-		Stop:                backoff.Stop,
-		Clock:               backoff.SystemClock,
-	}
-	return backoff.RetryWithData(getData, exp)
-}
-
-// InstanceUpdates implements protocol.APIInterface
-func (s *Service) InstanceUpdates(ctx context.Context, instanceID string, workspaceID string) (<-chan *gitpod.WorkspaceInstance, error) {
+func (s *Service) InstanceUpdates(ctx context.Context) (<-chan *gitpod.WorkspaceInstance, error) {
 	if s == nil {
 		return nil, errNotConnected
 	}
-	if !s.usePublicAPI(ctx) && s.persistServerAPIChannelWhenStart(ctx) {
-		return s.gitpodService.InstanceUpdates(ctx, instanceID)
-	}
-	updateChan := make(chan *gitpod.WorkspaceInstance)
-	var latestInstance *gitpod.WorkspaceInstance
+	ch := make(chan *gitpod.WorkspaceInstance)
+	s.subMutex.Lock()
+	s.subs[ch] = struct{}{}
+	s.subMutex.Unlock()
+
 	go func() {
-		for {
-			if ctx.Err() != nil {
-				close(updateChan)
-				break
-			}
-			if instance, err := s.getWorkspaceInfo(ctx, instanceID, workspaceID); err == nil {
-				if reflect.DeepEqual(latestInstance, instance) {
-					continue
-				}
-				latestInstance = instance
-				updateChan <- instance
-			}
-			time.Sleep(1 * time.Second)
-		}
+		defer func() {
+			close(ch)
+		}()
+		<-ctx.Done()
+		s.subMutex.Lock()
+		delete(s.subs, ch)
+		s.subMutex.Unlock()
 	}()
-	return updateChan, nil
+	return ch, nil
 }
 
-// GetOwnerID implements APIInterface
-func (s *Service) GetOwnerID(ctx context.Context, workspaceID string) (ownerID string, err error) {
-	if s == nil {
-		return "", errNotConnected
-	}
-	if !s.usePublicAPI(ctx) {
-		resp, err := s.gitpodService.GetWorkspace(ctx, workspaceID)
+func (s *Service) publicAPIInstanceUpdate(ctx context.Context, errChan chan error) {
+	workspaceID := s.cfg.WorkspaceID
+	resp, err := backoff.RetryWithData(func() (v1.WorkspacesService_StreamWorkspaceStatusClient, error) {
+		startTime := time.Now()
+		var err error
+		defer func() {
+			if err != nil {
+				s.apiMetrics.ProcessMetrics(true, "InstanceUpdates", err, startTime)
+			}
+		}()
+		service := v1.NewWorkspacesServiceClient(s.publicAPIConn)
+		resp, err := service.StreamWorkspaceStatus(ctx, &v1.StreamWorkspaceStatusRequest{
+			WorkspaceId: workspaceID,
+		})
 		if err != nil {
-			return "", err
+			log.WithError(err).Info("backoff failed to get workspace service client of PublicAPI, try again")
 		}
-		return resp.Workspace.OwnerID, nil
-	}
-	service := v1.NewWorkspacesServiceClient(s.publicAPIConn)
-	resp, err := service.GetWorkspace(ctx, &v1.GetWorkspaceRequest{
-		WorkspaceId: workspaceID,
-	})
+		return resp, err
+	}, backoff.WithContext(ConnBackoff, ctx))
 	if err != nil {
-		return "", err
+		// we don't care about ctx canceled
+		if ctx.Err() != nil {
+			return
+		}
+		log.WithField("method", "StreamWorkspaceStatus").WithError(err).Error("failed to call PublicAPI")
+		errChan <- err
+		return
 	}
-	return resp.Result.OwnerId, nil
+	startTime := time.Now()
+	defer func() {
+		s.apiMetrics.ProcessMetrics(true, "InstanceUpdates", err, startTime)
+	}()
+	var data *v1.StreamWorkspaceStatusResponse
+	for {
+		data, err = resp.Recv()
+		if err != nil {
+			code := status.Code(err)
+			if err != io.EOF && ctx.Err() == nil && code != codes.Canceled {
+				log.WithField("method", "StreamWorkspaceStatus").WithError(err).Error("failed to receive status update")
+			}
+			if ctx.Err() != nil || code == codes.Canceled {
+				return
+			}
+			errChan <- err
+			return
+		}
+		s.subMutex.Lock()
+		for sub := range s.subs {
+			sub <- workspaceStatusToWorkspaceInstance(data.Result)
+		}
+		s.subMutex.Unlock()
+	}
 }
 
-func (s *Service) TrackEvent(ctx context.Context, event *gitpod.RemoteTrackMessage) (err error) {
-	if s == nil {
-		return errNotConnected
+func (s *Service) serverInstanceUpdate(ctx context.Context, errChan chan error) {
+	instanceID := s.cfg.InstanceID
+	ch, err := backoff.RetryWithData(func() (<-chan *gitpod.WorkspaceInstance, error) {
+		startTime := time.Now()
+		ch, err := s.gitpodService.InstanceUpdates(ctx, instanceID)
+		defer func() {
+			if err != nil {
+				s.apiMetrics.ProcessMetrics(false, "InstanceUpdates", err, startTime)
+			}
+		}()
+		if err != nil {
+			log.WithError(err).Info("backoff failed to listen to serverAPI instanceUpdates, try again")
+		}
+		return ch, err
+	}, backoff.WithContext(ConnBackoff, ctx))
+	if err != nil {
+		// we don't care about ctx canceled
+		if ctx.Err() != nil {
+			return
+		}
+		log.WithField("method", "InstanceUpdates").WithError(err).Error("failed to call serverAPI")
+		errChan <- err
+		return
 	}
-	return s.gitpodService.TrackEvent(ctx, event)
+	startTime := time.Now()
+	defer func() {
+		s.apiMetrics.ProcessMetrics(false, "InstanceUpdates", ctx.Err(), startTime)
+	}()
+	for update := range ch {
+		s.subMutex.Lock()
+		for sub := range s.subs {
+			sub <- update
+		}
+		s.subMutex.Unlock()
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	errChan <- io.EOF
+}
+
+var ConnBackoff = &backoff.ExponentialBackOff{
+	InitialInterval:     2 * time.Second,
+	RandomizationFactor: 0.5,
+	Multiplier:          1.5,
+	MaxInterval:         30 * time.Second,
+	MaxElapsedTime:      0,
+	Stop:                backoff.Stop,
+	Clock:               backoff.SystemClock,
 }
 
 func (s *Service) RegisterMetrics(registry *prometheus.Registry) error {
 	if s == nil {
 		return errNotConnected
 	}
-	return registry.Register(s.publicApiMetrics)
+	return registry.Register(s.apiMetrics)
+}
+
+func workspaceStatusToWorkspaceInstance(status *v1.WorkspaceStatus) *gitpod.WorkspaceInstance {
+	instance := &gitpod.WorkspaceInstance{
+		CreationTime: status.Instance.CreatedAt.String(),
+		ID:           status.Instance.InstanceId,
+		Status: &gitpod.WorkspaceInstanceStatus{
+			ExposedPorts: []*gitpod.WorkspaceInstancePort{},
+			Message:      status.Instance.Status.Message,
+			// OwnerToken:   "", not used so ignore
+			Phase:   status.Instance.Status.Phase.String(),
+			Timeout: status.Instance.Status.Conditions.Timeout,
+			Version: int(status.Instance.Status.StatusVersion),
+		},
+		WorkspaceID: status.Instance.WorkspaceId,
+	}
+	for _, port := range status.Instance.Status.Ports {
+		info := &gitpod.WorkspaceInstancePort{
+			Port: float64(port.Port),
+			URL:  port.Url,
+		}
+		if port.Policy == v1.PortPolicy_PORT_POLICY_PUBLIC {
+			info.Visibility = gitpod.PortVisibilityPublic
+		} else {
+			info.Visibility = gitpod.PortVisibilityPrivate
+		}
+		instance.Status.ExposedPorts = append(instance.Status.ExposedPorts, info)
+	}
+	return instance
 }

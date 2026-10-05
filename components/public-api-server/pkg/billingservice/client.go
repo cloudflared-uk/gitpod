@@ -13,9 +13,12 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+//go:generate mockgen -source=client.go Interface -destination=./mock_billingservice/billingservice.go > mock_billingservice/billingservice.go
+
 type Interface interface {
 	FinalizeInvoice(ctx context.Context, invoiceId string) error
 	CancelSubscription(ctx context.Context, subscriptionId string) error
+	OnChargeDispute(ctx context.Context, disputeID string) error
 }
 
 type Client struct {
@@ -42,6 +45,17 @@ func (c *Client) FinalizeInvoice(ctx context.Context, invoiceId string) error {
 
 func (c *Client) CancelSubscription(ctx context.Context, subscriptionId string) error {
 	_, err := c.b.CancelSubscription(ctx, &v1.CancelSubscriptionRequest{SubscriptionId: subscriptionId})
+	if err != nil {
+		return fmt.Errorf("failed RPC to billing service: %s", err)
+	}
+
+	return nil
+}
+
+func (c *Client) OnChargeDispute(ctx context.Context, disputeID string) error {
+	_, err := c.b.OnChargeDispute(ctx, &v1.OnChargeDisputeRequest{
+		DisputeId: disputeID,
+	})
 	if err != nil {
 		return fmt.Errorf("failed RPC to billing service: %s", err)
 	}

@@ -3,7 +3,7 @@
 # to test this script, follow these steps
 # 1. generate a config like so: ./installer init > config.yaml
 # 2. generate a k8s manifest like so: ./installer render -n $(kubens -c) -c config.yaml > k8s.yaml
-# 3. fake a license and feature file like so: echo "foo" > /tmp/license && echo '"bar"' > /tmp/defaultFeatureFlags
+# 3. fake a feature file like so: echo '"bar"' > /tmp/defaultFeatureFlags
 # 4. call this script like so: ./.werft/jobs/build/installer/post-process.sh 1234 5678 2 your-branch-just-dashes
 
 set -euo pipefail
@@ -12,25 +12,22 @@ set -euo pipefail
 NODE_POOL_INDEX=0
 
 # These were previously using "findLastPort" etc. but in harvester-based preview environments they can be stable
-REG_DAEMON_PORT="30000"
-WS_DAEMON_PORT="10000"
+REG_DAEMON_PORT="31750"
 
 # Required params
 DEV_BRANCH=$1
 SMITH_TOKEN=$2
 
-if [[ -z ${REG_DAEMON_PORT} ]] || [[ -z ${WS_DAEMON_PORT} ]] || [[ -z ${DEV_BRANCH} ]] || [[ -z ${SMITH_TOKEN} ]]; then
-   echo "One or more input params were invalid: ${REG_DAEMON_PORT} ${WS_DAEMON_PORT} ${DEV_BRANCH} ${SMITH_TOKEN}"
+if [[ -z ${REG_DAEMON_PORT} ]] || [[ -z ${DEV_BRANCH} ]] || [[ -z ${SMITH_TOKEN} ]]; then
+   echo "One or more input params were invalid: ${REG_DAEMON_PORT} ${DEV_BRANCH} ${SMITH_TOKEN}"
    exit 1
 else
-   echo "Running with the following params: ${REG_DAEMON_PORT} ${WS_DAEMON_PORT} ${DEV_BRANCH}"
+   echo "Running with the following params: ${REG_DAEMON_PORT} ${DEV_BRANCH}"
 fi
 
 echo "Use node pool index $NODE_POOL_INDEX"
 
 # Optional params
-# default yes, we add a license
-LICENSE=$(cat /tmp/license)
 # default, no, we do not add feature flags, file is empty
 DEFAULT_FEATURE_FLAGS=$(cat /tmp/defaultFeatureFlags)
 # if payment is configured: Append the YAML objects
@@ -53,7 +50,7 @@ MATCHES="$(grep -c -- --- k8s.yaml)"
 # get the read number of K8s manifest docs
 # K8s object names and kinds are duplicated in a config map to faciliate deletion
 # subtract one (the config map) and then divide by 2 to get the actual # of docs we'll loop through
-DOCS="$((((MATCHES - 1) / 2) + 1))"
+DOCS="$(((MATCHES - 1) / 2))"
 documentIndex=0
 
 while [ "$documentIndex" -le "$DOCS" ]; do
@@ -78,11 +75,6 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       yq w -i k8s.yaml -d "$documentIndex" spec.template.spec.containers.[0].livenessProbe.initialDelaySeconds 15
       yq w -i k8s.yaml -d "$documentIndex" spec.template.spec.containers.[0].readinessProbe.periodSeconds 120
       yq w -i k8s.yaml -d "$documentIndex" spec.template.spec.containers.[0].livenessProbe.initialDelaySeconds 15
-   fi
-   if [[ "$SIZE" -ne "0" ]] && [[ "$NAME" == "ws-daemon" ]] && [[ "$KIND" == "DaemonSet" ]] ; then
-      echo "setting $NAME to $WS_DAEMON_PORT"
-      yq w -i k8s.yaml -d "$documentIndex" spec.template.spec.containers.[0].ports.[0].hostPort "$WS_DAEMON_PORT"
-      yq w -i k8s.yaml -d "$documentIndex" spec.template.spec.containers.[0].ports.[0].containerPort "$WS_DAEMON_PORT"
    fi
 
    # override details for registry-facade service
@@ -130,13 +122,6 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       STAGE="devstaging"
       STAGE_EXPR="s/\"stage\": \"production\"/\"stage\": \"$STAGE\"/"
       sed -i "$STAGE_EXPR" /tmp/"$NAME"overrides.yaml
-      # Install EE license, if it exists
-      # This is a temporary solution until #6868 is resolved
-      if [ "${#LICENSE}" -gt 0 ]; then
-         echo "Installing EE License..."
-         LICENSE_EXPR="s/\"license\": \"\"/\"license\": \"$LICENSE\"/"
-         sed -i "$LICENSE_EXPR" /tmp/"$NAME"overrides.yaml
-      fi
       # DEFAULT_FEATURE_FLAGS
       # default none, this is CSV list like: ws-feature-flags=registry_facade,full_workspace_backup
       if [ "${#DEFAULT_FEATURE_FLAGS}" -gt 0 ]; then
@@ -205,8 +190,7 @@ while [ "$documentIndex" -le "$DOCS" ]; do
          REGISTRY_FACADE_HOST="reg.$DEV_BRANCH.preview.gitpod-dev.com:$REG_DAEMON_PORT"
       fi
       yq r /tmp/"$NAME"overrides.yaml 'data.[config.json]' \
-      | jq --arg REGISTRY_FACADE_HOST "$REGISTRY_FACADE_HOST" '.manager.registryFacadeHost = $REGISTRY_FACADE_HOST' \
-      | jq ".manager.wsdaemon.port = $WS_DAEMON_PORT" > /tmp/"$NAME"-cm-overrides.json
+      | jq --arg REGISTRY_FACADE_HOST "$REGISTRY_FACADE_HOST" '.manager.registryFacadeHost = $REGISTRY_FACADE_HOST' > /tmp/"$NAME"-cm-overrides.json
 
       touch /tmp/"$NAME"-cm-overrides.yaml
       # write a yaml file with the json as a multiline string
@@ -214,6 +198,33 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       yq m -x -i /tmp/"$NAME"overrides.yaml /tmp/"$NAME"-cm-overrides.yaml
 
       yq m -x -i k8s.yaml -d "$documentIndex" /tmp/"$NAME"overrides.yaml
+   fi
+
+    # overrides for ws-manager-mk2
+   if [[ "ws-manager-mk2" == "$NAME" ]] && [[ "$KIND" == "ConfigMap" ]]; then
+      WORK="overrides for $NAME $KIND"
+      echo "$WORK"
+       # Change the port we use to connect to registry-facade
+      # is expected to be reg.<branch-name-with-dashes>.staging.gitpod-dev.com:$REG_DAEMON_PORT
+      # Change the port we use to connect to ws-daemon
+      REGISTRY_FACADE_HOST="reg.$DEV_BRANCH.staging.gitpod-dev.com:$REG_DAEMON_PORT"
+      if [[ -v WITH_VM ]]; then
+         REGISTRY_FACADE_HOST="reg.$DEV_BRANCH.preview.gitpod-dev.com:$REG_DAEMON_PORT"
+      fi
+
+      # get a copy of the config we're working with
+      yq r k8s.yaml -d "$documentIndex" > /tmp/"$NAME"-"$KIND"-overrides.yaml
+
+      # replace registry port
+      yq r /tmp/"$NAME"-"$KIND"-overrides.yaml 'data.[config.json]' \
+      | jq ".manager.registryFacadeHost = \"$REGISTRY_FACADE_HOST\"" > /tmp/"$NAME"-"$KIND"-overrides.json
+
+      # create override file
+      touch /tmp/"$NAME"-"$KIND"-data-overrides.yaml
+      yq w -i /tmp/"$NAME"-"$KIND"-data-overrides.yaml "data.[config.json]" -- "$(< /tmp/"$NAME"-"$KIND"-overrides.json)"
+
+      # merge the updated config map with k8s.yaml
+      yq m -x -i k8s.yaml -d "$documentIndex" /tmp/"$NAME"-"$KIND"-data-overrides.yaml
    fi
 
    # overrides for ws-proxy
@@ -272,13 +283,6 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       yq w -i k8s.yaml -d "$documentIndex" "data.[default.yaml]" -- "$(< /tmp/"$NAME"overrides.yaml)"
    fi
 
-   # NetworkPolicy for ws-daemon
-   if [[ "ws-daemon" == "$NAME" ]] && [[ "$KIND" == "NetworkPolicy" ]]; then
-      WORK="overrides for $NAME $KIND"
-      echo "$WORK"
-      yq w -i k8s.yaml -d "$documentIndex" spec.ingress[0].ports[0].port "$WS_DAEMON_PORT"
-   fi
-
    # NetworkPolicy for workspace-default
    if [[ "workspace-default" == "$NAME" ]] && [[ "$KIND" == "NetworkPolicy" ]]; then
       WORK="overrides for $NAME $KIND"
@@ -286,7 +290,6 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       yq w -i k8s.yaml -d "$documentIndex" spec.egress[0].to[0].ipBlock.except[0] 169.254.169.254/30
    fi
 
-   # host ws-daemon on $WS_DAEMON_PORT
    if [[ "ws-daemon" == "$NAME" ]] && [[ "$KIND" == "ConfigMap" ]]; then
       WORK="overrides for $NAME $KIND"
       echo "$WORK"
@@ -294,15 +297,10 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       yq r k8s.yaml -d "$documentIndex" > /tmp/"$NAME"-"$KIND"-overrides.yaml
       # Parse and update the JSON, and write it to a file
       yq r /tmp/"$NAME"-"$KIND"-overrides.yaml 'data.[config.json]' \
-      | jq ".service.address = $WS_DAEMON_PORT" \
       | jq ".daemon.cpulimit.enabled = true" \
       | jq ".daemon.cpulimit.totalBandwidth = \"12\"" \
       | jq ".daemon.cpulimit.limit = \"2\"" \
       | jq ".daemon.cpulimit.burstLimit = \"6\"" > /tmp/"$NAME"-"$KIND"-overrides.json
-      # Give the port a colon prefix, ("5678" to ":5678")
-      # jq would not have it, hence the usage of sed to do the transformation
-      PORT_NUM_FORMAT_EXPR="s/\"address\": $WS_DAEMON_PORT/\"address\": \":$WS_DAEMON_PORT\"/"
-      sed -i "$PORT_NUM_FORMAT_EXPR" /tmp/"$NAME"-"$KIND"-overrides.json
       # write a yaml file with new json as a multiline string
       touch /tmp/"$NAME"-"$KIND"-data-overrides.yaml
       yq w -i /tmp/"$NAME"-"$KIND"-data-overrides.yaml "data.[config.json]" -- "$(< /tmp/"$NAME"-"$KIND"-overrides.json)"
@@ -336,13 +334,6 @@ while [ "$documentIndex" -le "$DOCS" ]; do
       WORK="suspend $NAME $KIND"
       echo "$WORK"
       yq w -i k8s.yaml -d "$documentIndex" spec.suspend "true"
-   fi
-
-   # change registry-facade PodSecurityPolicy
-   NAMESPACE=$(kubens -c)
-   if [[ "$NAMESPACE-ns-registry-facade" == "$NAME" ]] && [[ "$KIND" == "PodSecurityPolicy" ]]; then
-      yq w -i k8s.yaml -d "$documentIndex" spec.hostPorts[0].min "$REG_DAEMON_PORT"
-      yq w -i k8s.yaml -d "$documentIndex" spec.hostPorts[0].max "$REG_DAEMON_PORT"
    fi
 
    # Uncomment to change or remove resources from the configmap which can be used to uninstall Gitpod

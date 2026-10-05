@@ -57,7 +57,7 @@ You can start using Gitpod in one or more of the following ways:
 ## Documentation
 
 All documentation can be found on https://www.gitpod.io/docs.
-For example, see [Introduction](https://www.gitpod.io/docs) and [Getting Started](https://www.gitpod.io/docs/getting-started) sections. 📚
+For example, see [Introduction](https://www.gitpod.io/docs) and [Getting Started](https://www.gitpod.io/docs/getting-started) sections. See also: [Gitpod Architecture](https://www.youtube.com/watch?v=svV-uE0Cdjk) 📚.
 
 Also check out [**awesome-gitpod**](https://github.com/Gitpod-Samples/awesome-gitpod) ✨
 
@@ -74,16 +74,13 @@ The issue tracker is used for tracking **bug reports** and **feature requests** 
 
 You can upvote [popular feature requests](https://github.com/gitpod-io/gitpod/issues?q=is%3Aissue+is%3Aopen+sort%3Areactions-%2B1-desc) or [create a new one](https://github.com/gitpod-io/gitpod/issues/new?template=feature_request.md).
 
-## Development Process
-
-We work with quarterly roadmaps in autonomous product teams.
-
--   [Gitpod Architecture](https://www.notion.so/gitpod/Architecture-0e39e570b10f4e8ba7b259629ee3cb74)
--   [Product Roadmap](https://github.com/orgs/gitpod-io/projects/27)
-
 ### How do GitHub Issues get prioritized?
 
-Most GitHub issues (except smaller or more urgent issues) relate to our [current product roadmap items](https://github.com/orgs/gitpod-io/projects/27). Gitpod teams work against these roadmap items. Each Gitpod team has [its own project board](https://github.com/orgs/gitpod-io/projects) that follows a similar structure. You can find these project boards attached to [the GitHub organization](https://github.com/gitpod-io). Each team board has a "GroundWork" tab which shows current GitHub issues in progress. Each team project board also has an "inbox" where issues are sent for review by the team (and should be responded to within 48 hours). "Upvoting" by [reacting](https://docs.github.com/en/rest/reference/reactions) to GitHub issues helps signal to Gitpod that issues are important to you. If you are unsure of the status of an issue, please comment and a Gitpodder should respond to you shortly. For any other questions, please utilize the [Gitpod community](https://www.gitpod.io/community).
+Each Gitpod team has [its own project board](https://github.com/orgs/gitpod-io/projects) that follows a similar structure. You can find these project boards attached to [the GitHub organization](https://github.com/gitpod-io). Each team board has a "GroundWork" tab which shows current GitHub issues in progress. Each team project board also has an "inbox" where issues are sent for review by the team (and should be responded to within 48 hours). "Upvoting" by [reacting](https://docs.github.com/en/rest/reference/reactions) to GitHub issues helps signal to Gitpod that issues are important to you. If you are unsure of the status of an issue, please comment and a Gitpodder should respond to you shortly. For any other questions, please utilize the [Gitpod community](https://www.gitpod.io/community).
+
+### Adding a new component to Gitpod
+
+For new Go projects, please update [gitpod-ws.code-workspace](./gitpod-ws.code-workspace) to include the folder. Why? This will make it so that [IntelliSense](https://code.visualstudio.com/docs/editor/intellisense) works with your project, without having to exclusively open the project in a separate context, e.g. `code components/<my-new-component>`. References [1](https://go.googlesource.com/tools/+/refs/heads/master/gopls/doc/workspace.md#multiple-workspace-folders)[2](https://code.visualstudio.com/docs/editor/multi-root-workspaces)
 
 ## Related Projects
 

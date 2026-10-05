@@ -4,38 +4,31 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import dayjs from "dayjs";
 import { PrebuildWithStatus, Project } from "@gitpod/gitpod-protocol";
-import { useContext, useEffect, useState } from "react";
-import { useHistory, useLocation, useRouteMatch } from "react-router";
-import Header from "../components/Header";
-import { ItemsList, Item, ItemField, ItemFieldContextMenu } from "../components/ItemsList";
-import { getGitpodService, gitpodHostUrl } from "../service/service";
-import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
-import { prebuildStatusIcon, prebuildStatusLabel } from "./Prebuilds";
-import { shortCommitMessage, toRemoteURL } from "./render-utils";
-import { ReactComponent as Spinner } from "../icons/Spinner.svg";
-import NoAccess from "../icons/NoAccess.svg";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import { openAuthorizeWindow } from "../provider-utils";
+import dayjs from "dayjs";
+import { useCallback, useContext, useEffect, useState } from "react";
+import { Redirect, useHistory } from "react-router";
 import Alert from "../components/Alert";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { listAllProjects } from "../service/public-api";
-import { UserContext } from "../user-context";
+import Header from "../components/Header";
+import { Item, ItemField, ItemFieldContextMenu, ItemsList } from "../components/ItemsList";
+import { Subheading } from "../components/typography/headings";
+import NoAccess from "../icons/NoAccess.svg";
+import { ReactComponent as Spinner } from "../icons/Spinner.svg";
+import { openAuthorizeWindow } from "../provider-utils";
+import { getGitpodService, gitpodHostUrl } from "../service/service";
+import { useNewCreateWorkspacePage } from "../workspaces/CreateWorkspacePage";
+import { StartWorkspaceModalContext } from "../workspaces/start-workspace-modal-context";
+import { prebuildStatusIcon, prebuildStatusLabel } from "./Prebuilds";
+import { useCurrentProject } from "./project-context";
+import { getProjectTabs } from "./projects.routes";
+import { shortCommitMessage, toRemoteURL } from "./render-utils";
+import search from "../icons/search.svg";
 
-export default function () {
-    const location = useLocation();
+export default function ProjectsPage() {
     const history = useHistory();
-
-    const { teams } = useContext(TeamsContext);
-    const { user } = useContext(UserContext);
-    const { usePublicApiProjectsService } = useContext(FeatureFlagContext);
-    const team = getCurrentTeam(location, teams);
-
-    const match = useRouteMatch<{ team: string; resource: string }>("/(t/)?:team/:resource");
-    const projectSlug = match?.params?.resource;
-
-    const [project, setProject] = useState<Project | undefined>();
+    const { project, loading } = useCurrentProject();
+    const { setStartWorkspaceModalProps } = useContext(StartWorkspaceModalContext);
 
     const [isLoading, setIsLoading] = useState<boolean>(false);
     const [isLoadingBranches, setIsLoadingBranches] = useState<boolean>(false);
@@ -43,58 +36,28 @@ export default function () {
     const [isConsideredInactive, setIsConsideredInactive] = useState<boolean>(false);
     const [isResuming, setIsResuming] = useState<boolean>(false);
     const [prebuilds, setPrebuilds] = useState<Map<string, PrebuildWithStatus | undefined>>(new Map());
-    const [prebuildLoaders] = useState<Set<string>>(new Set());
+    const [prebuildLoaders, setPrebuildLoaders] = useState<Set<string>>(new Set());
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
 
     const [showAuthBanner, setShowAuthBanner] = useState<{ host: string } | undefined>(undefined);
 
-    useEffect(() => {
-        updateProject();
-    }, [teams]);
+    const isNewCreateWsPage = useNewCreateWorkspacePage();
 
     useEffect(() => {
-        if (!project) {
-            return;
-        }
-        (async () => {
-            try {
-                await updateBranches();
-            } catch (error) {
-                if (error && error.code === ErrorCodes.NOT_AUTHENTICATED) {
-                    setShowAuthBanner({ host: new URL(project.cloneUrl).hostname });
-                } else {
-                    console.error("Getting branches failed", error);
-                }
-            }
-        })();
+        // project changed, reset state
+        setBranches([]);
+        setIsLoading(false);
+        setIsLoadingBranches(false);
+        setIsConsideredInactive(false);
+        setIsResuming(false);
+        setPrebuilds(new Map());
+        setPrebuildLoaders(new Set());
+        setSearchFilter(undefined);
+        setShowAuthBanner(undefined);
     }, [project]);
 
-    const updateProject = async () => {
-        if (!teams || !projectSlug) {
-            return;
-        }
-        let projects: Project[];
-        if (!!team) {
-            projects = usePublicApiProjectsService
-                ? await listAllProjects({ teamId: team.id })
-                : await getGitpodService().server.getTeamProjects(team.id);
-        } else {
-            projects = usePublicApiProjectsService
-                ? await listAllProjects({ userId: user?.id })
-                : await getGitpodService().server.getUserProjects();
-        }
-        // Find project matching with slug, otherwise with name
-        const project = projectSlug && projects.find((p) => (p.slug ? p.slug === projectSlug : p.name === projectSlug));
-
-        if (!project) {
-            return;
-        }
-
-        setProject(project);
-    };
-
-    const updateBranches = async () => {
+    const updateBranches = useCallback(async () => {
         if (!project) {
             return;
         }
@@ -110,7 +73,17 @@ export default function () {
         } finally {
             setIsLoadingBranches(false);
         }
-    };
+    }, [project]);
+
+    useEffect(() => {
+        updateBranches().catch((error) => {
+            if (project && error && error.code === ErrorCodes.NOT_AUTHENTICATED) {
+                setShowAuthBanner({ host: new URL(project.cloneUrl).hostname });
+            } else {
+                console.error("Getting branches failed", error);
+            }
+        });
+    }, [project, updateBranches]);
 
     const tryAuthorize = async (host: string, onSuccess: () => void) => {
         try {
@@ -182,7 +155,7 @@ export default function () {
         try {
             setIsLoading(true);
             const prebuildResult = await getGitpodService().server.triggerPrebuild(project.id, branch.name);
-            history.push(`/${!!team ? "t/" + team.slug : "projects"}/${projectSlug}/${prebuildResult.prebuildId}`);
+            history.push(`/projects/${Project.slug(project!)}/${prebuildResult.prebuildId}`);
         } finally {
             setIsLoading(false);
         }
@@ -207,7 +180,7 @@ export default function () {
             setIsResuming(true);
             const response = await getGitpodService().server.triggerPrebuild(project.id, null);
             setIsConsideredInactive(false);
-            history.push(`/${!!team ? "t/" + team.slug : "projects"}/${projectSlug}/${response.prebuildId}`);
+            history.push(`/projects/${Project.slug(project!)}/${response.prebuildId}`);
         } catch (error) {
             console.error(error);
         } finally {
@@ -215,19 +188,24 @@ export default function () {
         }
     };
 
+    if (!loading && !project) {
+        return <Redirect to="/projects" />;
+    }
+
     return (
         <>
             <Header
-                title="Branches"
+                title={project?.name || "Loading..."}
                 subtitle={
-                    <h2 className="tracking-wide">
+                    <Subheading tracking="wide">
                         View recent active branches for{" "}
-                        <a className="gp-link" href={project?.cloneUrl!}>
+                        <a target="_blank" rel="noreferrer noopener" className="gp-link" href={project?.cloneUrl!}>
                             {toRemoteURL(project?.cloneUrl || "")}
                         </a>
                         .
-                    </h2>
+                    </Subheading>
                 }
+                tabs={getProjectTabs(project)}
             />
             <div className="app-container">
                 {showAuthBanner ? (
@@ -249,24 +227,17 @@ export default function () {
                     </div>
                 ) : (
                     <>
-                        <div className="flex mt-8">
-                            <div className="flex">
-                                <div className="py-4">
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        fill="none"
-                                        viewBox="0 0 16 16"
-                                        width="16"
-                                        height="16"
-                                    >
-                                        <path
-                                            fill="#A8A29E"
-                                            d="M6 2a4 4 0 100 8 4 4 0 000-8zM0 6a6 6 0 1110.89 3.477l4.817 4.816a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 010 6z"
-                                        />
-                                    </svg>
-                                </div>
+                        <div className="pt-2 flex">
+                            <div className="flex relative h-10 my-auto">
+                                <img
+                                    src={search}
+                                    title="Search"
+                                    className="filter-grayscale absolute top-3 left-3"
+                                    alt="search icon"
+                                />
                                 <input
                                     type="search"
+                                    className="w-64 pl-9 border-0"
                                     placeholder="Search Active Branches"
                                     onChange={(e) => setSearchFilter(e.target.value)}
                                 />
@@ -305,13 +276,12 @@ export default function () {
                                         </>
                                     )}
                                     {!isResuming && (
-                                        <a
-                                            href="javascript:void(0)"
+                                        <button
                                             className="gp-link hover:text-gray-600"
                                             onClick={() => resumePrebuilds()}
                                         >
                                             Resume prebuilds
-                                        </a>
+                                        </button>
                                     )}
                                 </Alert>
                             )}
@@ -321,108 +291,122 @@ export default function () {
                                     <span>Fetching repository branches...</span>
                                 </div>
                             )}
-                            {branches
-                                .filter(filter)
-                                .slice(0, 10)
-                                .map((branch, index) => {
-                                    let prebuild = matchingPrebuild(branch); // this might lazily trigger fetching of prebuild details
-                                    if (prebuild && prebuild.info.changeHash !== branch.changeHash) {
-                                        prebuild = undefined;
-                                    }
-                                    const avatar = branch.changeAuthorAvatar && (
-                                        <img
-                                            className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2 overflow-hidden"
-                                            src={branch.changeAuthorAvatar || ""}
-                                            alt={branch.changeAuthor}
-                                        />
-                                    );
-                                    const statusIcon = prebuildStatusIcon(prebuild);
-                                    const status = prebuildStatusLabel(prebuild);
+                            {project &&
+                                branches
+                                    .filter(filter)
+                                    .slice(0, 10)
+                                    .map((branch, index) => {
+                                        let prebuild = matchingPrebuild(branch); // this might lazily trigger fetching of prebuild details
+                                        if (prebuild && prebuild.info.changeHash !== branch.changeHash) {
+                                            prebuild = undefined;
+                                        }
+                                        const avatar = branch.changeAuthorAvatar && (
+                                            <img
+                                                className="rounded-full w-4 h-4 inline-block align-text-bottom mr-2 overflow-hidden"
+                                                src={branch.changeAuthorAvatar || ""}
+                                                alt={branch.changeAuthor}
+                                            />
+                                        );
+                                        const statusIcon = prebuildStatusIcon(prebuild);
+                                        const status = prebuildStatusLabel(prebuild);
 
-                                    return (
-                                        <Item key={`branch-${index}-${branch.name}`} className="grid grid-cols-3 group">
-                                            <ItemField className="flex items-center my-auto">
-                                                <div>
-                                                    <a href={branch.url}>
-                                                        <div className="text-base text-gray-600 hover:text-gray-800 dark:text-gray-50 dark:hover:text-gray-200 font-medium mb-1">
-                                                            {branch.name}
-                                                            {branch.isDefault && (
-                                                                <span className="ml-2 self-center rounded-xl py-0.5 px-2 text-sm bg-blue-50 text-blue-40 dark:bg-blue-500 dark:text-blue-100">
-                                                                    DEFAULT
-                                                                </span>
-                                                            )}
-                                                        </div>
-                                                    </a>
-                                                </div>
-                                            </ItemField>
-                                            <ItemField className="flex items-center my-auto">
-                                                <div className="truncate">
-                                                    <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1 truncate">
-                                                        {shortCommitMessage(branch.changeTitle)}
-                                                    </div>
-                                                    <p>
-                                                        {avatar}Authored {formatDate(branch.changeDate)} ·{" "}
-                                                        {branch.changeHash?.substring(0, 8)}
-                                                    </p>
-                                                </div>
-                                            </ItemField>
-                                            <ItemField className="flex items-center my-auto">
-                                                <a
-                                                    className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer"
-                                                    href={
-                                                        prebuild
-                                                            ? `/${
-                                                                  !!team ? "t/" + team.slug : "projects"
-                                                              }/${projectSlug}/${prebuild.info.id}`
-                                                            : "javascript:void(0)"
-                                                    }
-                                                >
-                                                    {prebuild ? (
-                                                        <>
-                                                            <div className="inline-block align-text-bottom mr-2 w-4 h-4">
-                                                                {statusIcon}
+                                        return (
+                                            <Item
+                                                key={`branch-${index}-${branch.name}`}
+                                                className="grid grid-cols-3 group"
+                                            >
+                                                <ItemField className="flex items-center my-auto">
+                                                    <div>
+                                                        <a href={branch.url}>
+                                                            <div className="text-base text-gray-600 hover:text-gray-800 dark:text-gray-50 dark:hover:text-gray-200 font-medium mb-1">
+                                                                {branch.name}
+                                                                {branch.isDefault && (
+                                                                    <span className="ml-2 self-center rounded-xl py-0.5 px-2 text-sm bg-blue-50 text-blue-40 dark:bg-blue-500 dark:text-blue-100">
+                                                                        DEFAULT
+                                                                    </span>
+                                                                )}
                                                             </div>
-                                                            {status}
-                                                        </>
-                                                    ) : (
-                                                        <span> </span>
-                                                    )}
-                                                </a>
-                                                <span className="flex-grow" />
-                                                <a href={gitpodHostUrl.withContext(`${branch.url}`).toString()}>
-                                                    <button
-                                                        className={`primary mr-2 py-2 opacity-0 group-hover:opacity-100`}
+                                                        </a>
+                                                    </div>
+                                                </ItemField>
+                                                <ItemField className="flex items-center my-auto">
+                                                    <div className="truncate">
+                                                        <div className="text-base text-gray-500 dark:text-gray-50 font-medium mb-1 truncate">
+                                                            {shortCommitMessage(branch.changeTitle)}
+                                                        </div>
+                                                        <p>
+                                                            {avatar}Authored {formatDate(branch.changeDate)} ·{" "}
+                                                            {branch.changeHash?.substring(0, 8)}
+                                                        </p>
+                                                    </div>
+                                                </ItemField>
+                                                <ItemField className="flex items-center my-auto">
+                                                    <a
+                                                        className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer"
+                                                        href={
+                                                            prebuild
+                                                                ? `/projects/${Project.slug(project!)}/${
+                                                                      prebuild.info.id
+                                                                  }`
+                                                                : ""
+                                                        }
                                                     >
-                                                        New Workspace
-                                                    </button>
-                                                </a>
-                                                <ItemFieldContextMenu
-                                                    className="py-0.5"
-                                                    menuEntries={
-                                                        prebuild?.status === "queued" || prebuild?.status === "building"
-                                                            ? [
-                                                                  {
+                                                        {prebuild ? (
+                                                            <>
+                                                                <div className="inline-block align-text-bottom mr-2 w-4 h-4">
+                                                                    {statusIcon}
+                                                                </div>
+                                                                {status}
+                                                            </>
+                                                        ) : (
+                                                            <span> </span>
+                                                        )}
+                                                    </a>
+                                                    <span className="flex-grow" />
+                                                    <a href={gitpodHostUrl.withContext(`${branch.url}`).toString()}>
+                                                        <button
+                                                            className={`primary mr-2 py-2 opacity-0 group-hover:opacity-100`}
+                                                        >
+                                                            New Workspace
+                                                        </button>
+                                                    </a>
+                                                    <ItemFieldContextMenu
+                                                        className="py-0.5"
+                                                        menuEntries={[
+                                                            ...(isNewCreateWsPage
+                                                                ? []
+                                                                : [
+                                                                      {
+                                                                          title: "New Workspace with ...",
+                                                                          onClick: () =>
+                                                                              setStartWorkspaceModalProps({
+                                                                                  contextUrl: branch.url,
+                                                                                  allowContextUrlChange: true,
+                                                                              }),
+                                                                          separator: true,
+                                                                      },
+                                                                  ]),
+                                                            prebuild?.status === "queued" ||
+                                                            prebuild?.status === "building"
+                                                                ? {
                                                                       title: "Cancel Prebuild",
                                                                       customFontStyle:
                                                                           "text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300",
                                                                       onClick: () =>
                                                                           prebuild && cancelPrebuild(prebuild.info.id),
-                                                                  },
-                                                              ]
-                                                            : [
-                                                                  {
+                                                                  }
+                                                                : {
                                                                       title: `${prebuild ? "Rerun" : "Run"} Prebuild (${
                                                                           branch.name
                                                                       })`,
                                                                       onClick: () => triggerPrebuild(branch),
                                                                   },
-                                                              ]
-                                                    }
-                                                />
-                                            </ItemField>
-                                        </Item>
-                                    );
-                                })}
+                                                        ]}
+                                                    />
+                                                </ItemField>
+                                            </Item>
+                                        );
+                                    })}
                         </ItemsList>
                     </>
                 )}

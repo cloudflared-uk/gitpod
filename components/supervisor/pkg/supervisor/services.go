@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -92,6 +93,7 @@ func (service *ideReadyState) Set(ready bool, info *DesktopIDEStatus) {
 }
 
 type statusService struct {
+	willShutdownCtx context.Context
 	ContentState    ContentState
 	Ports           *ports.Manager
 	Tasks           *tasksManager
@@ -110,7 +112,21 @@ func (s *statusService) RegisterREST(mux *runtime.ServeMux, grpcEndpoint string)
 	return api.RegisterStatusServiceHandlerFromEndpoint(context.Background(), mux, grpcEndpoint, []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())})
 }
 
-func (s *statusService) SupervisorStatus(context.Context, *api.SupervisorStatusRequest) (*api.SupervisorStatusResponse, error) {
+func (s *statusService) SupervisorStatus(ctx context.Context, req *api.SupervisorStatusRequest) (*api.SupervisorStatusResponse, error) {
+	if req.WillShutdown {
+		if s.willShutdownCtx.Err() != nil {
+			return &api.SupervisorStatusResponse{Ok: true}, nil
+		}
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return nil, status.Error(codes.Canceled, "execution canceled")
+			}
+			return nil, status.Error(codes.DeadlineExceeded, ctx.Err().Error())
+		case <-s.willShutdownCtx.Done():
+			return &api.SupervisorStatusResponse{Ok: true}, nil
+		}
+	}
 	return &api.SupervisorStatusResponse{Ok: true}, nil
 }
 
@@ -652,6 +668,9 @@ func (is *InfoService) WorkspaceInfo(context.Context, *api.WorkspaceInfoRequest)
 		IdeAlias:             is.cfg.IDEAlias,
 		IdePort:              uint32(is.cfg.IDEPort),
 		WorkspaceClass:       &api.WorkspaceInfoResponse_WorkspaceClass{Id: is.cfg.WorkspaceClass},
+		OwnerId:              is.cfg.OwnerId,
+		DebugWorkspaceType:   is.cfg.DebugWorkspaceType,
+		ConfigcatEnabled:     is.cfg.ConfigcatEnabled,
 	}
 	if is.cfg.WorkspaceClassInfo != nil {
 		resp.WorkspaceClass.DisplayName = is.cfg.WorkspaceClassInfo.DisplayName
@@ -774,6 +793,35 @@ func (ss *ControlService) CreateSSHKeyPair(context.Context, *api.CreateSSHKeyPai
 	return &api.CreateSSHKeyPairResponse{
 		PrivateKey: ss.privateKey,
 	}, err
+}
+
+// CreateDebugEnv creates a debug workspace envs
+func (c *ControlService) CreateDebugEnv(ctx context.Context, req *api.CreateDebugEnvRequest) (*api.CreateDebugEnvResponse, error) {
+	var envs []string
+	for _, env := range os.Environ() {
+		if env == "" {
+			continue
+		}
+		parts := strings.SplitN(env, "=", 2)
+		key := parts[0]
+		// TODO all system envs should start with GITPOD_
+		// gp env shoud not allow to set env vars with GITPOD_ prefix
+		if strings.HasPrefix(key, "GITPOD_") || strings.HasPrefix(key, "THEIA_") || key == "VSX_REGISTRY_URL" {
+			envs = append(envs, env)
+		}
+	}
+	envs = append(envs, fmt.Sprintf("SUPERVISOR_DEBUG_WORKSPACE_TYPE=%d", req.GetWorkspaceType()))
+	envs = append(envs, fmt.Sprintf("SUPERVISOR_DEBUG_WORKSPACE_CONTENT_SOURCE=%d", req.GetContentSource()))
+	envs = append(envs, fmt.Sprintf("LOG_LEVEL=%s", req.GetLogLevel()))
+	envs = append(envs, fmt.Sprintf("GITPOD_TASKS=%s", req.GetTasks()))
+	envs = append(envs, fmt.Sprintf("GITPOD_WORKSPACE_URL=%s", req.GetWorkspaceUrl()))
+	envs = append(envs, fmt.Sprintf("GITPOD_REPO_ROOT=%s", req.GetCheckoutLocation()))
+	envs = append(envs, fmt.Sprintf("GITPOD_REPO_ROOTS=%s", req.GetCheckoutLocation()))
+	envs = append(envs, fmt.Sprintf("THEIA_WORKSPACE_ROOT=%s", req.GetWorkspaceLocation()))
+	envs = append(envs, fmt.Sprintf("GITPOD_PREVENT_METADATA_ACCESS=%s", "false"))
+	return &api.CreateDebugEnvResponse{
+		Envs: envs,
+	}, nil
 }
 
 // ContentState signals the workspace content state.

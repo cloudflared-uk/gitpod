@@ -75,6 +75,8 @@ type Workspace struct {
 
 	XFSProjectID int `json:"xfsProjectID"`
 
+	IsMk2 bool `json:"isMk2,omitempty"`
+
 	NonPersistentAttrs map[string]interface{} `json:"-"`
 
 	store              *Store
@@ -137,7 +139,7 @@ func (s *Workspace) MarkInitDone(ctx context.Context) (err error) {
 	// We persist before changing state so that we only mark everything as ready
 	// if we actually have a persistent workspace. Otherwise we might have wsman thinking
 	// something different than a restarted ws-daemon.
-	err = s.persist()
+	err = s.Persist()
 	if err != nil {
 		return xerrors.Errorf("cannot mark init done: %w", err)
 	}
@@ -153,7 +155,7 @@ func (s *Workspace) MarkInitDone(ctx context.Context) (err error) {
 	}
 
 	// Now that the rest of the world know's we're ready, we have to remember that ourselves.
-	err = s.persist()
+	err = s.Persist()
 	if err != nil {
 		return xerrors.Errorf("cannot mark init done: %w", err)
 	}
@@ -175,7 +177,7 @@ func (s *Workspace) WaitOrMarkForDisposal(ctx context.Context) (done bool, repo 
 		s.state = WorkspaceDisposing
 		s.stateLock.Unlock()
 
-		err = s.persist()
+		err = s.Persist()
 		if err != nil {
 			return false, nil, xerrors.Errorf("cannot mark as disposing: %w", err)
 		}
@@ -198,7 +200,7 @@ func (s *Workspace) WaitOrMarkForDisposal(ctx context.Context) (done bool, repo 
 }
 
 // Dispose marks the workspace as disposed and clears it from disk
-func (s *Workspace) Dispose(ctx context.Context) (err error) {
+func (s *Workspace) Dispose(ctx context.Context, hooks []WorkspaceLivecycleHook) (err error) {
 	//nolint:ineffassign,staticcheck
 	span, ctx := opentracing.StartSpanFromContext(ctx, "workspace.Dispose")
 	defer tracing.FinishSpan(span, &err)
@@ -215,14 +217,25 @@ func (s *Workspace) Dispose(ctx context.Context) (err error) {
 		}
 	}
 
-	s.stateLock.Lock()
-	s.state = WorkspaceDisposed
-	s.operatingCondition.Broadcast()
-	s.stateLock.Unlock()
+	if !s.IsMk2 {
+		s.stateLock.Lock()
+		s.state = WorkspaceDisposed
+		s.operatingCondition.Broadcast()
+		s.stateLock.Unlock()
+	}
 
-	err = s.store.runLifecycleHooks(ctx, s)
-	if err != nil {
-		return err
+	if hooks != nil {
+		for _, h := range hooks {
+			err := h(ctx, s)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		err = s.store.runLifecycleHooks(ctx, s)
+		if err != nil {
+			return err
+		}
 	}
 
 	if s.PersistentVolumeClaim {
@@ -262,7 +275,7 @@ func (s *Workspace) SetGitStatus(status *csapi.GitStatus) error {
 	s.LastGitStatus = status
 	s.stateLock.Unlock()
 
-	return s.persist()
+	return s.Persist()
 }
 
 // UpdateGitStatus attempts to update the LastGitStatus from the workspace's local working copy.
@@ -307,10 +320,9 @@ func (s *Workspace) UpdateGitStatus(ctx context.Context, persistentVolumeClaim b
 		s.LastGitStatus = toGitStatus(stat)
 	}
 
-	err = s.persist()
+	err = s.Persist()
 	if err != nil {
 		log.WithError(err).WithFields(s.OWI()).Warn("cannot persist latest Git status")
-		err = nil
 	}
 
 	return s.LastGitStatus, nil
@@ -343,10 +355,14 @@ type persistentWorkspace struct {
 }
 
 func (s *Workspace) persistentStateLocation() string {
+	if s.IsMk2 {
+		return filepath.Join(filepath.Dir(s.Location), fmt.Sprintf("%s.workspace.json", s.InstanceID))
+	}
+
 	return filepath.Join(s.store.Location, fmt.Sprintf("%s.workspace.json", s.InstanceID))
 }
 
-func (s *Workspace) persist() error {
+func (s *Workspace) Persist() error {
 	s.stateLock.RLock()
 	fc, err := json.Marshal(persistentWorkspace{s, s.state})
 	s.stateLock.RUnlock()

@@ -5,18 +5,7 @@
  */
 
 import { injectable, inject } from "inversify";
-import {
-    User,
-    Identity,
-    WorkspaceTimeoutDuration,
-    UserEnvVarValue,
-    Token,
-    WORKSPACE_TIMEOUT_DEFAULT_SHORT,
-    WORKSPACE_TIMEOUT_DEFAULT_LONG,
-    WORKSPACE_TIMEOUT_EXTENDED,
-    WORKSPACE_TIMEOUT_EXTENDED_ALT,
-    Workspace,
-} from "@gitpod/gitpod-protocol";
+import { User, Identity, UserEnvVarValue, Token } from "@gitpod/gitpod-protocol";
 import { ProjectDB, TeamDB, TermsAcceptanceDB, UserDB } from "@gitpod/gitpod-db/lib";
 import { HostContextProvider } from "../auth/host-context-provider";
 import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
@@ -33,7 +22,9 @@ import { StripeService } from "../../ee/src/user/stripe-service";
 import { ResponseError } from "vscode-ws-jsonrpc";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { UsageService } from "./usage-service";
-import { CostCenter_BillingStrategy } from "@gitpod/usage-api/lib/usage/v1/usage.pb";
+import { UserToTeamMigrationService } from "@gitpod/gitpod-db/lib/user-to-team-migration-service";
+import { ConfigCatClientFactory } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
+import { BillingModes } from "../../ee/src/billing/billing-mode";
 
 export interface FindUserByIdentityStrResult {
     user: User;
@@ -80,6 +71,9 @@ export class UserService {
     @inject(TeamDB) protected readonly teamDB: TeamDB;
     @inject(StripeService) protected readonly stripeService: StripeService;
     @inject(UsageService) protected readonly usageService: UsageService;
+    @inject(UserToTeamMigrationService) protected readonly migrationService: UserToTeamMigrationService;
+    @inject(ConfigCatClientFactory) protected readonly configCatClientFactory: ConfigCatClientFactory;
+    @inject(BillingModes) protected readonly billingModes: BillingModes;
 
     /**
      * Takes strings in the form of <authHost>/<authName> and returns the matching User
@@ -143,7 +137,12 @@ export class UserService {
         if (userUpdate) {
             userUpdate(newUser);
         }
-        newUser.identities.push(identity);
+        // HINT: we need to specify `deleted: false` here, so that any attempt to reuse the same
+        // entry would converge to a valid state. The identities are identified by the external
+        // `authId`, and if accounts are deleted, such entries are soft-deleted until the periodic
+        // deleter will take care of them. Reuse of soft-deleted entries would lead to an invalid
+        // state. This measure of prevention is considered in the period deleter as well.
+        newUser.identities.push({ ...identity, deleted: false });
         this.handleNewUser(newUser, isFirstUser);
         newUser = await this.userDb.storeUser(newUser);
         if (token) {
@@ -160,70 +159,45 @@ export class UserService {
             // blocked = if user already blocked OR is not allowed to pass
             newUser.blocked = newUser.blocked || !canPass;
         }
-        if (!newUser.blocked && (isFirstUser || this.config.makeNewUsersAdmin)) {
+        if (!newUser.blocked && isFirstUser && this.config.admin.grantFirstUserAdminRole) {
             newUser.rolesOrPermissions = ["admin"];
-        }
-    }
-
-    public workspaceTimeoutToDuration(timeout: WorkspaceTimeoutDuration): string {
-        switch (timeout) {
-            case WORKSPACE_TIMEOUT_DEFAULT_SHORT:
-                return "30m";
-            case WORKSPACE_TIMEOUT_DEFAULT_LONG:
-                return "60m";
-            case WORKSPACE_TIMEOUT_EXTENDED:
-            case WORKSPACE_TIMEOUT_EXTENDED_ALT:
-                return "180m";
-        }
-    }
-
-    public durationToWorkspaceTimeout(duration: string): WorkspaceTimeoutDuration {
-        switch (duration) {
-            case "30m":
-                return WORKSPACE_TIMEOUT_DEFAULT_SHORT;
-            case "60m":
-                return WORKSPACE_TIMEOUT_DEFAULT_LONG;
-            case "180m":
-                return WORKSPACE_TIMEOUT_EXTENDED_ALT;
-            default:
-                return WORKSPACE_TIMEOUT_DEFAULT_SHORT;
         }
     }
 
     protected async validateUsageAttributionId(user: User, usageAttributionId: string): Promise<AttributionId> {
         const attribution = AttributionId.parse(usageAttributionId);
         if (!attribution) {
-            throw new ResponseError(ErrorCodes.INVALID_COST_CENTER, "The billing team id configured is invalid.");
+            throw new ResponseError(ErrorCodes.INVALID_COST_CENTER, "The provided attributionId is invalid.", {
+                id: usageAttributionId,
+            });
         }
         if (attribution.kind === "team") {
             const team = await this.teamDB.findTeamById(attribution.teamId);
             if (!team) {
                 throw new ResponseError(
                     ErrorCodes.INVALID_COST_CENTER,
-                    "The billing team you've selected no longer exists.",
+                    "Organization not found. Please contact support if you believe this is an error.",
                 );
             }
             const members = await this.teamDB.findMembersByTeam(team.id);
             if (!members.find((m) => m.userId === user.id)) {
+                // if the user's not a member of an org, they can't see it
                 throw new ResponseError(
                     ErrorCodes.INVALID_COST_CENTER,
-                    "You're no longer a member of the selected billing team.",
+                    "Organization not found. Please contact support if you believe this is an error.",
                 );
             }
         }
         if (attribution.kind === "user") {
             if (user.id !== attribution.userId) {
-                throw new ResponseError(
-                    ErrorCodes.INVALID_COST_CENTER,
-                    "You can select either yourself or a team you are a member of",
-                );
+                throw new ResponseError(ErrorCodes.INVALID_COST_CENTER, "Invalid organizationId.");
             }
         }
         const billedAttributionIds = await this.listAvailableUsageAttributionIds(user);
         if (billedAttributionIds.find((id) => AttributionId.equals(id, attribution)) === undefined) {
             throw new ResponseError(
                 ErrorCodes.INVALID_COST_CENTER,
-                "You can select either yourself or a billed team you are a member of",
+                "Organization not found. Please contact support if you believe this is an error.",
             );
         }
         return attribution;
@@ -233,13 +207,17 @@ export class UserService {
      * Identifies the team or user to which a workspace instance's running time should be attributed to
      * (e.g. for usage analytics or billing purposes).
      *
+     * This is the legacy logic for determining a cost center. It's only used for workspaces that are started by users ibefore they have been migrated to org-only mode.
      *
      * @param user
      * @param projectId
      * @returns The validated AttributionId
      */
     async getWorkspaceUsageAttributionId(user: User, projectId?: string): Promise<AttributionId> {
-        // if it's a workspace for a project the user has access to and the costcenter has credits use that
+        if (user.additionalData?.isMigratedToTeamOnlyAttribution) {
+            throw new Error("getWorkspaceUsageAttributionId should not be called for users in org-only mode.");
+        }
+        // if it's a workspace for a project the user has access to and the org has credits use that
         if (projectId) {
             let attributionId: AttributionId | undefined;
             const project = await this.projectDb.findProjectById(projectId);
@@ -249,7 +227,7 @@ export class UserService {
                 if (team) {
                     attributionId = AttributionId.create(team);
                 }
-            } else {
+            } else if (!user?.additionalData?.isMigratedToTeamOnlyAttribution) {
                 attributionId = AttributionId.create(user);
             }
             if (!!attributionId && (await this.hasCredits(attributionId))) {
@@ -260,6 +238,13 @@ export class UserService {
             // Return the user's explicit attribution ID.
             return await this.validateUsageAttributionId(user, user.usageAttributionId);
         }
+        if (user?.additionalData?.isMigratedToTeamOnlyAttribution) {
+            const teams = await this.teamDB.findTeamsByUser(user.id);
+            if (teams.length > 0) {
+                return AttributionId.create(teams[0]);
+            }
+            throw new ResponseError(ErrorCodes.INVALID_COST_CENTER, "No organization found for user");
+        }
         return AttributionId.create(user);
     }
 
@@ -268,8 +253,11 @@ export class UserService {
      * @param workspace - optional, in which case the default billing account will be checked
      * @returns
      */
-    async checkUsageLimitReached(user: User, workspace?: Workspace): Promise<UsageLimitReachedResult> {
-        const attributionId = await this.getWorkspaceUsageAttributionId(user, workspace?.projectId);
+    async checkUsageLimitReached(user: User, organizationId?: string): Promise<UsageLimitReachedResult> {
+        if (!organizationId && user.additionalData?.isMigratedToTeamOnlyAttribution) {
+            throw new Error("organizationId must be provided for org-only users");
+        }
+        const attributionId = AttributionId.createFromOrganizationId(organizationId) || AttributionId.create(user);
         const creditBalance = await this.usageService.getCurrentBalance(attributionId);
         const currentInvoiceCredits = creditBalance.usedCredits;
         const usageLimit = creditBalance.usageLimit;
@@ -320,22 +308,11 @@ export class UserService {
      */
     async listAvailableUsageAttributionIds(user: User): Promise<AttributionId[]> {
         // List all teams available for attribution
-        const teams = await this.teamDB.findTeamsByUser(user.id);
-        const billedStripeTeams = (
-            await Promise.all(
-                teams.map(async (team) => {
-                    const attributionId = AttributionId.create(team);
-                    const billingStrategy = await this.usageService.getCurrentBillingStategy(attributionId);
-                    if (billingStrategy === CostCenter_BillingStrategy.BILLING_STRATEGY_STRIPE) {
-                        return attributionId;
-                    }
-                    return undefined;
-                }),
-            )
-        ).filter((t) => !!t) as AttributionId[];
-
-        // Attributing to oneself is always an option
-        return [AttributionId.create(user)].concat(billedStripeTeams);
+        const result = (await this.teamDB.findTeamsByUser(user.id)).map((team) => AttributionId.create(team));
+        if (user?.additionalData?.isMigratedToTeamOnlyAttribution) {
+            return result;
+        }
+        return [AttributionId.create(user)].concat(result);
     }
 
     /**
@@ -387,11 +364,6 @@ export class UserService {
         // return !!accepted && (accepted.termsRevision === terms.revision);
     }
 
-    async checkAutomaticOssEligibility(user: User): Promise<boolean> {
-        // EE implementation
-        return false;
-    }
-
     async isBlocked(params: CheckIsBlockedParams): Promise<boolean> {
         if (params.user && params.user.blocked) {
             return true;
@@ -405,7 +377,7 @@ export class UserService {
     async blockUser(targetUserId: string, block: boolean): Promise<User> {
         const target = await this.userDb.findUserById(targetUserId);
         if (!target) {
-            throw new Error("Not found.");
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "not found");
         }
 
         target.blocked = !!block;
@@ -421,8 +393,27 @@ export class UserService {
         // update user
         user.name = user.name || authUser.name || authUser.primaryEmail;
         user.avatarUrl = user.avatarUrl || authUser.avatarUrl;
-
+        await this.onAfterUserLoad(user);
         await this.updateUserIdentity(user, candidate, token);
+    }
+
+    async onAfterUserLoad(user: User): Promise<User> {
+        try {
+            // migrate user to team only attribution
+            const shouldMigrate = this.configCatClientFactory().getValueAsync("team_only_attribution", false, {
+                user,
+            });
+            if (User.is(user) && (await this.migrationService.needsMigration(user)) && (await shouldMigrate)) {
+                const mode = await this.billingModes.getBillingModeForUser(user, new Date());
+                if (mode.mode === "chargebee") {
+                    return user;
+                }
+                return await this.migrationService.migrateUser(user);
+            }
+        } catch (error) {
+            log.error({ user }, `Migrating user to team-only attribution failed`);
+        }
+        return user;
     }
 
     async updateUserIdentity(user: User, candidate: Identity, token: Token) {
@@ -470,7 +461,6 @@ export class UserService {
     }
 
     async deauthorize(user: User, authProviderId: string) {
-        const builtInProviders = ["Public-GitLab", "Public-GitHub", "Public-Bitbucket"];
         const externalIdentities = user.identities.filter(
             (i) => i.authProviderId !== TokenService.GITPOD_AUTH_PROVIDER_ID,
         );
@@ -485,10 +475,8 @@ export class UserService {
             (i) => i !== identity && (!this.config.disableDynamicAuthProviderLogin || isBuiltin(i.authProviderId)),
         );
 
-        if (
-            remainingLoginIdentities.length === 1 &&
-            !builtInProviders.includes(remainingLoginIdentities[0].authProviderId)
-        ) {
+        // Disallow users to deregister the last builtin auth provider's from their user
+        if (remainingLoginIdentities.length === 0) {
             throw new Error(
                 "Cannot remove last authentication provider for logging in to Gitpod. Please delete account if you want to leave.",
             );
@@ -565,5 +553,14 @@ export class UserService {
                 ?.authProvider?.info?.host || "unknown";
 
         throw EmailAddressAlreadyTakenException.create(`Email address is already in use.`, { host });
+    }
+
+    /**
+     * Only installation-level users are allowed to create/join other orgs then the one they belong to
+     * @param user
+     * @returns
+     */
+    async mayCreateOrJoinOrganization(user: User): Promise<boolean> {
+        return !user.organizationId;
     }
 }

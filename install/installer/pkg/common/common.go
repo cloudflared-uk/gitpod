@@ -56,7 +56,7 @@ func getProxyServerEnvvar(cfg *config.Config, envvarName string, key string) []c
 
 func DefaultLabels(component string) map[string]string {
 	return map[string]string{
-		"app":       AppName,
+		"app":       "gitpod",
 		"component": component,
 	}
 }
@@ -139,13 +139,17 @@ func WebappTracingEnv(context *RenderContext, component string) (res []corev1.En
 }
 
 func tracingEnv(context *RenderContext, component string, tracing *experimental.Tracing) (res []corev1.EnvVar) {
+	// For OpenTelemetry (OTEL) environment variable specification, see https://opentelemetry.io/docs/reference/specification/protocol/exporter/
+
 	if context.Config.Observability.Tracing == nil {
 		res = append(res, corev1.EnvVar{Name: "JAEGER_DISABLED", Value: "true"})
+		res = append(res, corev1.EnvVar{Name: "OTEL_SDK_DISABLED", Value: "true"})
 		return
 	}
 
 	if ep := context.Config.Observability.Tracing.Endpoint; ep != nil {
 		res = append(res, corev1.EnvVar{Name: "JAEGER_ENDPOINT", Value: *ep})
+		res = append(res, corev1.EnvVar{Name: "OTEL_EXPORTER_OTLP_ENDPOINT", Value: *ep})
 	} else if v := context.Config.Observability.Tracing.AgentHost; v != nil {
 		res = append(res, corev1.EnvVar{Name: "JAEGER_AGENT_HOST", Value: *v})
 	} else {
@@ -173,6 +177,7 @@ func tracingEnv(context *RenderContext, component string, tracing *experimental.
 	}
 
 	res = append(res, corev1.EnvVar{Name: "JAEGER_SERVICE_NAME", Value: component})
+	res = append(res, corev1.EnvVar{Name: "OTEL_SERVICE_NAME", Value: component})
 
 	jaegerTags := []string{}
 	if context.Config.Metadata.InstallationShortname != "" {
@@ -186,6 +191,8 @@ func tracingEnv(context *RenderContext, component string, tracing *experimental.
 	if len(jaegerTags) > 0 {
 		res = append(res,
 			corev1.EnvVar{Name: "JAEGER_TAGS", Value: strings.Join(jaegerTags, ",")},
+			// https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/resource/sdk.md#specifying-resource-information-via-an-environment-variable
+			corev1.EnvVar{Name: "OTEL_RESOURCE_ATTRIBUTES", Value: strings.Join(jaegerTags, ",")},
 		)
 	}
 
@@ -204,6 +211,9 @@ func tracingEnv(context *RenderContext, component string, tracing *experimental.
 	res = append(res,
 		corev1.EnvVar{Name: "JAEGER_SAMPLER_TYPE", Value: string(samplerType)},
 		corev1.EnvVar{Name: "JAEGER_SAMPLER_PARAM", Value: samplerParam},
+
+		corev1.EnvVar{Name: "OTEL_TRACES_SAMPLER", Value: string(samplerType)},
+		corev1.EnvVar{Name: "OTEL_TRACES_SAMPLER_ARG", Value: samplerParam},
 	)
 
 	return
@@ -223,9 +233,14 @@ func AnalyticsEnv(cfg *config.Config) (res []corev1.EnvVar) {
 	}}
 }
 
-func MessageBusEnv(_ *config.Config) (res []corev1.EnvVar) {
+func MessageBusEnv(cfg *config.Config) (res []corev1.EnvVar) {
 	clusterObj := corev1.LocalObjectReference{Name: InClusterMessageQueueName}
 	tlsObj := corev1.LocalObjectReference{Name: InClusterMessageQueueTLS}
+
+	credsSecret := clusterObj
+	if cfg.MessageBus != nil && cfg.MessageBus.Credentials != nil {
+		credsSecret = corev1.LocalObjectReference{Name: cfg.MessageBus.Credentials.Name}
+	}
 
 	return []corev1.EnvVar{{
 		Name: "MESSAGEBUS_USERNAME",
@@ -236,8 +251,8 @@ func MessageBusEnv(_ *config.Config) (res []corev1.EnvVar) {
 	}, {
 		Name: "MESSAGEBUS_PASSWORD",
 		ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-			LocalObjectReference: clusterObj,
-			Key:                  "password",
+			LocalObjectReference: credsSecret,
+			Key:                  "rabbitmq-password",
 		}},
 	}, {
 		Name: "MESSAGEBUS_CA",
@@ -409,16 +424,21 @@ func ConfigcatEnv(ctx *RenderContext) []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{
 			Name:  "CONFIGCAT_SDK_KEY",
-			Value: sdkKey,
+			Value: "gitpod",
+		},
+		{
+			Name:  "CONFIGCAT_BASE_URL",
+			Value: "https://" + ctx.Config.Domain + "/configcat",
 		},
 	}
 }
 
 func ConfigcatProxyEnv(ctx *RenderContext) []corev1.EnvVar {
 	var (
-		sdkKey       string
-		baseUrl      string
-		pollInterval string
+		sdkKey        string
+		baseUrl       string
+		pollInterval  string
+		fromConfigMap string
 	)
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
 		if cfg.WebApp != nil && cfg.WebApp.ConfigcatKey != "" {
@@ -427,6 +447,7 @@ func ConfigcatProxyEnv(ctx *RenderContext) []corev1.EnvVar {
 		if cfg.WebApp != nil && cfg.WebApp.ProxyConfig != nil && cfg.WebApp.ProxyConfig.Configcat != nil {
 			baseUrl = cfg.WebApp.ProxyConfig.Configcat.BaseUrl
 			pollInterval = cfg.WebApp.ProxyConfig.Configcat.PollInterval
+			fromConfigMap = cfg.WebApp.ProxyConfig.Configcat.FromConfigMap
 		}
 		return nil
 	})
@@ -434,21 +455,34 @@ func ConfigcatProxyEnv(ctx *RenderContext) []corev1.EnvVar {
 	if sdkKey == "" {
 		return nil
 	}
-
-	return []corev1.EnvVar{
+	envs := []corev1.EnvVar{
 		{
 			Name:  "CONFIGCAT_SDK_KEY",
 			Value: sdkKey,
 		},
-		{
-			Name:  "CONFIGCAT_BASE_URL",
-			Value: baseUrl,
-		},
-		{
-			Name:  "CONFIGCAT_POLL_INTERVAL",
-			Value: pollInterval,
-		},
 	}
+
+	if fromConfigMap != "" {
+		envs = append(envs,
+			corev1.EnvVar{
+				Name:  "CONFIGCAT_DIR",
+				Value: "/data/configcat/",
+			},
+		)
+	} else {
+		envs = append(envs,
+			corev1.EnvVar{
+				Name:  "CONFIGCAT_BASE_URL",
+				Value: baseUrl,
+			},
+			corev1.EnvVar{
+				Name:  "CONFIGCAT_POLL_INTERVAL",
+				Value: pollInterval,
+			},
+		)
+	}
+
+	return envs
 }
 
 func DatabaseWaiterContainer(ctx *RenderContext) *corev1.Container {
@@ -534,28 +568,6 @@ func KubeRBACProxyContainerWithConfig(ctx *RenderContext) *corev1.Container {
 	}
 }
 
-func NodeAffinity(orLabels ...string) *corev1.Affinity {
-	var terms []corev1.NodeSelectorTerm
-	for _, lbl := range orLabels {
-		terms = append(terms, corev1.NodeSelectorTerm{
-			MatchExpressions: []corev1.NodeSelectorRequirement{
-				{
-					Key:      lbl,
-					Operator: corev1.NodeSelectorOpExists,
-				},
-			},
-		})
-	}
-
-	return &corev1.Affinity{
-		NodeAffinity: &corev1.NodeAffinity{
-			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
-				NodeSelectorTerms: terms,
-			},
-		},
-	}
-}
-
 func IsDatabaseMigrationDisabled(ctx *RenderContext) bool {
 	disableMigration := false
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
@@ -570,28 +582,23 @@ func IsDatabaseMigrationDisabled(ctx *RenderContext) bool {
 func Replicas(ctx *RenderContext, component string) *int32 {
 	replicas := int32(1)
 
-	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.Common != nil && cfg.Common.PodConfig[component] != nil {
-			if cfg.Common.PodConfig[component].Replicas != nil {
-				replicas = *cfg.Common.PodConfig[component].Replicas
-			}
+	if ctx.Config.Components != nil && ctx.Config.Components.PodConfig[component] != nil {
+		if ctx.Config.Components.PodConfig[component].Replicas != nil {
+			replicas = *ctx.Config.Components.PodConfig[component].Replicas
 		}
-		return nil
-	})
+	}
+
 	return &replicas
 }
 
 func ResourceRequirements(ctx *RenderContext, component, containerName string, defaults corev1.ResourceRequirements) corev1.ResourceRequirements {
 	resources := defaults
 
-	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.Common != nil && cfg.Common.PodConfig[component] != nil {
-			if cfg.Common.PodConfig[component].Resources[containerName] != nil {
-				resources = *cfg.Common.PodConfig[component].Resources[containerName]
-			}
+	if ctx.Config.Components != nil && ctx.Config.Components.PodConfig[component] != nil {
+		if ctx.Config.Components.PodConfig[component].Resources[containerName] != nil {
+			resources = *ctx.Config.Components.PodConfig[component].Resources[containerName]
 		}
-		return nil
-	})
+	}
 
 	return resources
 }
@@ -654,7 +661,7 @@ var DeploymentStrategy = appsv1.DeploymentStrategy{
 var (
 	TypeMetaNamespace = metav1.TypeMeta{
 		APIVersion: "v1",
-		Kind:       "namespace",
+		Kind:       "Namespace",
 	}
 	TypeMetaStatefulSet = metav1.TypeMeta{
 		APIVersion: "apps/v1",
@@ -716,10 +723,6 @@ var (
 		APIVersion: "v1",
 		Kind:       "Secret",
 	}
-	TypeMetaPodSecurityPolicy = metav1.TypeMeta{
-		APIVersion: "policy/v1beta1",
-		Kind:       "PodSecurityPolicy",
-	}
 	TypeMetaResourceQuota = metav1.TypeMeta{
 		APIVersion: "v1",
 		Kind:       "ResourceQuota",
@@ -731,6 +734,14 @@ var (
 	TypeMetaBatchCronJob = metav1.TypeMeta{
 		APIVersion: "batch/v1",
 		Kind:       "CronJob",
+	}
+	TypeMetaCertificateClusterIssuer = metav1.TypeMeta{
+		APIVersion: "cert-manager.io/v1",
+		Kind:       "ClusterIssuer",
+	}
+	TypeMetaBundle = metav1.TypeMeta{
+		APIVersion: "trust.cert-manager.io/v1alpha1",
+		Kind:       "Bundle",
 	}
 )
 
@@ -787,4 +798,45 @@ func NodeNameEnv(context *RenderContext) []corev1.EnvVar {
 			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"},
 		},
 	}}
+}
+
+func NodeIPEnv(context *RenderContext) []corev1.EnvVar {
+	return []corev1.EnvVar{{
+		Name: "NODE_IP",
+		ValueFrom: &corev1.EnvVarSource{
+			FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.hostIP"},
+		},
+	}}
+}
+
+// ExperimentalWebappConfig extracts webapp experimental config from the render context.
+// When the experimental config is not defined, the result will be nil.
+func ExperimentalWebappConfig(ctx *RenderContext) *experimental.WebAppConfig {
+	var experimentalCfg *experimental.Config
+	_ = ctx.WithExperimental(func(ucfg *experimental.Config) error {
+		experimentalCfg = ucfg
+		return nil
+	})
+
+	if experimentalCfg == nil || experimentalCfg.WebApp == nil {
+		return nil
+	}
+
+	return experimentalCfg.WebApp
+}
+
+// WithLocalWsManager returns true if the installed application cluster should connect to a local ws-manager
+func WithLocalWsManager(ctx *RenderContext) bool {
+	return ctx.Config.Kind == config.InstallationFull
+}
+
+func DaemonSetRolloutStrategy() appsv1.DaemonSetUpdateStrategy {
+	maxUnavailable := intstr.Parse("20%")
+
+	return appsv1.DaemonSetUpdateStrategy{
+		Type: appsv1.RollingUpdateDaemonSetStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDaemonSet{
+			MaxUnavailable: &maxUnavailable,
+		},
+	}
 }

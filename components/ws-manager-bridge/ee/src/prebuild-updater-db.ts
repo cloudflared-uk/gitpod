@@ -15,6 +15,7 @@ import { DBWithTracing, TracedWorkspaceDB } from "@gitpod/gitpod-db/lib/traced-d
 import { WorkspaceDB } from "@gitpod/gitpod-db/lib/workspace-db";
 import { MessageBusIntegration } from "../../src/messagebus-integration";
 import { PrometheusMetricsExporter } from "../../src/prometheus-metrics-exporter";
+import { filterStatus } from "../../src/bridge";
 
 @injectable()
 export class PrebuildUpdaterDB implements PrebuildUpdater {
@@ -30,12 +31,7 @@ export class PrebuildUpdaterDB implements PrebuildUpdater {
     @inject(PrometheusMetricsExporter)
     protected readonly prometheusExporter: PrometheusMetricsExporter;
 
-    async updatePrebuiltWorkspace(
-        ctx: TraceContext,
-        userId: string,
-        status: WorkspaceStatus.AsObject,
-        writeToDB: boolean,
-    ) {
+    async updatePrebuiltWorkspace(ctx: TraceContext, userId: string, status: WorkspaceStatus.AsObject) {
         if (status.spec && status.spec.type != WorkspaceType.PREBUILD) {
             return;
         }
@@ -44,7 +40,7 @@ export class PrebuildUpdaterDB implements PrebuildUpdater {
         const workspaceId = status.metadata!.metaId!;
         const logCtx: LogContext = { instanceId, workspaceId, userId };
 
-        log.info(logCtx, "Handling prebuild workspace update.", status);
+        log.info(logCtx, "Handling prebuild workspace update.", filterStatus(status));
 
         const span = TraceContext.startSpan("updatePrebuiltWorkspace", ctx);
         try {
@@ -80,10 +76,8 @@ export class PrebuildUpdaterDB implements PrebuildUpdater {
                 span.setTag("updatePrebuildWorkspace.prebuild.error", updatedPrebuild.error);
 
                 // Here we make sure that we increment the counter only when:
-                // 1. the instance is governing ("writeToDB"), so that we don't get metrics from multiple pods,
-                // 2. the state changes (we can receive multiple events with the same state)
+                // the state changes (we can receive multiple events with the same state)
                 if (
-                    writeToDB &&
                     updatedPrebuild.state &&
                     terminatingStates.includes(updatedPrebuild.state) &&
                     updatedPrebuild.state !== prebuild.state
@@ -91,9 +85,7 @@ export class PrebuildUpdaterDB implements PrebuildUpdater {
                     this.prometheusExporter.increasePrebuildsCompletedCounter(updatedPrebuild.state);
                 }
 
-                if (writeToDB) {
-                    await this.workspaceDB.trace({ span }).storePrebuiltWorkspace(updatedPrebuild);
-                }
+                await this.workspaceDB.trace({ span }).storePrebuiltWorkspace(updatedPrebuild);
 
                 // notify updates
                 // headless update

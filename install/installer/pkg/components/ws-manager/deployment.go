@@ -45,10 +45,11 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 	}
 
 	podSpec := corev1.PodSpec{
-		PriorityClassName:  common.SystemNodeCritical,
-		Affinity:           common.NodeAffinity(cluster.AffinityLabelWorkspaceServices),
-		EnableServiceLinks: pointer.Bool(false),
-		ServiceAccountName: Component,
+		PriorityClassName:         common.SystemNodeCritical,
+		Affinity:                  cluster.WithNodeAffinityHostnameAntiAffinity(Component, cluster.AffinityLabelServices),
+		TopologySpreadConstraints: cluster.WithHostnameTopologySpread(Component),
+		EnableServiceLinks:        pointer.Bool(false),
+		ServiceAccountName:        Component,
 		SecurityContext: &corev1.PodSecurityContext{
 			RunAsUser: pointer.Int64(31002),
 		},
@@ -97,6 +98,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						MountPath: "/certs",
 						ReadOnly:  true,
 					},
+					common.CAVolumeMount(),
 				},
 				volumeMounts...,
 			),
@@ -133,6 +135,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						Secret: &corev1.SecretVolumeSource{SecretName: TLSSecretNameSecret},
 					},
 				},
+				common.CAVolume(),
 			},
 			volumes...,
 		),
@@ -141,13 +144,6 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 	err = common.AddStorageMounts(ctx, &podSpec, Component)
 	if err != nil {
 		return nil, err
-	}
-
-	if vol, mnt, _, ok := common.CustomCACertVolume(ctx); ok {
-		podSpec.Volumes = append(podSpec.Volumes, *vol)
-		container := podSpec.Containers[0]
-		container.VolumeMounts = append(container.VolumeMounts, *mnt)
-		podSpec.Containers[0] = container
 	}
 
 	return []runtime.Object{

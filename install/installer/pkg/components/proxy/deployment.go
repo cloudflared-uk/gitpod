@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	"github.com/gitpod-io/gitpod/installer/pkg/cluster"
@@ -97,24 +98,25 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil, err
 	}
 
-	var podAntiAffinity *corev1.PodAntiAffinity
+	var frontendDevEnabled bool
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.WebApp != nil && cfg.WebApp.UsePodAntiAffinity {
-			podAntiAffinity = &corev1.PodAntiAffinity{
-				PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
-					Weight: 100,
-					PodAffinityTerm: corev1.PodAffinityTerm{
-						LabelSelector: &metav1.LabelSelector{
-							MatchExpressions: []metav1.LabelSelectorRequirement{{
-								Key:      "component",
-								Operator: "In",
-								Values:   []string{Component},
-							}},
-						},
-						TopologyKey: cluster.AffinityLabelMeta,
+		if cfg.WebApp != nil && cfg.WebApp.ProxyConfig != nil {
+			frontendDevEnabled = cfg.WebApp.ProxyConfig.FrontendDevEnabled
+		}
+		if cfg.WebApp != nil && cfg.WebApp.ProxyConfig != nil && cfg.WebApp.ProxyConfig.Configcat != nil && cfg.WebApp.ProxyConfig.Configcat.FromConfigMap != "" {
+			volumes = append(volumes, corev1.Volume{
+				Name: "configcat",
+				VolumeSource: corev1.VolumeSource{
+					ConfigMap: &corev1.ConfigMapVolumeSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: cfg.WebApp.ProxyConfig.Configcat.FromConfigMap},
+						Optional:             pointer.Bool(true),
 					},
-				}},
-			}
+				},
+			})
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      "configcat",
+				MountPath: "/data/configcat",
+			})
 		}
 		return nil
 	})
@@ -145,15 +147,13 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						}),
 					},
 					Spec: corev1.PodSpec{
-						Affinity: &corev1.Affinity{
-							NodeAffinity:    common.NodeAffinity(cluster.AffinityLabelMeta).NodeAffinity,
-							PodAntiAffinity: podAntiAffinity,
-						},
+						Affinity:                      cluster.WithNodeAffinityHostnameAntiAffinity(Component, cluster.AffinityLabelMeta),
+						TopologySpreadConstraints:     cluster.WithHostnameTopologySpread(Component),
 						PriorityClassName:             common.SystemNodeCritical,
 						ServiceAccountName:            Component,
 						EnableServiceLinks:            pointer.Bool(false),
-						DNSPolicy:                     "ClusterFirst",
-						RestartPolicy:                 "Always",
+						DNSPolicy:                     corev1.DNSClusterFirst,
+						RestartPolicy:                 corev1.RestartPolicyAlways,
 						TerminationGracePeriodSeconds: pointer.Int64(30),
 						SecurityContext: &corev1.PodSecurityContext{
 
@@ -252,6 +252,12 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								[]corev1.EnvVar{{
 									Name:  "PROXY_DOMAIN",
 									Value: ctx.Config.Domain,
+								}, {
+									Name:  "FRONTEND_DEV_ENABLED",
+									Value: fmt.Sprintf("%t", frontendDevEnabled),
+								}, {
+									Name:  "WORKSPACE_HANDLER_FILE",
+									Value: strings.ToLower(string(ctx.Config.Kind)),
 								}},
 							)),
 						}},

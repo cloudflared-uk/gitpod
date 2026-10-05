@@ -4,101 +4,89 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import React, { useContext, useEffect, useState } from "react";
-import { Redirect, useLocation } from "react-router";
-import { TeamMemberInfo } from "@gitpod/gitpod-protocol";
 import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
 import { Currency, Plan, Plans, PlanType } from "@gitpod/gitpod-protocol/lib/plans";
 import { TeamSubscription2 } from "@gitpod/gitpod-protocol/lib/team-subscription-protocol";
+import React, { FunctionComponent, useContext, useEffect, useState } from "react";
 import { ChargebeeClient } from "../chargebee/chargebee-client";
-import { PageWithSubMenu } from "../components/PageWithSubMenu";
 import Card from "../components/Card";
 import DropDown from "../components/DropDown";
 import PillLabel from "../components/PillLabel";
 import SolidCard from "../components/SolidCard";
-import { ReactComponent as CheckSvg } from "../images/check.svg";
+import { Heading2, Subheading } from "../components/typography/headings";
+import { useOrgBillingMode } from "../data/billing-mode/org-billing-mode-query";
+import { useCurrentOrg } from "../data/organizations/orgs-query";
 import { ReactComponent as Spinner } from "../icons/Spinner.svg";
+import { ReactComponent as CheckSvg } from "../images/check.svg";
 import { PaymentContext } from "../payment-context";
 import { getGitpodService } from "../service/service";
-import { getCurrentTeam, TeamsContext } from "./teams-context";
-import { getTeamSettingsMenu } from "./TeamSettings";
+import { useCurrentUser } from "../user-context";
+import { OrgSettingsPage } from "./OrgSettingsPage";
 import TeamUsageBasedBilling from "./TeamUsageBasedBilling";
-import { UserContext } from "../user-context";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamMembersToProtocol, teamsService } from "../service/public-api";
-import Alert from "../components/Alert";
-import { getExperimentsClient } from "../experiments/client";
 
 type PendingPlan = Plan & { pendingSince: number };
 
-export default function TeamBilling() {
-    const { user } = useContext(UserContext);
-    const { teams } = useContext(TeamsContext);
-    const location = useLocation();
-    const team = getCurrentTeam(location, teams);
-    const [members, setMembers] = useState<TeamMemberInfo[]>([]);
-    const [isUserOwner, setIsUserOwner] = useState(true);
+export default function TeamBillingPage() {
+    return (
+        <OrgSettingsPage>
+            <TeamBilling />
+        </OrgSettingsPage>
+    );
+}
+
+const TeamBilling: FunctionComponent = () => {
+    const user = useCurrentUser();
+    const currentOrg = useCurrentOrg();
+    const orgBillingMode = useOrgBillingMode();
     const [teamSubscription, setTeamSubscription] = useState<TeamSubscription2 | undefined>();
     const { currency, setCurrency } = useContext(PaymentContext);
-    const [isUsageBasedBillingEnabled, setIsUsageBasedBillingEnabled] = useState<boolean>(false);
-    const [teamBillingMode, setTeamBillingMode] = useState<BillingMode | undefined>(undefined);
     const [pendingTeamPlan, setPendingTeamPlan] = useState<PendingPlan | undefined>();
     const [pollTeamSubscriptionTimeout, setPollTeamSubscriptionTimeout] = useState<NodeJS.Timeout | undefined>();
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
+    const members = currentOrg.data?.members || [];
 
     useEffect(() => {
-        if (!team) {
+        const orgId = currentOrg.data?.id;
+        if (!orgId) {
             return;
         }
         (async () => {
-            const [memberInfos, subscription, teamBillingMode] = await Promise.all([
-                usePublicApiTeamsService
-                    ? teamsService.getTeam({ teamId: team!.id }).then((resp) => {
-                          return publicApiTeamMembersToProtocol(resp.team?.members || []);
-                      })
-                    : getGitpodService().server.getTeamMembers(team.id),
-                getGitpodService().server.getTeamSubscription(team.id),
-                getGitpodService().server.getBillingModeForTeam(team.id),
-            ]);
-            setMembers(memberInfos);
-            const currentUserInTeam = memberInfos.find((member: TeamMemberInfo) => member.userId === user?.id);
-            setIsUserOwner(currentUserInTeam?.role === "owner");
+            const subscription = await getGitpodService().server.getTeamSubscription(orgId);
             setTeamSubscription(subscription);
-            setTeamBillingMode(teamBillingMode);
         })();
-    }, [team]);
+    }, [currentOrg.data?.id, user?.id]);
 
     useEffect(() => {
         setPendingTeamPlan(undefined);
-        if (!team) {
+        if (!currentOrg.data) {
             return;
         }
         try {
-            const pendingTeamPlanString = window.localStorage.getItem(`pendingPlanForTeam${team.id}`);
+            const pendingTeamPlanString = window.localStorage.getItem(`pendingPlanForTeam${currentOrg.data?.id}`);
             if (!pendingTeamPlanString) {
                 return;
             }
             const pending = JSON.parse(pendingTeamPlanString);
             setPendingTeamPlan(pending);
         } catch (error) {
-            console.error("Could not load pending team plan", team.id, error);
+            console.error("Could not load pending team plan", currentOrg.data?.id, error);
         }
-    }, [team]);
+    }, [currentOrg.data]);
 
     useEffect(() => {
-        if (!pendingTeamPlan || !team) {
+        if (!pendingTeamPlan || !currentOrg.data) {
             return;
         }
+        const orgId = currentOrg.data.id;
         if (teamSubscription && teamSubscription.planId === pendingTeamPlan.chargebeeId) {
             // The purchase was successful!
-            window.localStorage.removeItem(`pendingPlanForTeam${team.id}`);
+            window.localStorage.removeItem(`pendingPlanForTeam${orgId}`);
             clearTimeout(pollTeamSubscriptionTimeout!);
             setPendingTeamPlan(undefined);
             return;
         }
         if (pendingTeamPlan.pendingSince + 1000 * 60 * 5 < Date.now()) {
             // Pending team plans expire after 5 minutes
-            window.localStorage.removeItem(`pendingPlanForTeam${team.id}`);
+            window.localStorage.removeItem(`pendingPlanForTeam${orgId}`);
             clearTimeout(pollTeamSubscriptionTimeout!);
             setPendingTeamPlan(undefined);
             return;
@@ -106,7 +94,7 @@ export default function TeamBilling() {
         if (!pollTeamSubscriptionTimeout) {
             // Refresh team subscription in 5 seconds in order to poll for purchase confirmation
             const timeout = setTimeout(async () => {
-                const ts = await getGitpodService().server.getTeamSubscription(team.id);
+                const ts = await getGitpodService().server.getTeamSubscription(orgId);
                 setTeamSubscription(ts);
                 setPollTeamSubscriptionTimeout(undefined);
             }, 5000);
@@ -115,31 +103,18 @@ export default function TeamBilling() {
         return function cleanup() {
             clearTimeout(pollTeamSubscriptionTimeout!);
         };
-    }, [pendingTeamPlan, pollTeamSubscriptionTimeout, team, teamSubscription]);
-
-    useEffect(() => {
-        if (!team || !user) {
-            return;
-        }
-        (async () => {
-            const isEnabled = await getExperimentsClient().getValueAsync("isUsageBasedBillingEnabled", false, {
-                user,
-                teamId: team.id,
-                teamName: team.name,
-            });
-            setIsUsageBasedBillingEnabled(isEnabled);
-        })();
-    }, [team, user]);
+    }, [pendingTeamPlan, pollTeamSubscriptionTimeout, currentOrg.data, teamSubscription]);
 
     const availableTeamPlans = Plans.getAvailableTeamPlans(currency || "USD").filter((p) => p.type !== "student");
 
     const checkout = async (plan: Plan) => {
-        if (!team || members.length < 1) {
+        if (!currentOrg.data || currentOrg.data.members.length < 1) {
             return;
         }
-        const chargebeeClient = await ChargebeeClient.getOrCreate(team.id);
+        const orgId = currentOrg.data.id;
+        const chargebeeClient = await ChargebeeClient.getOrCreate(orgId);
         await new Promise((resolve, reject) => {
-            chargebeeClient.checkout((paymentServer) => paymentServer.teamCheckout(team.id, plan.chargebeeId), {
+            chargebeeClient.checkout((paymentServer) => paymentServer.teamCheckout(orgId, plan.chargebeeId), {
                 success: resolve,
                 error: reject,
             });
@@ -149,10 +124,10 @@ export default function TeamBilling() {
             pendingSince: Date.now(),
         };
         setPendingTeamPlan(pending);
-        window.localStorage.setItem(`pendingPlanForTeam${team.id}`, JSON.stringify(pending));
+        window.localStorage.setItem(`pendingPlanForTeam${orgId}`, JSON.stringify(pending));
     };
 
-    const isLoading = members.length === 0;
+    const isLoading = currentOrg.isLoading || orgBillingMode.isLoading;
     const teamPlan = pendingTeamPlan || Plans.getById(teamSubscription?.planId);
 
     const featuresByPlanType: { [type in PlanType]?: Array<React.ReactNode> } = {
@@ -171,29 +146,11 @@ export default function TeamBilling() {
         ],
     };
 
-    if (!isUserOwner) {
-        return <Redirect to={team ? `/t/${team.slug}` : "/"} />;
-    }
-
     function renderTeamBilling(): JSX.Element {
         return (
             <>
-                {isUsageBasedBillingEnabled && (
-                    <Alert type="message" className="mb-4">
-                        To access{" "}
-                        <a className="gp-link" href="https://www.gitpod.io/docs/configure/workspaces/workspace-classes">
-                            large workspaces
-                        </a>{" "}
-                        and{" "}
-                        <a className="gp-link" href="https://www.gitpod.io/docs/configure/billing/pay-as-you-go">
-                            pay-as-you-go
-                        </a>
-                        , first cancel your existing plan. Existing plans will keep working until the end of March,
-                        2023.
-                    </Alert>
-                )}
-                <h3>{!teamPlan ? "Select Team Plan" : "Team Plan"}</h3>
-                <h2 className="text-gray-500">
+                <Heading2>{!teamPlan ? "Select Plan" : "Current Plan"}</Heading2>
+                <Subheading>
                     {!teamPlan ? (
                         <div className="flex space-x-1">
                             <span>Currency:</span>
@@ -215,10 +172,10 @@ export default function TeamBilling() {
                         </div>
                     ) : (
                         <span>
-                            This team is currently on the <strong>{teamPlan.name}</strong> plan.
+                            This organization is currently on the <strong>{teamPlan.name}</strong> plan.
                         </span>
                     )}
-                </h2>
+                </Subheading>
                 <div className="mt-4 space-x-4 flex">
                     {isLoading && (
                         <>
@@ -248,9 +205,9 @@ export default function TeamBilling() {
                                             </div>
                                             <div className="mt-2">
                                                 <PillLabel type="warn" className="font-semibold normal-case text-sm">
-                                                    {members.length} x {Currency.getSymbol(tp.currency)}
+                                                    {(members || []).length} x {Currency.getSymbol(tp.currency)}
                                                     {tp.pricePerMonth} = {Currency.getSymbol(tp.currency)}
-                                                    {members.length * tp.pricePerMonth} per month
+                                                    {(members || []).length * tp.pricePerMonth} per month
                                                 </PillLabel>
                                             </div>
                                             <div className="mt-4 font-semibold text-sm">Includes:</div>
@@ -308,7 +265,7 @@ export default function TeamBilling() {
                                             Members
                                         </div>
                                         <div className="font-semibold text-base text-gray-600 dark:text-gray-400">
-                                            {members.length}
+                                            {(members || []).length}
                                         </div>
                                         <div className="mt-4 font-medium text-base text-gray-400 dark:text-gray-600">
                                             Next invoice on
@@ -319,9 +276,9 @@ export default function TeamBilling() {
                                         <div className="flex-grow flex flex-col items-stretch justify-end">
                                             <button
                                                 onClick={() => {
-                                                    if (team) {
-                                                        ChargebeeClient.getOrCreate(team.id).then((chargebeeClient) =>
-                                                            chargebeeClient.openPortal(),
+                                                    if (currentOrg.data) {
+                                                        ChargebeeClient.getOrCreate(currentOrg.data.id).then(
+                                                            (chargebeeClient) => chargebeeClient.openPortal(),
                                                         );
                                                     }
                                                 }}
@@ -337,7 +294,7 @@ export default function TeamBilling() {
                     )}
                 </div>
                 <div className="mt-4 text-gray-500">
-                    Team Billing automatically adds all members to the plan.{" "}
+                    Gitpod automatically adds all members of this organization to the plan.{" "}
                     <a href="https://www.gitpod.io/docs/team-billing" rel="noopener" className="gp-link">
                         Learn more
                     </a>
@@ -346,26 +303,10 @@ export default function TeamBilling() {
         );
     }
 
-    const showUBP = BillingMode.showUsageBasedBilling(teamBillingMode);
-    return (
-        <PageWithSubMenu
-            subMenu={getTeamSettingsMenu({ team, billingMode: teamBillingMode })}
-            title="Billing"
-            subtitle="Configure and manage billing for your team."
-        >
-            {teamBillingMode === undefined ? (
-                <div className="p-20">
-                    <Spinner className="h-5 w-5 animate-spin" />
-                </div>
-            ) : (
-                <>
-                    {showUBP && <TeamUsageBasedBilling />}
-                    {!showUBP && renderTeamBilling()}
-                </>
-            )}
-        </PageWithSubMenu>
-    );
-}
+    const showUBP = BillingMode.showUsageBasedBilling(orgBillingMode.data);
+
+    return showUBP ? <TeamUsageBasedBilling /> : renderTeamBilling();
+};
 
 function guessNextInvoiceDate(startDate: string): Date {
     const now = new Date();

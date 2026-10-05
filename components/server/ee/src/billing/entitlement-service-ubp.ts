@@ -9,7 +9,6 @@ import {
     BillingTier,
     Team,
     User,
-    Workspace,
     WorkspaceInstance,
     WorkspaceTimeoutDuration,
     WORKSPACE_TIMEOUT_DEFAULT_LONG,
@@ -47,7 +46,7 @@ export class EntitlementServiceUBP implements EntitlementService {
 
     async mayStartWorkspace(
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         date: Date,
         runningInstances: Promise<WorkspaceInstance[]>,
     ): Promise<MayStartWorkspaceResult> {
@@ -64,7 +63,7 @@ export class EntitlementServiceUBP implements EntitlementService {
             }
         };
         const [usageLimitReachedOnCostCenter, hitParallelWorkspaceLimit] = await Promise.all([
-            this.checkUsageLimitReached(user, workspace, date),
+            this.checkUsageLimitReached(user, organizationId, date),
             hasHitParallelWorkspaceLimit(),
         ]);
         return {
@@ -75,10 +74,10 @@ export class EntitlementServiceUBP implements EntitlementService {
 
     protected async checkUsageLimitReached(
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         date: Date,
     ): Promise<AttributionId | undefined> {
-        const result = await this.userService.checkUsageLimitReached(user, workspace);
+        const result = await this.userService.checkUsageLimitReached(user, organizationId);
         if (result.reached) {
             return result.attributionId;
         }
@@ -118,8 +117,9 @@ export class EntitlementServiceUBP implements EntitlementService {
      * @param user
      */
     async limitNetworkConnections(user: User, date: Date): Promise<boolean> {
-        const hasPaidPlan = await this.hasPaidSubscription(user, date);
-        return !hasPaidPlan;
+        // gpl: Because with the current payment handling (pay-after-use) having a "paid" plan is not a good enough classifier for trushworthyness atm.
+        // We're looking into improving this, but for the meantime we limit network connections for everybody to reduce the impact of abuse.
+        return true;
     }
 
     protected async hasPaidSubscription(user: User, date: Date): Promise<boolean> {

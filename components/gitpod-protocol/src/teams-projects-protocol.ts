@@ -48,6 +48,10 @@ export namespace Project {
         };
     };
 
+    export function slug(p: Project): string {
+        return p.slug || p.name || p.id;
+    }
+
     export interface Overview {
         branches: BranchDetails[];
         isConsideredInactive?: boolean;
@@ -125,19 +129,34 @@ export interface StartPrebuildResult {
     wsid: string;
     done: boolean;
 }
-export interface Team {
+
+// alias for backwards compatibility
+export type Team = Organization;
+export interface Organization {
     id: string;
     name: string;
-    slug: string;
+    slug?: string;
     creationTime: string;
     markedDeleted?: boolean;
     /** This is a flag that triggers the HARD DELETION of this entity */
     deleted?: boolean;
 }
 
-export type TeamMemberRole = "owner" | "member";
+export interface OrganizationSettings {
+    workspaceSharingDisabled?: boolean;
+}
 
-export interface TeamMemberInfo {
+export type TeamMemberRole = OrgMemberRole;
+export type OrgMemberRole = "owner" | "member";
+
+export namespace TeamMemberRole {
+    export function isValid(role: any): role is TeamMemberRole {
+        return role === "owner" || role === "member";
+    }
+}
+
+export type TeamMemberInfo = OrgMemberInfo;
+export interface OrgMemberInfo {
     userId: string;
     fullName?: string;
     primaryEmail?: string;

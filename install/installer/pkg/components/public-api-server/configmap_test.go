@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/gitpod-io/gitpod/installer/pkg/components/redis"
 	"github.com/gitpod-io/gitpod/installer/pkg/config/v1/experimental"
+	"github.com/google/go-cmp/cmp"
 
 	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	"github.com/gitpod-io/gitpod/components/public-api/go/config"
@@ -31,6 +33,12 @@ func TestConfigMap(t *testing.T) {
 		return nil
 	})
 
+	var oidcClientJWTSigningSecretPath string
+	_ = ctx.WithExperimental(func(ucfg *experimental.Config) error {
+		_, _, oidcClientJWTSigningSecretPath, _ = getOIDCClientJWTSecretConfig(ucfg)
+		return nil
+	})
+
 	var personalAccessTokenSigningKeyPath string
 	_ = ctx.WithExperimental(func(ucfg *experimental.Config) error {
 		_, _, personalAccessTokenSigningKeyPath, _ = getPersonalAccessTokenSigningKey(ucfg)
@@ -38,10 +46,25 @@ func TestConfigMap(t *testing.T) {
 	})
 
 	expectedConfiguration := config.Configuration{
-		GitpodServiceURL:                  "wss://test.domain.everything.awesome.is",
+		PublicURL:                         fmt.Sprintf("https://api.%s", ctx.Config.Domain),
+		GitpodServiceURL:                  fmt.Sprintf("ws://server.%s.svc.cluster.local:3000", ctx.Namespace),
 		BillingServiceAddress:             fmt.Sprintf("usage.%s.svc.cluster.local:9001", ctx.Namespace),
+		SessionServiceAddress:             fmt.Sprintf("server.%s.svc.cluster.local:9876", ctx.Namespace),
+		OIDCClientJWTSigningSecretPath:    oidcClientJWTSigningSecretPath,
 		StripeWebhookSigningSecretPath:    stripeSecretPath,
 		PersonalAccessTokenSigningKeyPath: personalAccessTokenSigningKeyPath,
+		DatabaseConfigPath:                "/secrets/database-config",
+		Redis: config.RedisConfiguration{
+			Address: fmt.Sprintf("%s.%s.svc.cluster.local:%d", redis.Component, ctx.Namespace, redis.Port),
+		},
+		Auth: config.AuthConfiguration{
+			PKI: config.AuthPKIConfiguration{
+				Signing: config.KeyPair{
+					PublicKeyPath:  "/secrets/auth-pki/signing/tls.crt",
+					PrivateKeyPath: "/secrets/auth-pki/signing/tls.key",
+				},
+			},
+		},
 		Server: &baseserver.Configuration{
 			Services: baseserver.ServicesConfiguration{
 				GRPC: &baseserver.ServerConfiguration{
@@ -58,7 +81,8 @@ func TestConfigMap(t *testing.T) {
 	require.NoError(t, err)
 
 	cm := objs[0].(*corev1.ConfigMap)
-	require.Equal(t, &corev1.ConfigMap{
+
+	expectation := &corev1.ConfigMap{
 		TypeMeta: common.TypeMetaConfigmap,
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        Component,
@@ -69,5 +93,8 @@ func TestConfigMap(t *testing.T) {
 		Data: map[string]string{
 			"config.json": string(expectedJSON),
 		},
-	}, cm)
+	}
+	if diff := cmp.Diff(expectation, cm); diff != "" {
+		t.Errorf("configMap mismatch (-want +got):\n%s", diff)
+	}
 }

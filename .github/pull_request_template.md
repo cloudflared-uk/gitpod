@@ -1,6 +1,10 @@
 ## Description
 <!-- Describe your changes in detail -->
 
+#### Preview status
+
+gitpod:summary
+
 ## Related Issue(s)
 <!-- List the issue(s) this PR solves -->
 Fixes #
@@ -17,6 +21,7 @@ Fixes #
   See https://www.notion.so/gitpod/Release-Notes-513a74fdd23b4cb1b3b3aefb1d34a3e0
 -->
 ```release-note
+NONE
 ```
 
 ## Documentation
@@ -29,11 +34,38 @@ Does this PR require updates to the documentation at www.gitpod.io/docs?
   * Are you sure? If so, nothing to do here.
 -->
 
-## Werft options:
+## Build Options:
 
+- [ ] /werft with-werft
+      Run the build with werft instead of GHA
+- [ ] leeway-no-cache
+- [ ] /werft no-test
+      Run Leeway with `--dont-test`
+
+<details>
+<summary>Publish Options</summary>
+
+- [ ] /werft publish-to-npm
+- [ ] /werft publish-to-jb-marketplace
+</details>
+
+<details>
+<summary>Installer Options</summary>
+
+- [ ] with-dedicated-emulation
+- [ ] with-ws-manager-mk2
+- [ ] workspace-feature-flags
+  Add desired feature flags to the end of the line above, space separated
+</details>
+
+#### Preview Environment Options:
 - [ ] /werft with-local-preview
       If enabled this will build `install/preview`
 - [ ] /werft with-preview
 - [ ] /werft with-large-vm
-- [ ] /werft with-integration-tests=all
+- [ ] /werft with-gce-vm
+      If enabled this will create the environment on GCE infra
+- [ ] with-integration-tests=all
       Valid options are `all`, `workspace`, `webapp`, `ide`, `jetbrains`, `vscode`, `ssh`
+
+/hold

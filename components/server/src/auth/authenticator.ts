@@ -9,7 +9,7 @@ import * as passport from "passport";
 import { injectable, postConstruct, inject } from "inversify";
 import { User } from "@gitpod/gitpod-protocol";
 import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
-import { UserDB } from "@gitpod/gitpod-db/lib";
+import { TeamDB, UserDB } from "@gitpod/gitpod-db/lib";
 import { Config } from "../config";
 import { HostContextProvider } from "./host-context-provider";
 import { AuthProvider, AuthFlow } from "./auth-provider";
@@ -25,6 +25,7 @@ export class Authenticator {
 
     @inject(Config) protected readonly config: Config;
     @inject(UserDB) protected userDb: UserDB;
+    @inject(TeamDB) protected teamDb: TeamDB;
     @inject(HostContextProvider) protected hostContextProvider: HostContextProvider;
     @inject(TokenProvider) protected readonly tokenProvider: TokenProvider;
     @inject(AuthProviderService) protected readonly authProviderService: AuthProviderService;
@@ -44,8 +45,9 @@ export class Authenticator {
         });
         passport.deserializeUser(async (id, done) => {
             try {
-                const user = await this.userDb.findUserById(id as string);
+                let user = await this.userDb.findUserById(id as string);
                 if (user) {
+                    user = await this.userService.onAfterUserLoad(user);
                     done(null, user);
                 } else {
                     done(new Error("User not found."));
@@ -106,6 +108,15 @@ export class Authenticator {
         if (!host || !authProvider) {
             log.info({ sessionId: req.sessionID }, `Bad request: missing parameters.`, { "login-flow": true });
             res.redirect(this.getSorryUrl(`Bad request: missing parameters.`));
+            return;
+        }
+        // Logins with organizational Git Auth is not permitted
+        if (authProvider.info.organizationId) {
+            log.info({ sessionId: req.sessionID }, `Login with "${host}" is not permitted.`, {
+                "authorize-flow": true,
+                ap: authProvider.info,
+            });
+            res.redirect(this.getSorryUrl(`Login with "${host}" is not permitted.`));
             return;
         }
         if (this.config.disableDynamicAuthProviderLogin && !authProvider.params.builtin) {
@@ -208,13 +219,40 @@ export class Authenticator {
             return;
         }
 
-        if (!authProvider.info.verified && user.id !== authProvider.info.ownerId) {
+        // For non-verified org auth provider, ensure user is an owner of the org
+        if (!authProvider.info.verified && authProvider.info.organizationId) {
+            const member = await this.teamDb.findTeamMembership(user.id, authProvider.info.organizationId);
+            if (member?.role !== "owner") {
+                log.info({ sessionId: req.sessionID }, `Authorization with "${host}" is not permitted.`, {
+                    "authorize-flow": true,
+                    ap: authProvider.info,
+                });
+                res.redirect(this.getSorryUrl(`Authorization with "${host}" is not permitted.`));
+                return;
+            }
+        }
+
+        // For non-verified, non-org auth provider, ensure user is the owner of the auth provider
+        if (!authProvider.info.verified && !authProvider.info.organizationId && user.id !== authProvider.info.ownerId) {
             log.info({ sessionId: req.sessionID }, `Authorization with "${host}" is not permitted.`, {
                 "authorize-flow": true,
                 ap: authProvider.info,
             });
             res.redirect(this.getSorryUrl(`Authorization with "${host}" is not permitted.`));
             return;
+        }
+
+        // Ensure user is a member of the org
+        if (authProvider.info.organizationId) {
+            const member = await this.teamDb.findTeamMembership(user.id, authProvider.info.organizationId);
+            if (!member) {
+                log.info({ sessionId: req.sessionID }, `Authorization with "${host}" is not permitted.`, {
+                    "authorize-flow": true,
+                    ap: authProvider.info,
+                });
+                res.redirect(this.getSorryUrl(`Authorization with "${host}" is not permitted.`));
+                return;
+            }
         }
 
         // prepare session

@@ -23,6 +23,10 @@ module.exports = {
                     DEFAULT: "#5C8DD6",
                     dark: "#265583",
                 },
+                // TODO: figure out if we want to just pull in the specific gitpod-* colors
+                teal: colors.teal,
+                sky: colors.sky,
+                rose: colors.rose,
                 "gitpod-black": "#161616",
                 "gitpod-gray": "#8E8787",
                 "gitpod-red": "#CE4A3E",
@@ -42,9 +46,17 @@ module.exports = {
                 112: "28rem",
                 128: "32rem",
             },
-            maxWidth: {
-                // TODO(andreafalzetti): remove custom ide-modal class once we implement https://github.com/gitpod-io/gitpod/issues/13116
-                51.5: "51.5rem",
+            lineHeight: {
+                64: "64px",
+            },
+            keyframes: {
+                "toast-in-right": {
+                    from: { transform: "translateX(100%)" },
+                    to: { transform: "translateX(0)" },
+                },
+            },
+            animation: {
+                "toast-in-right": "toast-in-right 0.3s ease-in-out",
             },
         },
         fontFamily: {
@@ -64,7 +76,16 @@ module.exports = {
                 "Segoe UI Symbol",
                 "Noto Color Emoji",
             ],
-            mono: ["SF Mono", "Monaco", "Inconsolata", "Fira Mono", "Droid Sans Mono", "Source Code Pro", "monospace"],
+            mono: [
+                "JetBrains Mono",
+                "SF Mono",
+                "Monaco",
+                "Inconsolata",
+                "Fira Mono",
+                "Droid Sans Mono",
+                "Source Code Pro",
+                "monospace",
+            ],
         },
         underlineThickness: {
             thin: "2px",

@@ -32,6 +32,7 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/pprof"
 	wsmanapi "github.com/gitpod-io/gitpod/ws-manager/api"
+	workspacev1 "github.com/gitpod-io/gitpod/ws-manager/api/crd/v1"
 	"github.com/gitpod-io/gitpod/ws-proxy/pkg/config"
 	"github.com/gitpod-io/gitpod/ws-proxy/pkg/proxy"
 	"github.com/gitpod-io/gitpod/ws-proxy/pkg/sshproxy"
@@ -71,10 +72,24 @@ var runCmd = &cobra.Command{
 			log.WithError(err).Fatal(err, "unable to start manager")
 		}
 
-		workspaceInfoProvider := proxy.NewRemoteWorkspaceInfoProvider(mgr.GetClient(), mgr.GetScheme())
-		err = workspaceInfoProvider.SetupWithManager(mgr)
-		if err != nil {
+		var infoprov proxy.CompositeInfoProvider
+		podInfoProv := proxy.NewRemoteWorkspaceInfoProvider(mgr.GetClient(), mgr.GetScheme())
+		if err = podInfoProv.SetupWithManager(mgr); err != nil {
 			log.WithError(err).Fatal(err, "unable to create controller", "controller", "Pod")
+		}
+		infoprov = append(infoprov, podInfoProv)
+
+		if cfg.EnableWorkspaceCRD {
+			crdInfoProv, err := proxy.NewCRDWorkspaceInfoProvider(mgr.GetClient(), mgr.GetScheme())
+			if err == nil {
+				if err = crdInfoProv.SetupWithManager(mgr); err != nil {
+					log.WithError(err).Warn(err, "unable to create CRD-based info provider", "controller", "Workspace")
+				} else {
+					infoprov = append(infoprov, crdInfoProv)
+				}
+			} else {
+				log.WithError(err).Warn("cannot create CRD-based info provider")
+			}
 		}
 
 		if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -113,7 +128,9 @@ var runCmd = &cobra.Command{
 			grpcOpts := common_grpc.DefaultClientOptions()
 			grpcOpts = append(grpcOpts, dialOption)
 
+			log.Info("Attempting to dial ws-manager, it's a blocking call that retries...")
 			conn, err := grpc.Dial(wsm.Addr, grpcOpts...)
+			// you will never get here if ws-manager is crashing, instead the readiness check for ws-proxy will restart the pod
 			if err != nil {
 				log.WithError(err).Fatal("cannot connect to ws-manager")
 			}
@@ -142,7 +159,7 @@ var runCmd = &cobra.Command{
 				signers = append(signers, hostSigner)
 			}
 			if len(signers) > 0 {
-				server := sshproxy.New(signers, workspaceInfoProvider, heartbeat)
+				server := sshproxy.New(signers, infoprov, heartbeat)
 				l, err := net.Listen("tcp", ":2200")
 				if err != nil {
 					panic(err)
@@ -152,7 +169,7 @@ var runCmd = &cobra.Command{
 			}
 		}
 
-		go proxy.NewWorkspaceProxy(cfg.Ingress, cfg.Proxy, proxy.HostBasedRouter(cfg.Ingress.Header, cfg.Proxy.GitpodInstallation.WorkspaceHostSuffix, cfg.Proxy.GitpodInstallation.WorkspaceHostSuffixRegex), workspaceInfoProvider, signers).MustServe()
+		go proxy.NewWorkspaceProxy(cfg.Ingress, cfg.Proxy, proxy.HostBasedRouter(cfg.Ingress.Header, cfg.Proxy.GitpodInstallation.WorkspaceHostSuffix, cfg.Proxy.GitpodInstallation.WorkspaceHostSuffixRegex), infoprov, signers).MustServe()
 		log.Infof("started proxying on %s", cfg.Ingress.HTTPAddress)
 
 		log.Info("🚪 ws-proxy is up and running")
@@ -166,6 +183,7 @@ var runCmd = &cobra.Command{
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(workspacev1.AddToScheme(scheme))
 	rootCmd.AddCommand(runCmd)
 }
 

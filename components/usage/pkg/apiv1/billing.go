@@ -12,8 +12,11 @@ import (
 	"math"
 	"time"
 
+	"github.com/bufbuild/connect-go"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	db "github.com/gitpod-io/gitpod/components/gitpod-db/go"
+	experimental_v1 "github.com/gitpod-io/gitpod/components/public-api/go/experimental/v1"
+	"github.com/gitpod-io/gitpod/components/public-api/go/experimental/v1/v1connect"
 	v1 "github.com/gitpod-io/gitpod/usage-api/v1"
 	"github.com/gitpod-io/gitpod/usage/pkg/stripe"
 	"github.com/google/uuid"
@@ -23,12 +26,15 @@ import (
 	"gorm.io/gorm"
 )
 
-func NewBillingService(stripeClient *stripe.Client, conn *gorm.DB, ccManager *db.CostCenterManager, stripePrices stripe.StripePrices) *BillingService {
+func NewBillingService(stripeClient *stripe.Client, conn *gorm.DB, ccManager *db.CostCenterManager, stripePrices stripe.StripePrices, teamsService v1connect.TeamsServiceClient, userService v1connect.UserServiceClient) *BillingService {
 	return &BillingService{
 		stripeClient: stripeClient,
 		conn:         conn,
 		ccManager:    ccManager,
 		stripePrices: stripePrices,
+
+		teamsService: teamsService,
+		userService:  userService,
 	}
 }
 
@@ -37,6 +43,9 @@ type BillingService struct {
 	stripeClient *stripe.Client
 	ccManager    *db.CostCenterManager
 	stripePrices stripe.StripePrices
+
+	teamsService v1connect.TeamsServiceClient
+	userService  v1connect.UserServiceClient
 
 	v1.UnimplementedBillingServiceServer
 }
@@ -143,10 +152,11 @@ func (s *BillingService) CreateStripeCustomer(ctx context.Context, req *v1.Creat
 	}
 
 	customer, err := s.stripeClient.CreateCustomer(ctx, stripe.CreateCustomerParams{
-		AttributuonID: string(attributionID),
-		Currency:      req.GetCurrency(),
-		Email:         req.GetEmail(),
-		Name:          req.GetName(),
+		AttributuonID:        string(attributionID),
+		Currency:             req.GetCurrency(),
+		Email:                req.GetEmail(),
+		Name:                 req.GetName(),
+		BillingCreatorUserID: req.GetBillingCreatorUserId(),
 	})
 	if err != nil {
 		log.WithError(err).Errorf("Failed to create stripe customer.")
@@ -212,6 +222,16 @@ func (s *BillingService) CreateStripeSubscription(ctx context.Context, req *v1.C
 	}
 	if !isAutomaticTaxSupported {
 		log.Warnf("Automatic Stripe tax is not supported for customer %s", stripeCustomer.ID)
+	}
+
+	// check the provided payment method by creating a hold on it.
+	result, err := s.stripeClient.TryHoldAmount(ctx, stripeCustomer, 1000)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to verify credit card for customer %s", stripeCustomer.ID)
+	}
+	if result != stripe.PaymentHoldResultSucceeded {
+		log.Errorf("Failed to verify credit card for customer %s. Result: %s", stripeCustomer.ID, result)
+		return nil, status.Error(codes.InvalidArgument, "The provided payment method is invalid. Please provide working credit card information to proceed.")
 	}
 
 	subscription, err := s.stripeClient.CreateSubscription(ctx, stripeCustomer.ID, priceID, isAutomaticTaxSupported)
@@ -312,6 +332,21 @@ func (s *BillingService) FinalizeInvoice(ctx context.Context, in *v1.FinalizeInv
 		// we are just logging at this point, so that we don't see the event again as the usage has been recorded.
 		logger.WithError(err).Errorf("Failed to increment billing cycle.")
 	}
+
+	// update stripe with current usage immediately, so that invoices created between now and the next reconcile are correct.
+	newBalance, err := db.GetBalance(ctx, s.conn, usage.AttributionID)
+	if err != nil {
+		// we are just logging at this point, so that we don't see the event again as the usage has been recorded.
+		logger.WithError(err).Errorf("Failed to compute new balance.")
+		return &v1.FinalizeInvoiceResponse{}, nil
+	}
+	err = s.stripeClient.UpdateUsage(ctx, map[db.AttributionID]int64{
+		usage.AttributionID: int64(math.Ceil(newBalance.ToCredits())),
+	})
+	if err != nil {
+		// we are just logging at this point, so that we don't see the event again as the usage has been recorded.
+		log.WithError(err).Errorf("Failed to udpate usage in stripe after receiving invoive.finalized.")
+	}
 	return &v1.FinalizeInvoiceResponse{}, nil
 }
 
@@ -380,6 +415,145 @@ func (s *BillingService) CancelSubscription(ctx context.Context, in *v1.CancelSu
 		return nil, err
 	}
 	return &v1.CancelSubscriptionResponse{}, nil
+}
+
+func (s *BillingService) OnChargeDispute(ctx context.Context, req *v1.OnChargeDisputeRequest) (*v1.OnChargeDisputeResponse, error) {
+	if req.DisputeId == "" {
+		return nil, status.Errorf(codes.InvalidArgument, "dispute ID is required")
+	}
+
+	logger := log.WithContext(ctx).WithField("disputeId", req.DisputeId)
+
+	dispute, err := s.stripeClient.GetDispute(ctx, req.DisputeId)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to retrieve dispute ID %s from stripe", req.DisputeId)
+	}
+
+	if dispute.PaymentIntent == nil || dispute.PaymentIntent.Customer == nil {
+		return nil, status.Errorf(codes.Internal, "dispute did not contain customer of payment intent in expanded fields")
+	}
+
+	customer := dispute.PaymentIntent.Customer
+	logger = logger.WithField("customerId", customer.ID)
+
+	attributionIDValue, ok := customer.Metadata[stripe.AttributionIDMetadataKey]
+	if !ok {
+		return nil, status.Errorf(codes.Internal, "Customer %s object did not contain attribution ID in metadata", customer.ID)
+	}
+
+	logger = logger.WithField("attributionId", attributionIDValue)
+
+	attributionID, err := db.ParseAttributionID(attributionIDValue)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to parse attribution ID from customer metadata.")
+		return nil, status.Errorf(codes.Internal, "failed to parse attribution ID from customer metadata")
+	}
+
+	var userIDsToBlock []string
+	entity, id := attributionID.Values()
+	switch entity {
+	case db.AttributionEntity_User:
+		// legacy for cases where we've not migrated the user to a team
+		// because we attribute to the user directly, we can just block the user directly
+		userIDsToBlock = append(userIDsToBlock, id)
+
+	case db.AttributionEntity_Team:
+		team, err := s.teamsService.GetTeam(ctx, connect.NewRequest(&experimental_v1.GetTeamRequest{
+			TeamId: id,
+		}))
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to lookup team details for team ID: %s", id)
+		}
+
+		for _, member := range team.Msg.GetTeam().GetMembers() {
+			if member.GetRole() != experimental_v1.TeamRole_TEAM_ROLE_OWNER {
+				continue
+			}
+			userIDsToBlock = append(userIDsToBlock, member.GetUserId())
+		}
+
+	default:
+		return nil, status.Errorf(codes.Internal, "unknown attribution entity for %s", attributionIDValue)
+	}
+
+	logger = logger.WithField("teamOwners", userIDsToBlock)
+
+	logger.Infof("Identified %d users to block based on charge dispute", len(userIDsToBlock))
+	var errs []error
+	for _, userToBlock := range userIDsToBlock {
+		_, err := s.userService.BlockUser(ctx, connect.NewRequest(&experimental_v1.BlockUserRequest{
+			UserId: userToBlock,
+			Reason: fmt.Sprintf("User has created a Stripe dispute ID: %s", req.GetDisputeId()),
+		}))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to block user %s: %w", userToBlock, err))
+		}
+	}
+
+	if len(errs) > 0 {
+		return nil, status.Errorf(codes.Internal, "failed to block users: %v", errs)
+	}
+
+	return &v1.OnChargeDisputeResponse{}, nil
+}
+
+func (s *BillingService) getPriceId(ctx context.Context, attributionId string) string {
+	defaultPriceId := s.stripePrices.TeamUsagePriceIDs.USD
+	attributionID, err := db.ParseAttributionID(attributionId)
+	if err != nil {
+		log.Errorf("Failed to parse attribution ID %s: %s", attributionId, err.Error())
+		return defaultPriceId
+	}
+
+	customer, err := s.GetStripeCustomer(ctx, &v1.GetStripeCustomerRequest{
+		Identifier: &v1.GetStripeCustomerRequest_AttributionId{
+			AttributionId: string(attributionID),
+		},
+	})
+	if err != nil {
+		if status.Code(err) != codes.NotFound {
+			log.Errorf("Failed to get stripe customer for attribution ID %s: %s", attributionId, err.Error())
+		}
+		return defaultPriceId
+	}
+
+	stripeCustomer, err := s.stripeClient.GetCustomer(ctx, customer.Customer.Id)
+	if err != nil {
+		log.Errorf("Failed to get customer infromation from stripe for customer ID %s: %s", customer.Customer.Id, err.Error())
+		return defaultPriceId
+	}
+
+	// if the customer has an active subscription, return that information
+	for _, subscription := range stripeCustomer.Subscriptions.Data {
+		if subscription.Status != "canceled" {
+			return subscription.Plan.ID
+		}
+	}
+	priceID, err := getPriceIdentifier(attributionID, stripeCustomer, s)
+	if err != nil {
+		log.Errorf("Failed to get price identifier for attribution ID %s: %s", attributionId, err.Error())
+		return defaultPriceId
+	}
+	return priceID
+}
+
+func (s *BillingService) GetPriceInformation(ctx context.Context, req *v1.GetPriceInformationRequest) (*v1.GetPriceInformationResponse, error) {
+	_, err := db.ParseAttributionID(req.GetAttributionId())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "Invalid attribution ID %s", req.GetAttributionId())
+	}
+	priceID := s.getPriceId(ctx, req.GetAttributionId())
+	price, err := s.stripeClient.GetPriceInformation(ctx, priceID)
+	if err != nil {
+		return nil, err
+	}
+	information := price.Metadata["human_readable_description"]
+	if information == "" {
+		information = "No information available"
+	}
+	return &v1.GetPriceInformationResponse{
+		HumanReadableDescription: information,
+	}, nil
 }
 
 func (s *BillingService) storeStripeCustomer(ctx context.Context, cus *stripe_api.Customer, attributionID db.AttributionID) (*v1.StripeCustomer, error) {

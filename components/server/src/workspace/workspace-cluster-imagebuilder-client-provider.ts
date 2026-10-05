@@ -4,8 +4,9 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { Workspace, WorkspaceInstance } from "@gitpod/gitpod-protocol";
+import { User, Workspace, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import { defaultGRPCOptions, IClientCallMetrics } from "@gitpod/gitpod-protocol/lib/util/grpc";
+import { WorkspaceRegion } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import {
     ImageBuilderClient,
     ImageBuilderClientCallMetrics,
@@ -17,7 +18,6 @@ import {
     WorkspaceManagerClientProviderCompositeSource,
     WorkspaceManagerClientProviderSource,
 } from "@gitpod/ws-manager/lib/client-provider-source";
-import { ExtendedUser } from "@gitpod/ws-manager/lib/constraints";
 import { inject, injectable, optional } from "inversify";
 
 @injectable()
@@ -32,14 +32,14 @@ export class WorkspaceClusterImagebuilderClientProvider implements ImageBuilderC
     protected readonly connectionCache = new Map<string, ImageBuilderClient>();
 
     async getClient(
-        applicationCluster: string,
-        user: ExtendedUser,
+        user: User,
         workspace: Workspace,
         instance: WorkspaceInstance,
+        region?: WorkspaceRegion,
     ): Promise<PromisifiedImageBuilderClient> {
-        const clusters = await this.clientProvider.getStartClusterSets(applicationCluster, user, workspace, instance);
+        const clusters = await this.clientProvider.getStartClusterSets(user, workspace, instance, region);
         for await (let cluster of clusters) {
-            const info = await this.source.getWorkspaceCluster(cluster.installation, applicationCluster);
+            const info = await this.source.getWorkspaceCluster(cluster.installation);
             if (!info) {
                 continue;
             }

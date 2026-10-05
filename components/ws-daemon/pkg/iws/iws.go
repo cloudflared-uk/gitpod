@@ -31,7 +31,6 @@ import (
 
 	linuxproc "github.com/c9s/goprocinfo/linux"
 	"github.com/gitpod-io/gitpod/common-go/cgroups"
-	v1 "github.com/gitpod-io/gitpod/common-go/cgroups/v1"
 	v2 "github.com/gitpod-io/gitpod/common-go/cgroups/v2"
 	"github.com/gitpod-io/gitpod/common-go/log"
 	"github.com/gitpod-io/gitpod/common-go/tracing"
@@ -85,7 +84,7 @@ var (
 )
 
 // ServeWorkspace establishes the IWS server for a workspace
-func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod, cgroupMountPoint string) func(ctx context.Context, ws *session.Workspace) error {
+func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod, cgroupMountPoint string, workspaceCIDR string) func(ctx context.Context, ws *session.Workspace) error {
 	return func(ctx context.Context, ws *session.Workspace) (err error) {
 		span, _ := opentracing.StartSpanFromContext(ctx, "iws.ServeWorkspace")
 		defer tracing.FinishSpan(span, &err)
@@ -99,6 +98,7 @@ func ServeWorkspace(uidmapper *Uidmapper, fsshift api.FSShiftMethod, cgroupMount
 			Session:          ws,
 			FSShift:          fsshift,
 			CGroupMountPoint: cgroupMountPoint,
+			WorkspaceCIDR:    workspaceCIDR,
 		}
 		err = iws.Start()
 		if err != nil {
@@ -139,6 +139,8 @@ type InWorkspaceServiceServer struct {
 	Session          *session.Workspace
 	FSShift          api.FSShiftMethod
 	CGroupMountPoint string
+
+	WorkspaceCIDR string
 
 	srv  *grpc.Server
 	sckt io.Closer
@@ -362,7 +364,10 @@ func (wbs *InWorkspaceServiceServer) SetupPairVeths(ctx context.Context, req *ap
 	}
 
 	err = nsi.Nsinsider(wbs.Session.InstanceID, int(containerPID), func(c *exec.Cmd) {
-		c.Args = append(c.Args, "setup-pair-veths", "--target-pid", strconv.Itoa(int(req.Pid)))
+		c.Args = append(c.Args, "setup-pair-veths",
+			"--target-pid", strconv.Itoa(int(req.Pid)),
+			fmt.Sprintf("--workspace-cidr=%v", wbs.WorkspaceCIDR),
+		)
 	}, nsi.EnterMountNS(true), nsi.EnterPidNS(true), nsi.EnterNetNS(true))
 	if err != nil {
 		log.WithError(err).WithFields(wbs.Session.OWI()).Error("SetupPairVeths: cannot setup a pair of veths")
@@ -374,7 +379,9 @@ func (wbs *InWorkspaceServiceServer) SetupPairVeths(ctx context.Context, req *ap
 		return nil, xerrors.Errorf("cannot map in-container PID %d (container PID: %d): %w", req.Pid, containerPID, err)
 	}
 	err = nsi.Nsinsider(wbs.Session.InstanceID, int(pid), func(c *exec.Cmd) {
-		c.Args = append(c.Args, "setup-peer-veth")
+		c.Args = append(c.Args, "setup-peer-veth",
+			fmt.Sprintf("--workspace-cidr=%v", wbs.WorkspaceCIDR),
+		)
 	}, nsi.EnterMountNS(true), nsi.EnterPidNS(true), nsi.EnterNetNS(true))
 	if err != nil {
 		log.WithError(err).WithFields(wbs.Session.OWI()).Error("SetupPairVeths: cannot setup a peer veths")
@@ -931,7 +938,11 @@ func (wbs *InWorkspaceServiceServer) WorkspaceInfo(ctx context.Context, req *api
 		return nil, status.Errorf(codes.FailedPrecondition, "could not determine cgroup setup")
 	}
 
-	resources, err := getWorkspaceResourceInfo(wbs.CGroupMountPoint, cgroupPath, unified)
+	if !unified {
+		return nil, status.Errorf(codes.FailedPrecondition, "only cgroups v2 is supported")
+	}
+
+	resources, err := getWorkspaceResourceInfo(wbs.CGroupMountPoint, cgroupPath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			log.WithError(err).Error("could not get resource information")
@@ -944,38 +955,21 @@ func (wbs *InWorkspaceServiceServer) WorkspaceInfo(ctx context.Context, req *api
 	}, nil
 }
 
-func getWorkspaceResourceInfo(mountPoint, cgroupPath string, unified bool) (*api.Resources, error) {
-	if unified {
-		cpu, err := getCpuResourceInfoV2(mountPoint, cgroupPath)
-		if err != nil {
-			return nil, err
-		}
-
-		memory, err := getMemoryResourceInfoV2(mountPoint, cgroupPath)
-		if err != nil {
-			return nil, err
-		}
-
-		return &api.Resources{
-			Cpu:    cpu,
-			Memory: memory,
-		}, nil
-	} else {
-		cpu, err := getCpuResourceInfoV1(mountPoint, cgroupPath)
-		if err != nil {
-			return nil, err
-		}
-
-		memory, err := getMemoryResourceInfoV1(mountPoint, cgroupPath)
-		if err != nil {
-			return nil, err
-		}
-
-		return &api.Resources{
-			Cpu:    cpu,
-			Memory: memory,
-		}, nil
+func getWorkspaceResourceInfo(mountPoint, cgroupPath string) (*api.Resources, error) {
+	cpu, err := getCpuResourceInfoV2(mountPoint, cgroupPath)
+	if err != nil {
+		return nil, err
 	}
+
+	memory, err := getMemoryResourceInfoV2(mountPoint, cgroupPath)
+	if err != nil {
+		return nil, err
+	}
+
+	return &api.Resources{
+		Cpu:    cpu,
+		Memory: memory,
+	}, nil
 }
 
 func getCpuResourceInfoV2(mountPoint, cgroupPath string) (*api.Cpu, error) {
@@ -1066,118 +1060,9 @@ func getMemoryResourceInfoV2(mountPoint, cgroupPath string) (*api.Memory, error)
 	}, nil
 }
 
-func getMemoryResourceInfoV1(mountPoint, cgroupPath string) (*api.Memory, error) {
-	memory := v1.NewMemoryControllerWithMount(mountPoint, cgroupPath)
-
-	memoryLimit, err := memory.Limit()
-	if err != nil {
-		return nil, err
-	}
-
-	memInfo, err := linuxproc.ReadMemInfo("/proc/meminfo")
-	if err != nil {
-		return nil, xerrors.Errorf("failed to read meminfo: %w", err)
-	}
-
-	// if no memory limit has been specified, use total available memory
-	if memoryLimit == math.MaxUint64 || memoryLimit > memInfo.MemTotal*1024 {
-		// total memory is specifed on kilobytes -> convert to bytes
-		memoryLimit = memInfo.MemTotal * 1024
-	}
-
-	usedMemory, err := memory.Usage()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to read memory limit: %w", err)
-	}
-
-	stats, err := memory.Stat()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to read memory stats: %w", err)
-	}
-
-	if stats.InactiveFileTotal > 0 {
-		if usedMemory < stats.InactiveFileTotal {
-			usedMemory = 0
-		} else {
-			usedMemory -= stats.InactiveFileTotal
-		}
-	}
-
-	return &api.Memory{
-		Limit: int64(memoryLimit),
-		Used:  int64(usedMemory),
-	}, nil
-}
-
-func getCpuResourceInfoV1(mountPoint, cgroupPath string) (*api.Cpu, error) {
-	cpu := v1.NewCpuControllerWithMount(mountPoint, cgroupPath)
-
-	t, err := resolveCPUStatV1(cpu)
-	if err != nil {
-		return nil, err
-	}
-
-	time.Sleep(time.Second)
-
-	t2, err := resolveCPUStatV1(cpu)
-	if err != nil {
-		return nil, err
-	}
-
-	cpuUsage := t2.usage - t.usage
-	totalTime := t2.uptime - t.uptime
-	used := cpuUsage / totalTime * 1000
-
-	quota, err := cpu.Quota()
-	if err != nil {
-		return nil, err
-	}
-
-	// if no cpu limit has been specified, use the number of cores
-	var limit uint64
-	if quota == math.MaxUint64 {
-		content, err := os.ReadFile(filepath.Join(mountPoint, "cpu", cgroupPath, "cpuacct.usage_percpu"))
-		if err != nil {
-			return nil, xerrors.Errorf("failed to read cpuacct.usage_percpu: %w", err)
-		}
-		limit = uint64(len(strings.Split(strings.TrimSpace(string(content)), " "))) * 1000
-	} else {
-		period, err := cpu.Period()
-		if err != nil {
-			return nil, err
-		}
-
-		limit = quota / period * 1000
-	}
-
-	return &api.Cpu{
-		Used:  int64(used),
-		Limit: int64(limit),
-	}, nil
-}
-
 type cpuStat struct {
 	usage  float64
 	uptime float64
-}
-
-func resolveCPUStatV1(cpu *v1.Cpu) (*cpuStat, error) {
-	usage_ns, err := cpu.Usage()
-	if err != nil {
-		return nil, xerrors.Errorf("failed to get cpu usage: %w", err)
-	}
-
-	// convert from nanoseconds to seconds
-	usage := float64(usage_ns) * 1e-9
-	uptime, err := readProcUptime()
-	if err != nil {
-		return nil, err
-	}
-
-	return &cpuStat{
-		usage:  usage,
-		uptime: uptime,
-	}, nil
 }
 
 func resolveCPUStatV2(cpu *v2.Cpu) (*cpuStat, error) {

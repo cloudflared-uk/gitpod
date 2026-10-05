@@ -66,7 +66,6 @@ type GeneratedValues struct {
 	InternalRegistryUsername     string
 	InternalRegistryPassword     string
 	InternalRegistrySharedSecret string
-	MessageBusPassword           string
 }
 
 type RenderContext struct {
@@ -156,18 +155,6 @@ func (r *RenderContext) generateValues() error {
 		return err
 	}
 	r.Values.InternalRegistrySharedSecret = internalRegistrySharedSecret
-
-	messageBusPassword := ""
-	_ = r.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.Common != nil {
-			messageBusPassword = cfg.Common.StaticMessagebusPassword
-		}
-		return nil
-	})
-	if messageBusPassword == "" {
-		messageBusPassword = "uq4KxOLtrA-QsDTfuwQ-"
-	}
-	r.Values.MessageBusPassword = messageBusPassword
 
 	return nil
 }

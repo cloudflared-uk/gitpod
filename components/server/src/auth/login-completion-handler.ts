@@ -13,7 +13,7 @@ import { AuthFlow } from "./auth-provider";
 import { HostContextProvider } from "./host-context-provider";
 import { AuthProviderService } from "./auth-provider-service";
 import { TosFlow } from "../terms/tos-flow";
-import { increaseLoginCounter } from "../../src/prometheus-metrics";
+import { increaseLoginCounter } from "../prometheus-metrics";
 import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
 import { trackLogin } from "../analytics";
 import { UserService } from "../user/user-service";
@@ -93,11 +93,6 @@ export class LoginCompletionHandler {
             );
         }
 
-        // Check for and automatically subscribe to Professional OpenSource subscription
-        /** no await */ this.checkForAndSubscribeToProfessionalOss(user).catch((err) => {
-            /** ignore */
-        });
-
         response.redirect(returnTo);
     }
 
@@ -108,21 +103,12 @@ export class LoginCompletionHandler {
             const { id, verified, builtin } = config;
             if (!builtin && !verified) {
                 try {
-                    await this.authProviderService.markAsVerified({ id, ownerId: user.id });
+                    await this.authProviderService.markAsVerified({ id, userId: user.id });
                 } catch (error) {
                     log.error(LogContext.from({ user }), `Failed to mark AuthProvider as verified!`, { error });
                 }
             }
         }
-    }
-
-    protected async checkForAndSubscribeToProfessionalOss(user: User) {
-        const eligible = await this.userService.checkAutomaticOssEligibility(user);
-        log.debug({ userId: user.id }, "user eligible for OSS subscription?", { eligible });
-        if (!eligible) {
-            return;
-        }
-        await this.subscriptionService.checkAndSubscribeToOssSubscription(user, new Date());
     }
 }
 export namespace LoginCompletionHandler {

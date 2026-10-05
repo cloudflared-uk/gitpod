@@ -6,9 +6,8 @@
 
 import { AuthProviderInfo } from "@gitpod/gitpod-protocol";
 import * as GitpodCookie from "@gitpod/gitpod-protocol/lib/util/gitpod-cookie";
-import { useContext, useEffect, useState } from "react";
+import { useContext, useEffect, useState, useMemo, useCallback, FC } from "react";
 import { UserContext } from "./user-context";
-import { TeamsContext } from "./teams/teams-context";
 import { getGitpodService } from "./service/service";
 import { iconForAuthProvider, openAuthorizeWindow, simplifyProviderName, getSafeURLRedirect } from "./provider-utils";
 import gitpod from "./images/gitpod.svg";
@@ -23,14 +22,15 @@ import prebuild from "./images/welcome/prebuild.svg";
 import exclamation from "./images/exclamation.svg";
 import { getURLHash } from "./utils";
 import ErrorMessage from "./components/ErrorMessage";
-import { FeatureFlagContext } from "./contexts/FeatureFlagContext";
-import { publicApiTeamsToProtocol, teamsService } from "./service/public-api";
+import { Heading1, Heading2, Subheading } from "./components/typography/headings";
+import { SSOLoginForm } from "./login/SSOLoginForm";
+import { useAuthProviders } from "./data/auth-providers/auth-provider-query";
 
 function Item(props: { icon: string; iconSize?: string; text: string }) {
     const iconSize = props.iconSize || 28;
     return (
         <div className="flex-col items-center w-1/3 px-3">
-            <img src={props.icon} className={`w-${iconSize} m-auto h-24`} />
+            <img src={props.icon} alt={props.text} className={`w-${iconSize} m-auto h-24`} />
             <div className="text-gray-400 text-sm w-36 h-20 text-center">{props.text}</div>
         </div>
     );
@@ -48,95 +48,91 @@ export function hasVisitedMarketingWebsiteBefore() {
     return document.cookie.match("gitpod-marketing-website-visited=true");
 }
 
-export function Login() {
+type LoginProps = {
+    onLoggedIn?: () => void;
+};
+export const Login: FC<LoginProps> = ({ onLoggedIn }) => {
     const { setUser } = useContext(UserContext);
-    const { setTeams } = useContext(TeamsContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
 
-    const urlHash = getURLHash();
-    let hostFromContext: string | undefined;
-    let repoPathname: string | undefined;
+    const urlHash = useMemo(() => getURLHash(), []);
 
-    try {
-        if (urlHash.length > 0) {
-            const url = new URL(urlHash);
-            hostFromContext = url.host;
-            repoPathname = url.pathname;
-        }
-    } catch (error) {
-        // Hash is not a valid URL
-    }
-
-    const [authProviders, setAuthProviders] = useState<AuthProviderInfo[]>([]);
+    const authProviders = useAuthProviders();
     const [errorMessage, setErrorMessage] = useState<string | undefined>(undefined);
-    const [providerFromContext, setProviderFromContext] = useState<AuthProviderInfo>();
+    const [hostFromContext, setHostFromContext] = useState<string | undefined>();
+    const [repoPathname, setRepoPathname] = useState<string | undefined>();
+
+    useEffect(() => {
+        try {
+            if (urlHash.length > 0) {
+                const url = new URL(urlHash);
+                setHostFromContext(url.host);
+                setRepoPathname(url.pathname);
+            }
+        } catch (error) {
+            // Hash is not a valid URL
+        }
+    }, [urlHash]);
+
+    let providerFromContext: AuthProviderInfo | undefined;
+    if (hostFromContext && authProviders.data) {
+        providerFromContext = authProviders.data.find((provider) => provider.host === hostFromContext);
+    }
 
     const showWelcome = !hasLoggedInBefore() && !hasVisitedMarketingWebsiteBefore() && !urlHash.startsWith("https://");
 
-    useEffect(() => {
-        (async () => {
-            setAuthProviders(await getGitpodService().server.getAuthProviders());
-        })();
-    }, []);
-
-    useEffect(() => {
-        if (hostFromContext && authProviders) {
-            const providerFromContext = authProviders.find((provider) => provider.host === hostFromContext);
-            setProviderFromContext(providerFromContext);
-        }
-    }, [authProviders]);
-
-    const authorizeSuccessful = async (payload?: string) => {
-        updateUser().catch(console.error);
-
-        // Check for a valid returnTo in payload
-        const safeReturnTo = getSafeURLRedirect(payload);
-        if (safeReturnTo) {
-            // ... and if it is, redirect to it
-            window.location.replace(safeReturnTo);
-        }
-    };
-
-    const updateUser = async () => {
+    const updateUser = useCallback(async () => {
         await getGitpodService().reconnect();
-        const [user, teams] = await Promise.all([
-            getGitpodService().server.getLoggedInUser(),
-            usePublicApiTeamsService
-                ? publicApiTeamsToProtocol((await teamsService.listTeams({})).teams)
-                : await getGitpodService().server.getTeams(),
-        ]);
+        const [user] = await Promise.all([getGitpodService().server.getLoggedInUser()]);
         setUser(user);
-        setTeams(teams);
         markLoggedIn();
-    };
+    }, [setUser]);
 
-    const openLogin = async (host: string) => {
-        setErrorMessage(undefined);
+    const authorizeSuccessful = useCallback(
+        async (payload?: string) => {
+            updateUser().catch(console.error);
 
-        try {
-            await openAuthorizeWindow({
-                login: true,
-                host,
-                onSuccess: authorizeSuccessful,
-                onError: (payload) => {
-                    let errorMessage: string;
-                    if (typeof payload === "string") {
-                        errorMessage = payload;
-                    } else {
-                        errorMessage = payload.description ? payload.description : `Error: ${payload.error}`;
-                        if (payload.error === "email_taken") {
-                            errorMessage = `Email address already used in another account. Please log in with ${
-                                (payload as any).host
-                            }.`;
+            onLoggedIn && onLoggedIn();
+
+            // Check for a valid returnTo in payload
+            const safeReturnTo = getSafeURLRedirect(payload);
+            if (safeReturnTo) {
+                // ... and if it is, redirect to it
+                window.location.replace(safeReturnTo);
+            }
+        },
+        [onLoggedIn, updateUser],
+    );
+
+    const openLogin = useCallback(
+        async (host: string) => {
+            setErrorMessage(undefined);
+
+            try {
+                await openAuthorizeWindow({
+                    login: true,
+                    host,
+                    onSuccess: authorizeSuccessful,
+                    onError: (payload) => {
+                        let errorMessage: string;
+                        if (typeof payload === "string") {
+                            errorMessage = payload;
+                        } else {
+                            errorMessage = payload.description ? payload.description : `Error: ${payload.error}`;
+                            if (payload.error === "email_taken") {
+                                errorMessage = `Email address already used in another account. Please log in with ${
+                                    (payload as any).host
+                                }.`;
+                            }
                         }
-                    }
-                    setErrorMessage(errorMessage);
-                },
-            });
-        } catch (error) {
-            console.log(error);
-        }
-    };
+                        setErrorMessage(errorMessage);
+                    },
+                });
+            } catch (error) {
+                console.log(error);
+            }
+        },
+        [authorizeSuccessful],
+    );
 
     return (
         <div id="login-container" className="z-50 flex w-screen h-screen">
@@ -149,10 +145,11 @@ export function Login() {
                                 <img src={gitpodDark} className="h-8 hidden dark:block" alt="Gitpod dark theme logo" />
                             </div>
                             <div className="mb-10">
-                                <h1 className="text-5xl mb-3">Welcome to Gitpod</h1>
-                                <div className="text-gray-400 text-lg">
-                                    Spin up fresh, automated dev environments for each task in the cloud, in seconds.
-                                </div>
+                                <Heading1 className="text-5xl mb-3">Welcome to Gitpod</Heading1>
+                                <Subheading className="text-gray-400 text-lg">
+                                    Spin up fresh cloud development environments for each task, fully automated, in
+                                    seconds.
+                                </Subheading>
                             </div>
                             <div className="flex mb-10">
                                 <Item icon={code} iconSize="16" text="Always Ready&#x2011;To&#x2011;Code" />
@@ -191,25 +188,25 @@ export function Login() {
                             <div className="mx-auto text-center pb-8 space-y-2">
                                 {providerFromContext ? (
                                     <>
-                                        <h2 className="text-xl text-black dark:text-gray-50 font-semibold">
-                                            Open a cloud development environment
-                                        </h2>
-                                        <h2 className="text-xl">for the repository {repoPathname?.slice(1)}</h2>
+                                        <Heading2>Open a cloud development environment</Heading2>
+                                        <Subheading>for the repository {repoPathname?.slice(1)}</Subheading>
                                     </>
                                 ) : (
                                     <>
-                                        <h1 className="text-3xl">Log in{showWelcome ? "" : " to Gitpod"}</h1>
-                                        <h2 className="uppercase text-sm text-gray-400">ALWAYS READY-TO-CODE</h2>
+                                        <Heading1>Log in{showWelcome ? "" : " to Gitpod"}</Heading1>
+                                        <Subheading className="uppercase text-sm text-gray-400">
+                                            ALWAYS READY-TO-CODE
+                                        </Subheading>
                                     </>
                                 )}
                             </div>
 
-                            <div className="flex flex-col space-y-3 items-center">
+                            <div className="w-56 mx-auto flex flex-col space-y-3 items-center">
                                 {providerFromContext ? (
                                     <button
                                         key={"button" + providerFromContext.host}
                                         className="btn-login flex-none w-56 h-10 p-0 inline-flex"
-                                        onClick={() => openLogin(providerFromContext.host)}
+                                        onClick={() => openLogin(providerFromContext!.host)}
                                     >
                                         {iconForAuthProvider(providerFromContext.authProviderType)}
                                         <span className="pt-2 pb-2 mr-3 text-sm my-auto font-medium truncate overflow-ellipsis">
@@ -217,7 +214,7 @@ export function Login() {
                                         </span>
                                     </button>
                                 ) : (
-                                    authProviders.map((ap) => (
+                                    authProviders.data?.map((ap) => (
                                         <button
                                             key={"button" + ap.host}
                                             className="btn-login flex-none w-56 h-10 p-0 inline-flex"
@@ -230,6 +227,8 @@ export function Login() {
                                         </button>
                                     ))
                                 )}
+
+                                <SSOLoginForm onSuccess={authorizeSuccessful} />
                             </div>
                             {errorMessage && <ErrorMessage imgSrc={exclamation} message={errorMessage} />}
                         </div>
@@ -259,4 +258,4 @@ export function Login() {
             </div>
         </div>
     );
-}
+};

@@ -2,9 +2,9 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License.AGPL.txt in the project root for license information.
 
-FROM gitpod/workspace-full:2022-11-09-13-54-49
+FROM gitpod/workspace-full:2023-03-24-02-48-18
 
-ENV TRIGGER_REBUILD 25
+ENV TRIGGER_REBUILD 40
 
 USER root
 
@@ -136,7 +136,7 @@ RUN install-packages netcat
 USER gitpod
 
 # Fix node version we develop against
-ARG GITPOD_NODE_VERSION=16.18.1
+ARG GITPOD_NODE_VERSION=16.19.0
 RUN bash -c ". .nvm/nvm.sh \
     && nvm install $GITPOD_NODE_VERSION \
     && npm install -g typescript yarn"
@@ -151,7 +151,7 @@ ARG GCS_DIR=/opt/google-cloud-sdk
 ENV PATH=$GCS_DIR/bin:$PATH
 RUN sudo chown gitpod: /opt \
     && mkdir $GCS_DIR \
-    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-400.0.0-linux-x86_64.tar.gz \
+    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-420.0.0-linux-x86_64.tar.gz \
     | tar -xzvC /opt \
     && /opt/google-cloud-sdk/install.sh --quiet --usage-reporting=false --bash-completion=true \
     --additional-components gke-gcloud-auth-plugin docker-credential-gcr alpha beta \
@@ -163,7 +163,6 @@ ENV USE_GKE_GCLOUD_AUTH_PLUGIN=True
 # Install tools for gsutil
 RUN sudo install-packages \
     gcc \
-    python-dev \
     python-setuptools
 
 RUN sudo python3 -m pip uninstall crcmod; sudo python3 -m pip install --no-cache-dir -U crcmod
@@ -173,7 +172,7 @@ RUN sudo python3 -m pip uninstall crcmod; sudo python3 -m pip install --no-cache
 ARG GCLOUD_CONFIG_DIR=/home/gitpod/.config/gcloud
 COPY --chown=gitpod gcloud-default-config $GCLOUD_CONFIG_DIR/configurations/config_default
 
-ENV DB_HOST=localhost
+ENV DB_HOST=127.0.0.1
 
 # awscliv2
 # See also: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-version.html
@@ -250,8 +249,11 @@ RUN sudo apt-add-repository -y ppa:fish-shell/release-3 && \
 # Install tmux + tmuxinator
 RUN brew install tmux tmuxinator
 
+# Install redis-server
+RUN brew install redis@7.0
+
 # Copy our own tools
-ENV NEW_KUBECDL=1
+ENV NEW_KUBECDL=2
 COPY dev-kubecdl--app/kubecdl dev-gpctl--app/gpctl /usr/bin/
 
 # Configure our tools' autocompletion
@@ -262,3 +264,7 @@ ENV PATH=$PATH:/workspace/bin
 # Setting the environment variable here so that it will be accessible to all tasks and
 # terminal sessions in Gitpod workspaces.
 ENV PREVIEW_ENV_DEV_SA_KEY_PATH=/home/gitpod/.config/gcloud/preview-environment-dev-sa.json
+
+# So we can parse the report.html output by leeway, and remove the output produced by this image build
+# why? it's too verbose, exceeding the Github Actions summary limit
+RUN go install github.com/ericchiang/pup@v0.4.0

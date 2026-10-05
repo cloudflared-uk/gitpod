@@ -34,3 +34,23 @@ func ExampleListTeams() {
 
 	fmt.Fprintf(os.Stdout, "Retrieved teams %v", response.Msg.GetTeams())
 }
+
+func ExampleGetTeam() {
+	token := "gitpod_pat_example.personal-access-token"
+
+	gitpod, err := client.New(client.WithCredentials(token))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to construct gitpod client %v", err)
+		return
+	}
+
+	response, err := gitpod.Teams.GetTeam(context.Background(), connect.NewRequest(&v1.GetTeamRequest{
+		TeamId: "<TEAM_ID>",
+	}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to get team %v", err)
+		return
+	}
+
+	fmt.Fprintf(os.Stdout, "Retrieved team %v", response.Msg.GetTeam())
+}

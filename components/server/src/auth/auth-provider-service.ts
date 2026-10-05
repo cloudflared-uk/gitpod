@@ -7,7 +7,7 @@
 import { injectable, inject } from "inversify";
 import { AuthProviderEntry as AuthProviderEntry, User } from "@gitpod/gitpod-protocol";
 import { AuthProviderParams } from "./auth-provider";
-import { AuthProviderEntryDB } from "@gitpod/gitpod-db/lib";
+import { AuthProviderEntryDB, TeamDB } from "@gitpod/gitpod-db/lib";
 import { Config } from "../config";
 import { v4 as uuidv4 } from "uuid";
 import { oauthUrls as githubUrls } from "../github/github-urls";
@@ -21,6 +21,9 @@ import isReachable = require("is-reachable");
 export class AuthProviderService {
     @inject(AuthProviderEntryDB)
     protected authProviderDB: AuthProviderEntryDB;
+
+    @inject(TeamDB)
+    protected teamDB: TeamDB;
 
     @inject(Config)
     protected readonly config: Config;
@@ -56,6 +59,7 @@ export class AuthProviderService {
             host: oap.host.toLowerCase(),
             verified: oap.status === "verified",
             builtin: false,
+            disallowLogin: !!oap.organizationId,
             // hiddenOnDashboard: true, // i.e. show only if it's used
             loginContextMatcher: `https://${oap.host}/`,
             oauth: {
@@ -67,6 +71,11 @@ export class AuthProviderService {
 
     async getAuthProvidersOfUser(user: User | string): Promise<AuthProviderEntry[]> {
         const result = await this.authProviderDB.findByUserId(User.is(user) ? user.id : user);
+        return result;
+    }
+
+    async getAuthProvidersOfOrg(organizationId: string): Promise<AuthProviderEntry[]> {
+        const result = await this.authProviderDB.findByOrgId(organizationId);
         return result;
     }
 
@@ -112,6 +121,51 @@ export class AuthProviderService {
         }
         return await this.authProviderDB.storeAuthProvider(authProvider as AuthProviderEntry, true);
     }
+
+    async createOrgAuthProvider(entry: AuthProviderEntry.NewOrgEntry): Promise<AuthProviderEntry> {
+        const orgProviders = await this.authProviderDB.findByOrgId(entry.organizationId);
+        const existing = orgProviders.find((p) => p.host === entry.host);
+        if (existing) {
+            throw new Error("Provider for this host already exists.");
+        }
+
+        const authProvider = this.initializeNewProvider(entry);
+
+        return await this.authProviderDB.storeAuthProvider(authProvider as AuthProviderEntry, true);
+    }
+
+    async updateOrgAuthProvider(entry: AuthProviderEntry.UpdateOrgEntry): Promise<AuthProviderEntry> {
+        let authProvider: AuthProviderEntry;
+
+        const { id, organizationId } = entry;
+        // TODO can we change this to query for the provider by id and org instead of loading all from org?
+        const existing = (await this.authProviderDB.findByOrgId(organizationId)).find((p) => p.id === id);
+        if (!existing) {
+            throw new Error("Provider does not exist.");
+        }
+        const changed =
+            entry.clientId !== existing.oauth.clientId ||
+            (entry.clientSecret && entry.clientSecret !== existing.oauth.clientSecret);
+
+        if (!changed) {
+            return existing;
+        }
+
+        // update config on demand
+        const oauth = {
+            ...existing.oauth,
+            clientId: entry.clientId,
+            clientSecret: entry.clientSecret || existing.oauth.clientSecret, // FE may send empty ("") if not changed
+        };
+        authProvider = {
+            ...existing,
+            oauth,
+            status: "pending",
+        };
+
+        return await this.authProviderDB.storeAuthProvider(authProvider as AuthProviderEntry, true);
+    }
+
     protected initializeNewProvider(newEntry: AuthProviderEntry.NewEntry): AuthProviderEntry {
         const { host, type, clientId, clientSecret } = newEntry;
         let urls;
@@ -147,26 +201,52 @@ export class AuthProviderService {
         };
     }
 
-    async markAsVerified(params: { ownerId: string; id: string }) {
-        const { ownerId, id } = params;
+    async markAsVerified(params: { userId: string; id: string }) {
+        const { userId, id } = params;
         let ap: AuthProviderEntry | undefined;
         try {
-            let authProviders = await this.authProviderDB.findByUserId(ownerId);
-            if (authProviders.length === 0) {
-                // "no-user" is the magic user id assigned during the initial setup
-                authProviders = await this.authProviderDB.findByUserId("no-user");
+            const ap = await this.authProviderDB.findById(id);
+            if (!ap) {
+                log.warn("Failed to find the AuthProviderEntry to be activated.", { params, id });
+                return;
             }
-            ap = authProviders.find((p) => p.id === id);
-            if (ap) {
-                ap = {
-                    ...ap,
-                    ownerId: ownerId,
-                    status: "verified",
-                };
-                await this.authProviderDB.storeAuthProvider(ap, true);
+
+            // Check that user is allowed to verify the AuthProviderEntry
+            if (ap.organizationId) {
+                const membership = await this.teamDB.findTeamMembership(userId, ap.organizationId);
+                if (!membership) {
+                    log.warn("Failed to find the TeamMembership for Org AuthProviderEntry to be activated.", {
+                        params,
+                        id,
+                        ap,
+                    });
+                    return;
+                }
+
+                // As long as user is an owner of the org the ap belongs too, they can verify it
+                if (membership.role !== "owner") {
+                    log.warn("User must be an owner of org for AuthProviderEntry to be activated.", {
+                        params,
+                        id,
+                        ap,
+                    });
+                    return;
+                }
             } else {
-                log.warn("Failed to find the AuthProviderEntry to be activated.", { params, id, ap });
+                // For a non-org AuthProviderEntry, user must be the owner, or it must be the special "no-user" entry
+                // "no-user" is the magic user id assigned during the initial setup
+                if (userId !== ap.ownerId && ap.ownerId !== "no-user") {
+                    log.warn("User cannot active the AuthProviderEntry.", { params, id, ap });
+                    return;
+                }
             }
+
+            const updatedAP: AuthProviderEntry = {
+                ...ap,
+                ownerId: userId,
+                status: "verified",
+            };
+            await this.authProviderDB.storeAuthProvider(updatedAP, true);
         } catch (error) {
             log.error("Failed to activate AuthProviderEntry.", { params, id, ap });
         }

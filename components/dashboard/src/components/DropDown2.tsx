@@ -19,6 +19,7 @@ export interface DropDown2Props {
     disableSearch?: boolean;
     expanded?: boolean;
     onSelectionChange: (id: string) => void;
+    allOptions?: string;
 }
 
 export const DropDown2: FunctionComponent<DropDown2Props> = (props) => {
@@ -38,6 +39,9 @@ export const DropDown2: FunctionComponent<DropDown2Props> = (props) => {
     // reset search when the drop down is expanded or closed
     useEffect(() => {
         setSearch("");
+        if (props.allOptions) {
+            setSelectedElementTemp(props.allOptions);
+        }
         if (showDropDown && selectedElementTemp) {
             document.getElementById(selectedElementTemp)?.scrollIntoView({ behavior: "smooth", block: "nearest" });
         }
@@ -99,12 +103,12 @@ export const DropDown2: FunctionComponent<DropDown2Props> = (props) => {
                     e.preventDefault();
                 }
             }
-            if (e.key === " ") {
+            if (e.key === " " && search === "") {
                 toggleDropDown();
                 e.preventDefault();
             }
         },
-        [filteredOptions, props, selectedElementTemp, setFocussedElement, showDropDown, toggleDropDown],
+        [filteredOptions, props, search, selectedElementTemp, setFocussedElement, showDropDown, toggleDropDown],
     );
 
     const handleBlur = useCallback(
@@ -173,7 +177,9 @@ export const DropDown2: FunctionComponent<DropDown2Props> = (props) => {
                                             key={element.id}
                                             id={element.id}
                                             tabIndex={0}
-                                            className={"h-16 rounded-lg flex items-center px-2 " + selectionClasses}
+                                            className={
+                                                "h-min rounded-lg flex items-center px-2 py-1.5 " + selectionClasses
+                                            }
                                             onMouseDown={() => {
                                                 if (element.isSelectable) {
                                                     setFocussedElement(element.id);

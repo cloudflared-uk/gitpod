@@ -4,126 +4,199 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { Team } from "@gitpod/gitpod-protocol";
-import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
-import { useContext, useEffect, useState } from "react";
-import { Redirect, useLocation } from "react-router";
+import { OrganizationSettings } from "@gitpod/gitpod-protocol";
+import React, { useCallback, useState } from "react";
+import Alert from "../components/Alert";
+import { Button } from "../components/Button";
+import { CheckboxInputField } from "../components/forms/CheckboxInputField";
 import ConfirmationModal from "../components/ConfirmationModal";
-import { PageWithSubMenu } from "../components/PageWithSubMenu";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamMembersToProtocol, teamsService } from "../service/public-api";
-import { getGitpodService, gitpodHostUrl } from "../service/service";
-import { UserContext } from "../user-context";
-import { getCurrentTeam, TeamsContext } from "./teams-context";
+import { TextInputField } from "../components/forms/TextInputField";
+import { Heading2, Subheading } from "../components/typography/headings";
+import { useUpdateOrgSettingsMutation } from "../data/organizations/update-org-settings-mutation";
+import { useOrgSettingsQuery } from "../data/organizations/org-settings-query";
+import { useCurrentOrg, useOrganizationsInvalidator } from "../data/organizations/orgs-query";
+import { useUpdateOrgMutation } from "../data/organizations/update-org-mutation";
+import { useOnBlurError } from "../hooks/use-onblur-error";
+import { teamsService } from "../service/public-api";
+import { gitpodHostUrl } from "../service/service";
+import { useCurrentUser } from "../user-context";
+import { OrgSettingsPage } from "./OrgSettingsPage";
 
-export function getTeamSettingsMenu(params: { team?: Team; billingMode?: BillingMode }) {
-    const { team, billingMode } = params;
-    return [
-        {
-            title: "General",
-            link: [`/t/${team?.slug}/settings`],
-        },
-        // The Billing page contains both chargebee and usage-based components, so: always show them!
-        ...(billingMode && billingMode.mode !== "none"
-            ? [
-                  {
-                      title: "Billing",
-                      link: [`/t/${team?.slug}/billing`],
-                  },
-              ]
-            : []),
-    ];
-}
-
-export default function TeamSettings() {
+export default function TeamSettingsPage() {
+    const user = useCurrentUser();
+    const org = useCurrentOrg().data;
+    const invalidateOrgs = useOrganizationsInvalidator();
     const [modal, setModal] = useState(false);
-    const [teamSlug, setTeamSlug] = useState("");
-    const [isUserOwner, setIsUserOwner] = useState(true);
-    const { teams } = useContext(TeamsContext);
-    const { user } = useContext(UserContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
-    const [billingMode, setBillingMode] = useState<BillingMode | undefined>(undefined);
-    const location = useLocation();
-    const team = getCurrentTeam(location, teams);
+    const [teamNameToDelete, setTeamNameToDelete] = useState("");
+    const [teamName, setTeamName] = useState(org?.name || "");
+    const [slug, setSlug] = useState(org?.slug || "");
+    const [updated, setUpdated] = useState(false);
+    const updateOrg = useUpdateOrgMutation();
+    const { data: settings, isLoading } = useOrgSettingsQuery();
+    const updateTeamSettings = useUpdateOrgSettingsMutation();
+
+    const handleUpdateTeamSettings = useCallback(
+        (newSettings: Partial<OrganizationSettings>) => {
+            if (!org?.id) {
+                throw new Error("no organization selected");
+            }
+            updateTeamSettings.mutate({
+                ...settings,
+                ...newSettings,
+            });
+        },
+        [updateTeamSettings, org?.id, settings],
+    );
 
     const close = () => setModal(false);
 
-    useEffect(() => {
-        (async () => {
-            if (!team) return;
-            const members = usePublicApiTeamsService
-                ? await publicApiTeamMembersToProtocol(
-                      (await teamsService.getTeam({ teamId: team!.id })).team?.members || [],
-                  )
-                : await getGitpodService().server.getTeamMembers(team.id);
+    const teamNameError = useOnBlurError(
+        teamName.length > 32
+            ? "Organization name must not be longer than 32 characters"
+            : "Organization name can not be blank",
+        !!teamName && teamName.length <= 32,
+    );
 
-            const currentUserInTeam = members.find((member) => member.userId === user?.id);
-            setIsUserOwner(currentUserInTeam?.role === "owner");
+    const slugError = useOnBlurError(
+        slug.length > 100
+            ? "Organization slug must not be longer than 100 characters"
+            : "Organization slug can not be blank.",
+        !!slug && slug.length <= 100,
+    );
 
-            // TODO(gpl) Maybe we should have TeamContext here instead of repeating ourselves...
-            const billingMode = await getGitpodService().server.getBillingModeForTeam(team.id);
-            setBillingMode(billingMode);
-        })();
-    }, []);
+    const orgFormIsValid = teamNameError.isValid && slugError.isValid;
 
-    if (!isUserOwner) {
-        return <Redirect to="/" />;
-    }
-    const deleteTeam = async () => {
-        if (!team || !user) {
+    const updateTeamInformation = useCallback(
+        async (e: React.FormEvent) => {
+            e.preventDefault();
+
+            if (!orgFormIsValid) {
+                return;
+            }
+
+            try {
+                await updateOrg.mutateAsync({ name: teamName, slug });
+                setUpdated(true);
+                setTimeout(() => setUpdated(false), 3000);
+            } catch (error) {
+                console.error(error);
+            }
+        },
+        [orgFormIsValid, updateOrg, teamName, slug],
+    );
+
+    const deleteTeam = useCallback(async () => {
+        if (!org || !user) {
             return;
         }
 
-        usePublicApiTeamsService
-            ? await teamsService.deleteTeam({ teamId: team.id })
-            : await getGitpodService().server.deleteTeam(team.id);
-
+        await teamsService.deleteTeam({ teamId: org.id });
+        invalidateOrgs();
         document.location.href = gitpodHostUrl.asDashboard().toString();
-    };
+    }, [invalidateOrgs, org, user]);
 
     return (
         <>
-            <PageWithSubMenu
-                subMenu={getTeamSettingsMenu({ team, billingMode })}
-                title="Settings"
-                subtitle="Manage general team settings."
-            >
-                <h3>Delete Team</h3>
-                <p className="text-base text-gray-500 pb-4 max-w-2xl">
-                    Deleting this team will also remove all associated data with this team, including projects and
-                    workspaces. Deleted teams cannot be restored!
-                </p>
+            <OrgSettingsPage>
+                <Heading2>Organization Details</Heading2>
+                <Subheading className="max-w-2xl">Details of your organization within Gitpod.</Subheading>
+
+                {updateOrg.isError && (
+                    <Alert type="error" closable={true} className="mb-2 max-w-xl rounded-md">
+                        <span>Failed to update organization information: </span>
+                        <span>{updateOrg.error.message || "unknown error"}</span>
+                    </Alert>
+                )}
+                {updateTeamSettings.isError && (
+                    <Alert type="error" closable={true} className="mb-2 max-w-xl rounded-md">
+                        <span>Failed to update organization settings: </span>
+                        <span>{updateTeamSettings.error.message || "unknown error"}</span>
+                    </Alert>
+                )}
+                {updated && (
+                    <Alert type="message" closable={true} className="mb-2 max-w-xl rounded-md">
+                        Organization name has been updated.
+                    </Alert>
+                )}
+                <form onSubmit={updateTeamInformation}>
+                    <TextInputField
+                        label="Name"
+                        hint="The name of your company or organization"
+                        value={teamName}
+                        error={teamNameError.message}
+                        onChange={setTeamName}
+                        onBlur={teamNameError.onBlur}
+                    />
+
+                    <TextInputField
+                        label="Slug"
+                        hint="The slug will be used for easier signin and discovery"
+                        value={slug}
+                        error={slugError.message}
+                        onChange={setSlug}
+                        onBlur={slugError.onBlur}
+                    />
+
+                    <Button
+                        className="mt-4"
+                        htmlType="submit"
+                        disabled={(org?.name === teamName && org?.slug === slug) || !orgFormIsValid}
+                    >
+                        Update Organization
+                    </Button>
+
+                    <Heading2 className="pt-12">Collaboration & Sharing</Heading2>
+                    <CheckboxInputField
+                        label="Workspace Sharing"
+                        hint="Allow workspaces created within an Organization to share the workspace with any authenticated user."
+                        checked={!settings?.workspaceSharingDisabled}
+                        onChange={(checked) => handleUpdateTeamSettings({ workspaceSharingDisabled: !checked })}
+                        disabled={isLoading}
+                    />
+                </form>
+
+                <Heading2 className="pt-12">Delete Organization</Heading2>
+                <Subheading className="pb-4 max-w-2xl">
+                    Deleting this organization will also remove all associated data, including projects and workspaces.
+                    Deleted organizations cannot be restored!
+                </Subheading>
                 <button className="danger secondary" onClick={() => setModal(true)}>
-                    Delete Team
+                    Delete Organization
                 </button>
-            </PageWithSubMenu>
+            </OrgSettingsPage>
 
             <ConfirmationModal
                 title="Delete Team"
                 buttonText="Delete Team"
-                buttonDisabled={teamSlug !== team!.slug}
+                buttonDisabled={teamNameToDelete !== org?.name}
                 visible={modal}
-                warningText="Warning: This action cannot be reversed."
+                warningHead="Warning"
+                warningText="This action cannot be reversed."
                 onClose={close}
                 onConfirm={deleteTeam}
             >
                 <p className="text-base text-gray-500">
-                    You are about to permanently delete <b>{team?.slug}</b> including all associated data with this
-                    team.
+                    You are about to permanently delete <b>{org?.name}</b> including all associated data.
                 </p>
                 <ol className="text-gray-500 text-m list-outside list-decimal">
                     <li className="ml-5">
-                        All <b>projects</b> added in this team will be deleted and cannot be restored afterwards.
+                        All <b>projects</b> added in this organization will be deleted and cannot be restored
+                        afterwards.
                     </li>
                     <li className="ml-5">
-                        All <b>members</b> of this team will lose access to this team, associated projects and
-                        workspaces.
+                        All <b>members</b> of this organization will lose access to this organization, associated
+                        projects and workspaces.
                     </li>
                 </ol>
                 <p className="pt-4 pb-2 text-gray-600 dark:text-gray-400 text-base font-semibold">
-                    Type <code>{team?.slug}</code> to confirm
+                    Type <code>{org?.name}</code> to confirm
                 </p>
-                <input autoFocus className="w-full" type="text" onChange={(e) => setTeamSlug(e.target.value)}></input>
+                <input
+                    autoFocus
+                    className="w-full"
+                    type="text"
+                    onChange={(e) => setTeamNameToDelete(e.target.value)}
+                ></input>
             </ConfirmationModal>
         </>
     );

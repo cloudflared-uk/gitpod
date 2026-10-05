@@ -251,6 +251,14 @@ func (s *IDEServiceServer) ResolveWorkspaceConfig(ctx context.Context, req *api.
 	resp = &api.ResolveWorkspaceConfigResponse{
 		SupervisorImage: ideConfig.SupervisorImage,
 		WebImage:        defaultIde.Image,
+		IdeImageLayers:  defaultIde.ImageLayers,
+	}
+
+	if os.Getenv("CONFIGCAT_SDK_KEY") != "" {
+		resp.Envvars = append(resp.Envvars, &api.EnvironmentVariable{
+			Name:  "GITPOD_CONFIGCAT_ENABLED",
+			Value: "true",
+		})
 	}
 
 	var wsConfig *gitpodapi.GitpodConfig
@@ -320,39 +328,28 @@ func (s *IDEServiceServer) ResolveWorkspaceConfig(ctx context.Context, req *api.
 
 		// we always need WebImage for when the user chooses a desktop ide
 		resp.WebImage = getUserIDEImage(defaultIde)
+		resp.IdeImageLayers = getUserImageLayers(defaultIde)
 
 		var desktopImageLayer string
-		var userImageLayers []string
+		var desktopUserImageLayers []string
 		if chosenIDE.Type == config.IDETypeDesktop {
 			desktopImageLayer = getUserIDEImage(chosenIDE)
-			userImageLayers = getUserImageLayers(chosenIDE)
+			desktopUserImageLayers = getUserImageLayers(chosenIDE)
 		} else {
 			resp.WebImage = getUserIDEImage(chosenIDE)
+			resp.IdeImageLayers = getUserImageLayers(chosenIDE)
 		}
 
 		ideName, referrer := s.resolveReferrerIDE(ideConfig, wsContext, userIdeName)
 		if ideName != "" {
 			resp.RefererIde = ideName
 			desktopImageLayer = getUserIDEImage(referrer)
-			userImageLayers = getUserImageLayers(referrer)
+			desktopUserImageLayers = getUserImageLayers(referrer)
 		}
 
 		if desktopImageLayer != "" {
 			resp.IdeImageLayers = append(resp.IdeImageLayers, desktopImageLayer)
-			resp.IdeImageLayers = append(resp.IdeImageLayers, userImageLayers...)
-		}
-
-		if ideConfig.GpRunImage != "" {
-			featureFlagAttrs := experiments.Attributes{
-				UserID:    req.User.Id,
-				UserEmail: req.User.GetEmail(),
-			}
-			useRunGp := s.experiemntsClient.GetBoolValue(ctx, "ide_service_experimental_rungp", false, featureFlagAttrs)
-			log.WithField("featureFlagAttrs", featureFlagAttrs).WithField("useRunGp", useRunGp).Debug("calling configcat to check ide_service_experimental_rungp")
-			if useRunGp {
-				resp.IdeImageLayers = append(resp.IdeImageLayers, ideConfig.GpRunImage)
-				log.Debug("adding gp-run layer")
-			}
+			resp.IdeImageLayers = append(resp.IdeImageLayers, desktopUserImageLayers...)
 		}
 	}
 

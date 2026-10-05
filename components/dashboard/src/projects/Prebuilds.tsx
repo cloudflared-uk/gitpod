@@ -6,8 +6,7 @@
 
 import dayjs from "dayjs";
 import { PrebuildWithStatus, PrebuiltWorkspaceState, Project } from "@gitpod/gitpod-protocol";
-import { useContext, useEffect, useState } from "react";
-import { useLocation, useRouteMatch } from "react-router";
+import { useEffect, useState } from "react";
 import Header from "../components/Header";
 import DropDown, { DropDownEntry } from "../components/DropDown";
 import { ItemsList, Item, ItemField } from "../components/ItemsList";
@@ -18,26 +17,16 @@ import StatusCanceled from "../icons/StatusCanceled.svg";
 import StatusPaused from "../icons/StatusPaused.svg";
 import StatusRunning from "../icons/StatusRunning.svg";
 import { getGitpodService } from "../service/service";
-import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
 import { shortCommitMessage } from "./render-utils";
-import { Link } from "react-router-dom";
+import { Link, Redirect } from "react-router-dom";
 import { Disposable } from "vscode-jsonrpc";
-import { UserContext } from "../user-context";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { listAllProjects } from "../service/public-api";
+import { useCurrentProject } from "./project-context";
+import { getProjectTabs } from "./projects.routes";
+import search from "../icons/search.svg";
 
-export default function (props: { project?: Project; isAdminDashboard?: boolean }) {
-    const location = useLocation();
-
-    const { teams } = useContext(TeamsContext);
-    const { user } = useContext(UserContext);
-    const { usePublicApiProjectsService } = useContext(FeatureFlagContext);
-    const team = getCurrentTeam(location, teams);
-
-    const match = useRouteMatch<{ team: string; resource: string }>("/(t/)?:team/:resource");
-    const projectSlug = props.isAdminDashboard ? props.project?.slug : match?.params?.resource;
-
-    const [project, setProject] = useState<Project | undefined>();
+export default function PrebuildsPage(props: { project?: Project; isAdminDashboard?: boolean }) {
+    const currentProject = useCurrentProject();
+    const project = props.project || currentProject.project;
 
     const [searchFilter, setSearchFilter] = useState<string | undefined>();
     const [statusFilter, setStatusFilter] = useState<PrebuiltWorkspaceState | undefined>();
@@ -48,11 +37,6 @@ export default function (props: { project?: Project; isAdminDashboard?: boolean 
 
     useEffect(() => {
         let registration: Disposable;
-        // Props come from the Admin dashboard and we do not need
-        // the variables generated from route or location
-        if (props.project) {
-            setProject(props.project);
-        }
         if (!project) {
             return;
         }
@@ -83,31 +67,7 @@ export default function (props: { project?: Project; isAdminDashboard?: boolean 
                 registration.dispose();
             };
         }
-    }, [project]);
-
-    useEffect(() => {
-        if (!teams) {
-            return;
-        }
-        (async () => {
-            let projects: Project[];
-            if (!!team) {
-                projects = usePublicApiProjectsService
-                    ? await listAllProjects({ teamId: team.id })
-                    : await getGitpodService().server.getTeamProjects(team.id);
-            } else {
-                projects = usePublicApiProjectsService
-                    ? await listAllProjects({ userId: user?.id })
-                    : await getGitpodService().server.getUserProjects();
-            }
-            const newProject =
-                projectSlug && projects.find((p) => (p.slug ? p.slug === projectSlug : p.name === projectSlug));
-
-            if (newProject) {
-                setProject(newProject);
-            }
-        })();
-    }, [projectSlug, team, teams]);
+    }, [project, props]);
 
     useEffect(() => {
         if (prebuilds.length === 0) {
@@ -169,36 +129,37 @@ export default function (props: { project?: Project; isAdminDashboard?: boolean 
         return date ? dayjs(date).fromNow() : "";
     };
 
+    if (!currentProject.loading && !project) {
+        return <Redirect to="/projects" />;
+    }
+
     return (
         <>
             {!props.isAdminDashboard && (
-                <Header title="Prebuilds" subtitle={`View recent prebuilds for active branches.`} />
+                <Header
+                    title={project?.name || "Unknown project"}
+                    subtitle={`View recent prebuilds for active branches.`}
+                    tabs={getProjectTabs(project)}
+                />
             )}
             <div className={props.isAdminDashboard ? "" : "app-container"}>
-                <div className={props.isAdminDashboard ? "flex" : "flex mt-8"}>
-                    <div className="flex">
-                        <div className="py-4">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                fill="none"
-                                viewBox="0 0 16 16"
-                                width="16"
-                                height="16"
-                            >
-                                <path
-                                    fill="#A8A29E"
-                                    d="M6 2a4 4 0 100 8 4 4 0 000-8zM0 6a6 6 0 1110.89 3.477l4.817 4.816a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 010 6z"
-                                />
-                            </svg>
-                        </div>
+                <div className={props.isAdminDashboard ? "flex" : "flex pt-2"}>
+                    <div className="flex relative h-10 my-auto">
+                        <img
+                            src={search}
+                            title="Search"
+                            className="filter-grayscale absolute top-3 left-3"
+                            alt="search icon"
+                        />
                         <input
                             type="search"
+                            className="w-64 pl-9 border-0"
                             placeholder="Search Prebuilds"
                             onChange={(e) => setSearchFilter(e.target.value)}
                         />
                     </div>
                     <div className="flex-1" />
-                    <div className="py-3 pl-3">
+                    <div className="py-2 pl-3">
                         <DropDown prefix="Prebuild Status: " customClasses="w-32" entries={statusFilterEntries()} />
                     </div>
                     {!props.isAdminDashboard && (
@@ -236,10 +197,7 @@ export default function (props: { project?: Project; isAdminDashboard?: boolean 
                         .filter(filter)
                         .sort(prebuildSorter)
                         .map((p, index) => (
-                            <Link
-                                to={`/${!!team ? "t/" + team.slug : "projects"}/${projectSlug}/${p.info.id}`}
-                                className="cursor-pointer"
-                            >
+                            <Link to={`/projects/${Project.slug(project!)}/${p.info.id}`} className="cursor-pointer">
                                 <Item key={`prebuild-${p.info.id}`}>
                                     <ItemField
                                         className={`flex items-center my-auto md:w-3/12 xl:w-4/12 ${

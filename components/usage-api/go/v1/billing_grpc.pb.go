@@ -1,4 +1,4 @@
-// Copyright (c) 2022 Gitpod GmbH. All rights reserved.
+// Copyright (c) 2023 Gitpod GmbH. All rights reserved.
 // Licensed under the GNU Affero General Public License (AGPL).
 // See License.AGPL.txt in the project root for license information.
 
@@ -39,9 +39,10 @@ type BillingServiceClient interface {
 	GetStripeCustomer(ctx context.Context, in *GetStripeCustomerRequest, opts ...grpc.CallOption) (*GetStripeCustomerResponse, error)
 	CreateStripeCustomer(ctx context.Context, in *CreateStripeCustomerRequest, opts ...grpc.CallOption) (*CreateStripeCustomerResponse, error)
 	CreateStripeSubscription(ctx context.Context, in *CreateStripeSubscriptionRequest, opts ...grpc.CallOption) (*CreateStripeSubscriptionResponse, error)
-	// GetStripeSubscription without passing in the `status` will return uncancelled subscriptions
-	// Stripe returns a list which may include more than one, but we will throw an error in that case
-	GetStripeSubscription(ctx context.Context, in *GetStripeSubscriptionRequest, opts ...grpc.CallOption) (*GetStripeSubscriptionResponse, error)
+	// GetPriceInformation returns the price information for a given attribtion id
+	GetPriceInformation(ctx context.Context, in *GetPriceInformationRequest, opts ...grpc.CallOption) (*GetPriceInformationResponse, error)
+	// OnChargeDispute handles charge disputes created with the underlying payment provider.
+	OnChargeDispute(ctx context.Context, in *OnChargeDisputeRequest, opts ...grpc.CallOption) (*OnChargeDisputeResponse, error)
 }
 
 type billingServiceClient struct {
@@ -106,9 +107,18 @@ func (c *billingServiceClient) CreateStripeSubscription(ctx context.Context, in 
 	return out, nil
 }
 
-func (c *billingServiceClient) GetStripeSubscription(ctx context.Context, in *GetStripeSubscriptionRequest, opts ...grpc.CallOption) (*GetStripeSubscriptionResponse, error) {
-	out := new(GetStripeSubscriptionResponse)
-	err := c.cc.Invoke(ctx, "/usage.v1.BillingService/GetStripeSubscription", in, out, opts...)
+func (c *billingServiceClient) GetPriceInformation(ctx context.Context, in *GetPriceInformationRequest, opts ...grpc.CallOption) (*GetPriceInformationResponse, error) {
+	out := new(GetPriceInformationResponse)
+	err := c.cc.Invoke(ctx, "/usage.v1.BillingService/GetPriceInformation", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *billingServiceClient) OnChargeDispute(ctx context.Context, in *OnChargeDisputeRequest, opts ...grpc.CallOption) (*OnChargeDisputeResponse, error) {
+	out := new(OnChargeDisputeResponse)
+	err := c.cc.Invoke(ctx, "/usage.v1.BillingService/OnChargeDispute", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -132,9 +142,10 @@ type BillingServiceServer interface {
 	GetStripeCustomer(context.Context, *GetStripeCustomerRequest) (*GetStripeCustomerResponse, error)
 	CreateStripeCustomer(context.Context, *CreateStripeCustomerRequest) (*CreateStripeCustomerResponse, error)
 	CreateStripeSubscription(context.Context, *CreateStripeSubscriptionRequest) (*CreateStripeSubscriptionResponse, error)
-	// GetStripeSubscription without passing in the `status` will return uncancelled subscriptions
-	// Stripe returns a list which may include more than one, but we will throw an error in that case
-	GetStripeSubscription(context.Context, *GetStripeSubscriptionRequest) (*GetStripeSubscriptionResponse, error)
+	// GetPriceInformation returns the price information for a given attribtion id
+	GetPriceInformation(context.Context, *GetPriceInformationRequest) (*GetPriceInformationResponse, error)
+	// OnChargeDispute handles charge disputes created with the underlying payment provider.
+	OnChargeDispute(context.Context, *OnChargeDisputeRequest) (*OnChargeDisputeResponse, error)
 	mustEmbedUnimplementedBillingServiceServer()
 }
 
@@ -160,8 +171,11 @@ func (UnimplementedBillingServiceServer) CreateStripeCustomer(context.Context, *
 func (UnimplementedBillingServiceServer) CreateStripeSubscription(context.Context, *CreateStripeSubscriptionRequest) (*CreateStripeSubscriptionResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateStripeSubscription not implemented")
 }
-func (UnimplementedBillingServiceServer) GetStripeSubscription(context.Context, *GetStripeSubscriptionRequest) (*GetStripeSubscriptionResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method GetStripeSubscription not implemented")
+func (UnimplementedBillingServiceServer) GetPriceInformation(context.Context, *GetPriceInformationRequest) (*GetPriceInformationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetPriceInformation not implemented")
+}
+func (UnimplementedBillingServiceServer) OnChargeDispute(context.Context, *OnChargeDisputeRequest) (*OnChargeDisputeResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method OnChargeDispute not implemented")
 }
 func (UnimplementedBillingServiceServer) mustEmbedUnimplementedBillingServiceServer() {}
 
@@ -284,20 +298,38 @@ func _BillingService_CreateStripeSubscription_Handler(srv interface{}, ctx conte
 	return interceptor(ctx, in, info, handler)
 }
 
-func _BillingService_GetStripeSubscription_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(GetStripeSubscriptionRequest)
+func _BillingService_GetPriceInformation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetPriceInformationRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(BillingServiceServer).GetStripeSubscription(ctx, in)
+		return srv.(BillingServiceServer).GetPriceInformation(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: "/usage.v1.BillingService/GetStripeSubscription",
+		FullMethod: "/usage.v1.BillingService/GetPriceInformation",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(BillingServiceServer).GetStripeSubscription(ctx, req.(*GetStripeSubscriptionRequest))
+		return srv.(BillingServiceServer).GetPriceInformation(ctx, req.(*GetPriceInformationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _BillingService_OnChargeDispute_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(OnChargeDisputeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BillingServiceServer).OnChargeDispute(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/usage.v1.BillingService/OnChargeDispute",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BillingServiceServer).OnChargeDispute(ctx, req.(*OnChargeDisputeRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -334,8 +366,12 @@ var BillingService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _BillingService_CreateStripeSubscription_Handler,
 		},
 		{
-			MethodName: "GetStripeSubscription",
-			Handler:    _BillingService_GetStripeSubscription_Handler,
+			MethodName: "GetPriceInformation",
+			Handler:    _BillingService_GetPriceInformation_Handler,
+		},
+		{
+			MethodName: "OnChargeDispute",
+			Handler:    _BillingService_OnChargeDispute_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

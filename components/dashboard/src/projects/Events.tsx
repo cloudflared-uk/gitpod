@@ -6,33 +6,21 @@
 
 import dayjs from "dayjs";
 import { PrebuildEvent, Project } from "@gitpod/gitpod-protocol";
-import { useContext, useEffect, useState } from "react";
-import { useLocation, useRouteMatch } from "react-router";
+import { useCallback, useEffect, useState } from "react";
 import Header from "../components/Header";
 import { ItemsList, Item, ItemField } from "../components/ItemsList";
 import { getGitpodService } from "../service/service";
-import { TeamsContext, getCurrentTeam } from "../teams/teams-context";
-import { toRemoteURL } from "./render-utils";
 import Spinner from "../icons/Spinner.svg";
 import NoAccess from "../icons/NoAccess.svg";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { openAuthorizeWindow } from "../provider-utils";
-import { UserContext } from "../user-context";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { listAllProjects } from "../service/public-api";
+import { useCurrentProject } from "./project-context";
+import { toRemoteURL } from "./render-utils";
+import { Redirect } from "react-router";
+import { Subheading } from "../components/typography/headings";
 
-export default function () {
-    const location = useLocation();
-
-    const { teams } = useContext(TeamsContext);
-    const { user } = useContext(UserContext);
-    const { usePublicApiProjectsService } = useContext(FeatureFlagContext);
-    const team = getCurrentTeam(location, teams);
-
-    const match = useRouteMatch<{ team: string; resource: string }>("/(t/)?:team/:resource");
-    const projectSlug = match?.params?.resource;
-
-    const [project, setProject] = useState<Project | undefined>();
+export default function EventsPage() {
+    const { project, loading } = useCurrentProject();
 
     const [isLoadingEvents, setIsLoadingEvents] = useState<boolean>(false);
     const [events, setEvents] = useState<PrebuildEvent[]>([]);
@@ -41,9 +29,18 @@ export default function () {
 
     const [showAuthBanner, setShowAuthBanner] = useState<{ host: string } | undefined>(undefined);
 
-    useEffect(() => {
-        updateProject();
-    }, [teams]);
+    const updatePrebuildEvents = useCallback(async () => {
+        if (!project) {
+            return;
+        }
+        setIsLoadingEvents(true);
+        try {
+            const events = await getGitpodService().server.getPrebuildEvents(project.id);
+            setEvents(events);
+        } finally {
+            setIsLoadingEvents(false);
+        }
+    }, [project]);
 
     useEffect(() => {
         if (!project) {
@@ -60,45 +57,7 @@ export default function () {
                 }
             }
         })();
-    }, [project]);
-
-    const updateProject = async () => {
-        if (!teams || !projectSlug) {
-            return;
-        }
-        let projects: Project[];
-        if (!!team) {
-            projects = usePublicApiProjectsService
-                ? await listAllProjects({ teamId: team.id })
-                : await getGitpodService().server.getTeamProjects(team.id);
-        } else {
-            projects = usePublicApiProjectsService
-                ? await listAllProjects({ userId: user?.id })
-                : await getGitpodService().server.getUserProjects();
-        }
-
-        // Find project matching with slug, otherwise with name
-        const project = projectSlug && projects.find((p) => (p.slug ? p.slug === projectSlug : p.name === projectSlug));
-
-        if (!project) {
-            return;
-        }
-
-        setProject(project);
-    };
-
-    const updatePrebuildEvents = async () => {
-        if (!project) {
-            return;
-        }
-        setIsLoadingEvents(true);
-        try {
-            const events = await getGitpodService().server.getPrebuildEvents(project.id);
-            setEvents(events);
-        } finally {
-            setIsLoadingEvents(false);
-        }
-    };
+    }, [project, updatePrebuildEvents]);
 
     const tryAuthorize = async (host: string, onSuccess: () => void) => {
         try {
@@ -145,18 +104,22 @@ export default function () {
         return event.status;
     };
 
+    if (!loading && !project) {
+        return <Redirect to="/projects" />;
+    }
+
     return (
         <>
             <Header
                 title="Prebuild Events"
                 subtitle={
-                    <h2 className="tracking-wide">
+                    <Subheading tracking="wide">
                         View recent prebuild events for{" "}
                         <a className="gp-link" href={project?.cloneUrl!}>
                             {toRemoteURL(project?.cloneUrl || "")}
                         </a>
                         .
-                    </h2>
+                    </Subheading>
                 }
             />
             <div className="app-container">
@@ -217,7 +180,7 @@ export default function () {
                             </Item>
                             {isLoadingEvents && (
                                 <div className="flex items-center justify-center space-x-2 text-gray-400 text-sm pt-16 pb-40">
-                                    <img className="h-4 w-4 animate-spin" src={Spinner} />
+                                    <img className="h-4 w-4 animate-spin" src={Spinner} alt="loading spinner" />
                                     <span>Fetching Prebuild Events...</span>
                                 </div>
                             )}
@@ -246,9 +209,7 @@ export default function () {
                                                 {event.prebuildId && (
                                                     <a
                                                         className="text-base text-gray-900 dark:text-gray-50 font-medium uppercase mb-1 cursor-pointer"
-                                                        href={`/${
-                                                            !!team ? "t/" + team.slug : "projects"
-                                                        }/${projectSlug}/${event.prebuildId}`}
+                                                        href={`/projects/${Project.slug(project!)}/${event.prebuildId}`}
                                                     >
                                                         {<>{status}</>}
                                                     </a>

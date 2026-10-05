@@ -16,6 +16,7 @@ const (
 	licenseFilePath                        = "/gitpod/license"
 	chargebeeMountPath                     = "/chargebee"
 	stripeSecretMountPath                  = "/stripe-secret"
+	linkedInSecretMountPath                = "/linkedin-secret"
 	githubAppCertSecret                    = "github-app-cert-secret"
 	IAMSessionPort                         = common.ServerIAMSessionPort
 	IAMSessionPortName                     = "session"
@@ -25,4 +26,11 @@ const (
 	DebugNodePortName                      = "debugnode"
 	ServicePort                            = 3000
 	personalAccessTokenSigningKeyMountPath = "/secrets/personal-access-token-signing-key"
+
+	AdminCredentialsSecretName      = "admin-credentials"
+	AdminCredentialsSecretMountPath = "/credentials/admin"
+	AdminCredentialsSecretKey       = "admin.json"
+
+	GRPCAPIName = "grpc"
+	GRPCAPIPort = common.ServerGRPCAPIPort
 )

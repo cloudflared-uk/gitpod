@@ -40,8 +40,8 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/quota"
 )
 
-// Metrics combine custom metrics exported by WorkspaceService
-type metrics struct {
+// Metrics combine custom Metrics exported by WorkspaceService
+type Metrics struct {
 	BackupWaitingTimeHist       prometheus.Histogram
 	BackupWaitingTimeoutCounter prometheus.Counter
 	InitializerHistogram        *prometheus.HistogramVec
@@ -56,7 +56,7 @@ type WorkspaceService struct {
 	stopService context.CancelFunc
 	runtime     container.Runtime
 
-	metrics *metrics
+	metrics *Metrics
 
 	// channel to limit the number of concurrent backups and uploads.
 	backupWorkspaceLimiter chan struct{}
@@ -69,7 +69,7 @@ type WorkspaceService struct {
 type WorkspaceExistenceCheck func(instanceID string) bool
 
 // NewWorkspaceService creates a new workspce initialization service, starts housekeeping and the Prometheus integration
-func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace string, runtime container.Runtime, wec WorkspaceExistenceCheck, uidmapper *iws.Uidmapper, cgroupMountPoint string, reg prometheus.Registerer) (res *WorkspaceService, err error) {
+func NewWorkspaceService(ctx context.Context, cfg Config, runtime container.Runtime, wec WorkspaceExistenceCheck, uidmapper *iws.Uidmapper, cgroupMountPoint string, reg prometheus.Registerer, workspaceCIDR string) (res *WorkspaceService, err error) {
 	//nolint:ineffassign
 	span, ctx := opentracing.StartSpanFromContext(ctx, "NewWorkspaceService")
 	defer tracing.FinishSpan(span, &err)
@@ -86,7 +86,9 @@ func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace st
 	}
 
 	// read all session json files
-	store, err := session.NewStore(ctx, cfg.WorkingArea, workspaceLifecycleHooks(cfg, kubernetesNamespace, wec, uidmapper, xfs, cgroupMountPoint))
+	store, err := session.NewStore(ctx, cfg.WorkingArea,
+		WorkspaceLifecycleHooks(cfg, workspaceCIDR, wec, uidmapper, xfs, cgroupMountPoint),
+	)
 	if err != nil {
 		return nil, xerrors.Errorf("cannot create session store: %w", err)
 	}
@@ -96,17 +98,9 @@ func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace st
 		return nil, xerrors.Errorf("cannot register Prometheus gauge for working area diskspace: %w", err)
 	}
 
-	waitingTimeHist, err := registerConcurrentBackupWaitingTime(reg)
+	waitingTimeHist, waitingTimeoutCounter, err := RegisterConcurrentBackupMetrics(reg, "")
 	if err != nil {
-		return nil, xerrors.Errorf("cannot register Prometheus histogram for backup waiting time: %w", err)
-	}
-	waitingTimeoutCounter := prometheus.NewCounter(prometheus.CounterOpts{
-		Name: "concurrent_backup_waiting_timeout_total",
-		Help: "total count of backup rate limiting timeouts",
-	})
-	err = reg.Register(waitingTimeoutCounter)
-	if err != nil {
-		return nil, xerrors.Errorf("cannot register Prometheus counter for backup waiting timeouts: %w", err)
+		return nil, err
 	}
 
 	initializerHistogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
@@ -127,7 +121,7 @@ func NewWorkspaceService(ctx context.Context, cfg Config, kubernetesNamespace st
 		stopService: stopService,
 		runtime:     runtime,
 
-		metrics: &metrics{
+		metrics: &Metrics{
 			BackupWaitingTimeHist:       waitingTimeHist,
 			BackupWaitingTimeoutCounter: waitingTimeoutCounter,
 			InitializerHistogram:        initializerHistogram,
@@ -158,19 +152,28 @@ func registerWorkingAreaDiskspaceGauge(workingArea string, reg prometheus.Regist
 	}))
 }
 
-func registerConcurrentBackupWaitingTime(reg prometheus.Registerer) (prometheus.Histogram, error) {
+func RegisterConcurrentBackupMetrics(reg prometheus.Registerer, suffix string) (prometheus.Histogram, prometheus.Counter, error) {
 	backupWaitingTime := prometheus.NewHistogram(prometheus.HistogramOpts{
-		Name:    "concurrent_backup_waiting_seconds",
+		Name:    "concurrent_backup_waiting_seconds" + suffix,
 		Help:    "waiting time for concurrent backups to finish",
 		Buckets: []float64{5, 10, 30, 60, 120, 180, 300, 600, 1800},
 	})
 
 	err := reg.Register(backupWaitingTime)
 	if err != nil {
-		return nil, err
+		return nil, nil, xerrors.Errorf("cannot register Prometheus histogram for backup waiting time: %w", err)
 	}
 
-	return backupWaitingTime, nil
+	waitingTimeoutCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "concurrent_backup_waiting_timeout_total" + suffix,
+		Help: "total count of backup rate limiting timeouts",
+	})
+	err = reg.Register(waitingTimeoutCounter)
+	if err != nil {
+		return nil, nil, xerrors.Errorf("cannot register Prometheus counter for backup waiting timeouts: %w", err)
+	}
+
+	return backupWaitingTime, waitingTimeoutCounter, nil
 }
 
 // Start starts this workspace service and returns when the service gets stopped.
@@ -252,7 +255,7 @@ func (s *WorkspaceService) InitWorkspace(ctx context.Context, req *api.InitWorks
 				return nil, status.Error(codes.Internal, "no presigned storage available")
 			}
 
-			remoteContent, err = collectRemoteContent(ctx, rs, ps, workspace.Owner, req.Initializer)
+			remoteContent, err = CollectRemoteContent(ctx, rs, ps, workspace.Owner, req.Initializer)
 			if err != nil && errors.Is(err, errCannotFindSnapshot) {
 				log.WithError(err).Error("cannot find snapshot")
 				return nil, status.Error(codes.NotFound, "cannot find snapshot")

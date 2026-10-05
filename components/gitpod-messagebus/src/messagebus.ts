@@ -10,7 +10,7 @@ import { Disposable } from "@gitpod/gitpod-protocol";
 import { log } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { MessagebusConfiguration } from "./config";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
-import { globalTracer, FORMAT_HTTP_HEADERS, childOf } from "opentracing";
+import { globalTracer, FORMAT_HTTP_HEADERS } from "opentracing";
 import { CancellationToken } from "vscode-jsonrpc/lib/cancellation";
 
 export type WorkspaceSubtopic = "updates" | "log" | "credit" | "headless-log" | "ports";
@@ -61,8 +61,6 @@ export interface MessageBusHelper {
      * @param topic the topic to parse
      */
     getWsInformationFromTopic(topic: string): WorkspaceTopic | undefined;
-
-    getSubscriptionUpdateTopic(attributionId?: string): string;
 }
 
 export const WorkspaceTopic = Symbol("WorkspaceTopic");
@@ -89,10 +87,6 @@ export class MessageBusHelperImpl implements MessageBusHelper {
      */
     async assertWorkspaceExchange(ch: Channel): Promise<void> {
         await ch.assertExchange(this.workspaceExchange, "topic", { durable: true });
-    }
-
-    getSubscriptionUpdateTopic(attributionId: string | undefined): string {
-        return `subscription.${attributionId || "*"}.update`;
     }
 
     /**
@@ -540,22 +534,11 @@ export abstract class AbstractTopicListener<T> implements MessagebusListener {
         }
 
         if (msg) {
-            const spanCtx = globalTracer().extract(FORMAT_HTTP_HEADERS, message.properties.headers);
-            let span;
-            if (!!spanCtx && !!spanCtx.toTraceId()) {
-                span = globalTracer().startSpan(`/messagebus/${this.exchangeName}`, {
-                    references: [childOf(spanCtx!)],
-                });
-            }
-
+            // gpl: We decided against tracing here because of the low signal/noise ratio (see history)
             try {
-                this.listener({ span }, msg, message.fields.routingKey);
+                this.listener({}, msg, message.fields.routingKey);
             } catch (e) {
                 log.error("Error while executing message handler", e, { message });
-            } finally {
-                if (span) {
-                    span.finish();
-                }
             }
         }
     }

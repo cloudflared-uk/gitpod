@@ -37,9 +37,10 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 			ForUsers:            1_000_000_000,
 			MinForUsersOnStripe: 0,
 		},
+		ServerAddress: common.ClusterAddress(common.ServerComponent, ctx.Namespace, common.ServerGRPCAPIPort),
 	}
 
-	expWebAppConfig := getExperimentalWebAppConfig(ctx)
+	expWebAppConfig := common.ExperimentalWebappConfig(ctx)
 	if expWebAppConfig != nil && expWebAppConfig.Stripe != nil {
 		cfg.StripePrices = stripe.StripePrices{
 			IndividualUsagePriceIDs: stripe.PriceConfig{

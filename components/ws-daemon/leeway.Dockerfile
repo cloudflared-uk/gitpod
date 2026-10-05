@@ -2,10 +2,10 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License.AGPL.txt in the project root for license information.
 
-FROM alpine:3.16 as dl
+FROM cgr.dev/chainguard/wolfi-base@sha256:ad3c07c4f23df2a8082beae4636025dba212b4495aa9faa0b5d8acda914a2673 as dl
 WORKDIR /dl
 RUN apk add --no-cache curl file \
-  && curl -OsSL https://github.com/opencontainers/runc/releases/download/v1.1.4/runc.amd64 \
+  && curl -OsSL https://github.com/opencontainers/runc/releases/download/v1.1.6/runc.amd64 \
   && chmod +x runc.amd64 \
   && if ! file runc.amd64 | grep -iq "ELF 64-bit LSB executable"; then echo "runc.amd64 is not a binary file"; exit 1;fi
 
@@ -55,7 +55,6 @@ RUN groupadd -r -g 33333 gitpod \
 COPY components-ws-daemon--app/ws-daemon /app/ws-daemond
 COPY components-ws-daemon--content-initializer/ws-daemon /app/content-initializer
 COPY components-ws-daemon-nsinsider--app/nsinsider /app/nsinsider
-COPY dev-ready-probe-labeler--app/ready-probe-labeler /app/ready-probe-labeler
 
 COPY default.gitconfig /etc/gitconfig
 COPY default.gitconfig /home/gitpod/.gitconfig

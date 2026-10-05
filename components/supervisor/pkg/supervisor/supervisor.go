@@ -31,7 +31,6 @@ import (
 	"syscall"
 	"time"
 
-	grpc_proxy "github.com/adamthesax/grpc-proxy/proxy"
 	"github.com/gorilla/websocket"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_logrus "github.com/grpc-ecosystem/go-grpc-middleware/logging/logrus"
@@ -43,10 +42,7 @@ import (
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/emptypb"
 
 	"github.com/gitpod-io/gitpod/common-go/analytics"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -77,6 +73,7 @@ const (
 	gitpodGID       = 33333
 	gitpodGroupName = "gitpod"
 	desktopIDEPort  = 24000
+	debugProxyPort  = 23003
 )
 
 var (
@@ -152,6 +149,8 @@ func (s IDEKind) String() string {
 	return "unknown"
 }
 
+var childProcEnvvars []string
+
 // Run serves as main entrypoint to the supervisor.
 func Run(options ...RunOption) {
 	exitCode := 0
@@ -185,14 +184,18 @@ func Run(options ...RunOption) {
 
 	// BEWARE: we can only call buildChildProcEnv once, because it might download env vars from a one-time-secret
 	//         URL, which would fail if we tried another time.
-	childProcEnvvars := buildChildProcEnv(cfg, nil, opts.RunGP)
+	childProcEnvvars = buildChildProcEnv(cfg, nil, opts.RunGP)
 
 	err = AddGitpodUserIfNotExists()
 	if err != nil {
 		log.WithError(err).Fatal("cannot ensure Gitpod user exists")
 	}
 	symlinkBinaries(cfg)
-	configureGit(cfg, childProcEnvvars)
+
+	configureGit(cfg)
+
+	telemetry := analytics.NewFromEnvironment()
+	defer telemetry.Close()
 
 	tokenService := NewInMemoryTokenService()
 
@@ -235,6 +238,9 @@ func Run(options ...RunOption) {
 	if cfg.DesktopIDE != nil {
 		internalPorts = append(internalPorts, desktopIDEPort)
 	}
+	if cfg.isDebugWorkspace() {
+		internalPorts = append(internalPorts, debugProxyPort)
+	}
 
 	endpoint, host, err := cfg.GitpodAPIEndpoint()
 	if err != nil {
@@ -256,19 +262,21 @@ func Run(options ...RunOption) {
 			Endpoint:          endpoint,
 			InstanceID:        cfg.WorkspaceInstanceID,
 			WorkspaceID:       cfg.WorkspaceID,
+			OwnerID:           cfg.OwnerId,
 			SupervisorVersion: Version,
+			ConfigcatEnabled:  cfg.ConfigcatEnabled,
 		}, tokenService)
 	}
 
 	if cfg.DesktopIDE != nil {
 		desktopIdeReady = &ideReadyState{cond: sync.NewCond(&sync.Mutex{})}
 	}
-	if !cfg.isHeadless() && !opts.RunGP {
-		go trackReadiness(ctx, gitpodService, cfg, cstate, ideReady, desktopIdeReady)
+	if !cfg.isHeadless() && !opts.RunGP && !cfg.isDebugWorkspace() {
+		go trackReadiness(ctx, telemetry, cfg, cstate, ideReady, desktopIdeReady)
 	}
 	tokenService.provider[KindGit] = []tokenProvider{NewGitTokenProvider(gitpodService, cfg.WorkspaceConfig, notificationService)}
 
-	gitpodConfigService := config.NewConfigService(cfg.RepoRoot+"/.gitpod.yml", cstate.ContentReady(), log.Log)
+	gitpodConfigService := config.NewConfigService(cfg.RepoRoot+"/.gitpod.yml", cstate.ContentReady())
 	go gitpodConfigService.Watch(ctx)
 
 	var exposedPorts ports.ExposedPortsInterface
@@ -288,29 +296,28 @@ func Run(options ...RunOption) {
 	)
 
 	topService := NewTopService()
+	if !opts.RunGP {
+		topService.Observe(ctx)
+	}
+
+	if !cfg.isHeadless() && !opts.RunGP {
+		go analyseConfigChanges(ctx, cfg, telemetry, gitpodConfigService)
+		go analysePerfChanges(ctx, cfg, telemetry, topService)
+	}
 
 	supervisorMetrics := metrics.NewMetrics()
 	var metricsReporter *metrics.GrpcMetricsReporter
-	if opts.RunGP {
-		cstate.MarkContentReady(csapi.WorkspaceInitFromOther)
-	} else {
-		topService.Observe(ctx)
-
-		if !cfg.isHeadless() && !opts.RunGP {
-			go startAnalyze(ctx, cfg, gitpodConfigService, topService, gitpodService)
-		}
-		if !strings.Contains("ephemeral", cfg.WorkspaceClusterHost) {
-			_, gitpodHost, err := cfg.GitpodAPIEndpoint()
-			if err != nil {
-				log.WithError(err).Error("grpc metrics: failed to parse gitpod host")
-			} else {
-				metricsReporter = metrics.NewGrpcMetricsReporter(gitpodHost)
-				if err := supervisorMetrics.Register(metricsReporter.Registry); err != nil {
-					log.WithError(err).Error("could not register supervisor metrics")
-				}
-				if err := gitpodService.RegisterMetrics(metricsReporter.Registry); err != nil {
-					log.WithError(err).Error("could not register public api metrics")
-				}
+	if !opts.RunGP && !cfg.isDebugWorkspace() && !strings.Contains("ephemeral", cfg.WorkspaceClusterHost) {
+		_, gitpodHost, err := cfg.GitpodAPIEndpoint()
+		if err != nil {
+			log.WithError(err).Error("grpc metrics: failed to parse gitpod host")
+		} else {
+			metricsReporter = metrics.NewGrpcMetricsReporter(gitpodHost)
+			if err := supervisorMetrics.Register(metricsReporter.Registry); err != nil {
+				log.WithError(err).Error("could not register supervisor metrics")
+			}
+			if err := gitpodService.RegisterMetrics(metricsReporter.Registry); err != nil {
+				log.WithError(err).Error("could not register public api metrics")
 			}
 		}
 	}
@@ -338,8 +345,10 @@ func Run(options ...RunOption) {
 
 	taskManager := newTasksManager(cfg, termMuxSrv, cstate, nil, ideReady, desktopIdeReady)
 
+	willShutdownCtx, fireWillShutdown := context.WithCancel(ctx)
 	apiServices := []RegisterableService{
 		&statusService{
+			willShutdownCtx: willShutdownCtx,
 			ContentState:    cstate,
 			Ports:           portMgmt,
 			Tasks:           taskManager,
@@ -356,18 +365,18 @@ func Run(options ...RunOption) {
 	}
 	apiServices = append(apiServices, additionalServices...)
 
-	if !cfg.isHeadless() {
+	if !cfg.isPrebuild() {
 		// We need to checkout dotfiles first, because they may be changing the path which affects the IDE.
 		// TODO(cw): provide better feedback if the IDE start fails because of the dotfiles (provide any feedback at all).
-		installDotfiles(ctx, cfg, tokenService, childProcEnvvars)
+		installDotfiles(ctx, cfg, tokenService)
 	}
 
 	var ideWG sync.WaitGroup
 	ideWG.Add(1)
-	go startAndWatchIDE(ctx, cfg, &cfg.IDE, childProcEnvvars, &ideWG, cstate, ideReady, WebIDE, supervisorMetrics)
+	go startAndWatchIDE(ctx, cfg, &cfg.IDE, &ideWG, cstate, ideReady, WebIDE, supervisorMetrics)
 	if cfg.DesktopIDE != nil {
 		ideWG.Add(1)
-		go startAndWatchIDE(ctx, cfg, cfg.DesktopIDE, childProcEnvvars, &ideWG, cstate, desktopIdeReady, DesktopIDE, supervisorMetrics)
+		go startAndWatchIDE(ctx, cfg, cfg.DesktopIDE, &ideWG, cstate, desktopIdeReady, DesktopIDE, supervisorMetrics)
 	}
 
 	var (
@@ -375,16 +384,20 @@ func Run(options ...RunOption) {
 		shutdown = make(chan ShutdownReason, 1)
 	)
 
-	if !opts.RunGP {
+	if opts.RunGP {
+		cstate.MarkContentReady(csapi.WorkspaceInitFromOther)
+	} else if cfg.isDebugWorkspace() {
+		cstate.MarkContentReady(cfg.GetDebugWorkspaceContentSource())
+	} else {
 		wg.Add(1)
 		go startContentInit(ctx, cfg, &wg, cstate, supervisorMetrics)
 	}
 
 	wg.Add(1)
-	go startAPIEndpoint(ctx, cfg, &wg, apiServices, tunneledPortsService, metricsReporter, opts.RunGP, apiEndpointOpts...)
+	go startAPIEndpoint(ctx, cfg, &wg, apiServices, tunneledPortsService, metricsReporter, apiEndpointOpts...)
 
 	wg.Add(1)
-	go startSSHServer(ctx, cfg, &wg, childProcEnvvars)
+	go startSSHServer(ctx, cfg, &wg)
 
 	wg.Add(1)
 	tasksSuccessChan := make(chan taskSuccess, 1)
@@ -392,7 +405,7 @@ func Run(options ...RunOption) {
 
 	if !opts.RunGP {
 		wg.Add(1)
-		go socketActivationForDocker(ctx, &wg, termMux)
+		go socketActivationForDocker(ctx, &wg, termMux, cfg, telemetry)
 	}
 
 	if cfg.isHeadless() {
@@ -414,7 +427,7 @@ func Run(options ...RunOption) {
 		}()
 	}
 
-	if !cfg.isHeadless() && !opts.RunGP {
+	if !cfg.isPrebuild() && !opts.RunGP && !cfg.isDebugWorkspace() {
 		go func() {
 			for _, repoRoot := range strings.Split(cfg.RepoRoots, ",") {
 				<-cstate.ContentReady()
@@ -425,12 +438,11 @@ func Run(options ...RunOption) {
 					log.Debugf("unshallow of local repository took %v", time.Since(start))
 				}()
 
-				if !isShallowRepository(repoRoot, childProcEnvvars) {
+				if !isShallowRepository(repoRoot) {
 					return
 				}
 
 				cmd := runAsGitpodUser(exec.Command("git", "fetch", "--unshallow", "--tags"))
-				cmd.Env = childProcEnvvars
 				cmd.Dir = repoRoot
 				cmd.Stdout = os.Stdout
 				cmd.Stderr = os.Stderr
@@ -451,6 +463,7 @@ func Run(options ...RunOption) {
 	}
 
 	log.Info("received SIGTERM (or shutdown) - tearing down")
+	fireWillShutdown()
 	terminalShutdownCtx, cancelTermination := context.WithTimeout(context.Background(), cfg.GetTerminationGracePeriod())
 	defer cancelTermination()
 	cancel()
@@ -464,9 +477,8 @@ func Run(options ...RunOption) {
 	wg.Wait()
 }
 
-func isShallowRepository(rootDir string, env []string) bool {
+func isShallowRepository(rootDir string) bool {
 	cmd := runAsGitpodUser(exec.Command("git", "rev-parse", "--is-shallow-repository"))
-	cmd.Env = env
 	cmd.Dir = rootDir
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -483,7 +495,7 @@ func isShallowRepository(rootDir string, env []string) bool {
 	return isShallow
 }
 
-func installDotfiles(ctx context.Context, cfg *Config, tokenService *InMemoryTokenService, childProcEnvvars []string) {
+func installDotfiles(ctx context.Context, cfg *Config, tokenService *InMemoryTokenService) {
 	repo := cfg.DotfileRepo
 	if repo == "" {
 		return
@@ -498,15 +510,7 @@ func installDotfiles(ctx context.Context, cfg *Config, tokenService *InMemoryTok
 	prep := func(cfg *Config, out io.Writer, name string, args ...string) *exec.Cmd {
 		cmd := exec.Command(name, args...)
 		cmd.Dir = "/home/gitpod"
-		cmd.Env = childProcEnvvars
-		cmd.SysProcAttr = &syscall.SysProcAttr{
-			// All supervisor children run as gitpod user. The environment variables we produce are also
-			// gitpod user specific.
-			Credential: &syscall.Credential{
-				Uid: gitpodUID,
-				Gid: gitpodGID,
-			},
-		}
+		runAsGitpodUser(cmd)
 		cmd.Stdout = out
 		cmd.Stderr = out
 		return cmd
@@ -695,7 +699,7 @@ func symlinkBinaries(cfg *Config) {
 	}
 }
 
-func configureGit(cfg *Config, childProcEnvvars []string) {
+func configureGit(cfg *Config) {
 	settings := [][]string{
 		{"push.default", "simple"},
 		{"alias.lg", "log --color --graph --pretty=format:'%Cred%h%Creset -%C(yellow)%d%Creset %s %Cgreen(%cr) %C(bold blue)<%an>%Creset' --abbrev-commit"},
@@ -712,7 +716,6 @@ func configureGit(cfg *Config, childProcEnvvars []string) {
 	for _, s := range settings {
 		cmd := exec.Command("git", append([]string{"config", "--global"}, s...)...)
 		cmd = runAsGitpodUser(cmd)
-		cmd.Env = childProcEnvvars
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		err := cmd.Run()
@@ -757,7 +760,7 @@ var (
 	errSignalTerminated = errors.New("signal: terminated")
 )
 
-func startAndWatchIDE(ctx context.Context, cfg *Config, ideConfig *IDEConfig, childProcEnvvars []string, wg *sync.WaitGroup, cstate *InMemoryContentState, ideReady *ideReadyState, ide IDEKind, metrics *metrics.SupervisorMetrics) {
+func startAndWatchIDE(ctx context.Context, cfg *Config, ideConfig *IDEConfig, wg *sync.WaitGroup, cstate *InMemoryContentState, ideReady *ideReadyState, ide IDEKind, metrics *metrics.SupervisorMetrics) {
 	defer wg.Done()
 	defer log.WithField("ide", ide.String()).Debug("startAndWatchIDE shutdown")
 
@@ -784,7 +787,7 @@ supervisorLoop:
 
 		ideStopped = make(chan struct{}, 1)
 		startTime := time.Now()
-		cmd = prepareIDELaunch(cfg, ideConfig, childProcEnvvars)
+		cmd = prepareIDELaunch(cfg, ideConfig)
 		launchIDE(cfg, ideConfig, cmd, ideStopped, ideReady, &ideStatus, ide)
 
 		if firstStart {
@@ -885,7 +888,7 @@ func launchIDE(cfg *Config, ideConfig *IDEConfig, cmd *exec.Cmd, ideStopped chan
 	}()
 }
 
-func prepareIDELaunch(cfg *Config, ideConfig *IDEConfig, childProcEnvvars []string) *exec.Cmd {
+func prepareIDELaunch(cfg *Config, ideConfig *IDEConfig) *exec.Cmd {
 	args := ideConfig.EntrypointArgs
 	for i := range args {
 		args[i] = strings.ReplaceAll(args[i], "{IDEPORT}", strconv.Itoa(cfg.IDEPort))
@@ -894,20 +897,15 @@ func prepareIDELaunch(cfg *Config, ideConfig *IDEConfig, childProcEnvvars []stri
 	log.WithField("args", args).WithField("entrypoint", ideConfig.Entrypoint).Info("preparing IDE launch")
 
 	cmd := exec.Command(ideConfig.Entrypoint, args...)
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		// We need the child process to run in its own process group, s.t. we can suspend and resume
-		// IDE and its children.
-		Setpgid:   true,
-		Pdeathsig: syscall.SIGKILL,
 
-		// All supervisor children run as gitpod user. The environment variables we produce are also
-		// gitpod user specific.
-		Credential: &syscall.Credential{
-			Uid: gitpodUID,
-			Gid: gitpodGID,
-		},
-	}
-	cmd.Env = childProcEnvvars
+	// All supervisor children run as gitpod user. The environment variables we produce are also
+	// gitpod user specific.
+	runAsGitpodUser(cmd)
+
+	// We need the child process to run in its own process group, s.t. we can suspend and resume
+	// IDE and its children.
+	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
 
 	// Here we must resist the temptation to "neaten up" the IDE output for headless builds.
 	// This would break the JSON parsing of the headless builds.
@@ -946,6 +944,27 @@ func buildChildProcEnv(cfg *Config, envvars []string, runGP bool) []string {
 		}
 
 		envs[nme] = val
+	}
+
+	getEnv := func(name string) string {
+		return envs[name]
+	}
+	for _, ide := range []*IDEConfig{&cfg.IDE, cfg.DesktopIDE} {
+		if ide == nil || ide.Env == nil {
+			continue
+		}
+		for _, name := range ide.Env.Keys() {
+			if isBlacklistedEnvvar(name) {
+				continue
+			}
+			raw, exists := ide.Env.Get(name)
+			if !exists {
+				continue
+			}
+			if value, ok := raw.(string); ok {
+				envs[name] = os.Expand(value, getEnv)
+			}
+		}
 	}
 
 	envs["SUPERVISOR_ADDR"] = fmt.Sprintf("localhost:%d", cfg.APIEndpointPort)
@@ -1133,7 +1152,7 @@ func isBlacklistedEnvvar(name string) bool {
 	return false
 }
 
-func startAPIEndpoint(ctx context.Context, cfg *Config, wg *sync.WaitGroup, services []RegisterableService, tunneled *ports.TunneledPortsService, metricsReporter *metrics.GrpcMetricsReporter, runGP bool, opts ...grpc.ServerOption) {
+func startAPIEndpoint(ctx context.Context, cfg *Config, wg *sync.WaitGroup, services []RegisterableService, tunneled *ports.TunneledPortsService, metricsReporter *metrics.GrpcMetricsReporter, opts ...grpc.ServerOption) {
 	defer wg.Done()
 	defer log.Debug("startAPIEndpoint shutdown")
 
@@ -1144,35 +1163,6 @@ func startAPIEndpoint(ctx context.Context, cfg *Config, wg *sync.WaitGroup, serv
 
 	var unaryInterceptors []grpc.UnaryServerInterceptor
 	var streamInterceptors []grpc.StreamServerInterceptor
-	if cfg.HostAPIEndpointPort != nil {
-		url := fmt.Sprintf("localhost:%d", *cfg.HostAPIEndpointPort)
-		conn, err := grpc.DialContext(ctx, url, grpc.WithTransportCredentials(insecure.NewCredentials()))
-		if err != nil {
-			log.WithError(err).Fatal("cannot access host supervisor")
-		}
-		noProxy := func(fullMethod string) bool {
-			return strings.Contains(fullMethod, "TasksStatus") ||
-				strings.Contains(fullMethod, "TerminalService") ||
-				strings.Contains(fullMethod, "InfoService") ||
-				strings.Contains(fullMethod, "CreateSSHKeyPair")
-		}
-		unaryInterceptors = append(unaryInterceptors, func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
-			if noProxy(info.FullMethod) {
-				return handler(ctx, req)
-			}
-			md, _ := metadata.FromIncomingContext(ctx)
-			resp := &emptypb.Empty{}
-			respErr := conn.Invoke(metadata.NewOutgoingContext(ctx, md.Copy()), info.FullMethod, req, resp)
-			return resp, respErr
-		})
-		streamProxy := grpc_proxy.TransparentHandler(grpc_proxy.DefaultDirector(conn))
-		streamInterceptors = append(streamInterceptors, func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-			if noProxy(info.FullMethod) {
-				return handler(srv, ss)
-			}
-			return streamProxy(srv, ss)
-		})
-	}
 
 	if cfg.DebugEnable {
 		unaryInterceptors = append(unaryInterceptors, grpc_logrus.UnaryServerInterceptor(log.Log))
@@ -1244,24 +1234,12 @@ func startAPIEndpoint(ctx context.Context, cfg *Config, wg *sync.WaitGroup, serv
 	routes.Handle("/", httputil.NewSingleHostReverseProxy(ideURL))
 	routes.Handle("/_supervisor/frontend/", http.StripPrefix("/_supervisor/frontend", http.FileServer(http.Dir(cfg.StaticConfig.FrontendLocation))))
 
-	var hostProxy *httputil.ReverseProxy
-	if runGP && cfg.HostAPIEndpointPort != nil {
-		hostProxy = httputil.NewSingleHostReverseProxy(&url.URL{
-			Scheme: "http",
-			Host:   fmt.Sprintf("localhost:%d", *cfg.HostAPIEndpointPort),
-		})
-	}
 	routes.Handle("/_supervisor/v1/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.Contains(r.Header.Get("Content-Type"), "application/grpc") {
 			websocket.IsWebSocketUpgrade(r)
 			http.StripPrefix("/_supervisor/v1", grpcWebServer).ServeHTTP(w, r)
-		} else if hostProxy == nil ||
-			strings.HasPrefix(r.URL.Path, "/_supervisor/v1/terminal") ||
-			strings.HasPrefix(r.URL.Path, "/_supervisor/v1/info/workspace") ||
-			strings.HasPrefix(r.URL.Path, "/_supervisor/v1/status/tasks") {
-			http.StripPrefix("/_supervisor", restMux).ServeHTTP(w, r)
 		} else {
-			hostProxy.ServeHTTP(w, r)
+			http.StripPrefix("/_supervisor", restMux).ServeHTTP(w, r)
 		}
 	}))
 
@@ -1393,7 +1371,7 @@ func stopWhenTasksAreDone(ctx context.Context, wg *sync.WaitGroup, shutdown chan
 	shutdown <- ShutdownReasonSuccess
 }
 
-func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup, childProcEnvvars []string) {
+func startSSHServer(ctx context.Context, cfg *Config, wg *sync.WaitGroup) {
 	defer wg.Done()
 
 	if cfg.isHeadless() {
@@ -1532,7 +1510,7 @@ func recordInitializerMetrics(path string, metrics *metrics.SupervisorMetrics) {
 	}
 }
 
-func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *terminal.Mux) {
+func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *terminal.Mux, cfg *Config, w analytics.Writer) {
 	defer wg.Done()
 
 	fn := "/var/run/docker.sock"
@@ -1560,6 +1538,20 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 				},
 				LogToStdout: true,
 			})
+			outcome := "success"
+			if err != nil {
+				outcome = "failure"
+			}
+			w.Track(analytics.TrackMessage{
+				Identity: analytics.Identity{UserID: cfg.OwnerId},
+				Event:    "gitpod_activate_docker",
+				Properties: map[string]interface{}{
+					"instanceId":     cfg.WorkspaceInstanceID,
+					"workspaceId":    cfg.WorkspaceID,
+					"outcome":        outcome,
+					"debugWorkspace": cfg.isDebugWorkspace(),
+				},
+			})
 			if err != nil {
 				return err
 			}
@@ -1585,14 +1577,6 @@ func socketActivationForDocker(ctx context.Context, wg *sync.WaitGroup, term *te
 	}
 }
 
-func startAnalyze(ctx context.Context, cfg *Config, gitpodConfigService config.ConfigInterface, topService *TopService, gitpodService serverapi.APIInterface) {
-	analytics := analytics.NewFromEnvironment()
-	go analyseConfigChanges(ctx, cfg, analytics, gitpodConfigService, gitpodService)
-	go analysePerfChanges(ctx, cfg, analytics, topService, gitpodService)
-	<-ctx.Done()
-	analytics.Close()
-}
-
 type PerfAnalyzer struct {
 	label   string
 	defs    []int
@@ -1614,28 +1598,25 @@ func (a *PerfAnalyzer) analyze(used float64) bool {
 	return true
 }
 
-func analysePerfChanges(ctx context.Context, wscfg *Config, w analytics.Writer, topService *TopService, gitpodAPI serverapi.APIInterface) {
-	ownerID, err := gitpodAPI.GetOwnerID(ctx, wscfg.WorkspaceID)
-	if err != nil {
-		log.WithError(err).Error("gitpod perf analytics: failed to resolve workspace info")
-		return
-	}
-
+func analysePerfChanges(ctx context.Context, wscfg *Config, w analytics.Writer, topService *TopService) {
 	analyze := func(analyzer *PerfAnalyzer, used float64) {
 		if !analyzer.analyze(used) {
 			return
 		}
-		log.WithField("buckets", analyzer.buckets).WithField("used", used).WithField("label", analyzer.label).Debug("gitpod perf analytics: changed")
-		w.Track(analytics.TrackMessage{
-			Identity: analytics.Identity{UserID: ownerID},
-			Event:    "gitpod_" + analyzer.label + "_changed",
-			Properties: map[string]interface{}{
-				"used":        used,
-				"buckets":     analyzer.buckets,
-				"instanceId":  wscfg.WorkspaceInstanceID,
-				"workspaceId": wscfg.WorkspaceID,
-			},
-		})
+		if wscfg.isDebugWorkspace() {
+			log.WithField("buckets", analyzer.buckets).WithField("used", used).WithField("label", analyzer.label).Info("gitpod perf analytics: changed")
+		} else {
+			w.Track(analytics.TrackMessage{
+				Identity: analytics.Identity{UserID: wscfg.OwnerId},
+				Event:    "gitpod_" + analyzer.label + "_changed",
+				Properties: map[string]interface{}{
+					"used":        used,
+					"buckets":     analyzer.buckets,
+					"instanceId":  wscfg.WorkspaceInstanceID,
+					"workspaceId": wscfg.WorkspaceID,
+				},
+			})
+		}
 	}
 
 	cpuAnalyzer := &PerfAnalyzer{label: "cpu", defs: []int{1, 2, 3, 4, 5, 6, 7, 8}}
@@ -1656,15 +1637,63 @@ func analysePerfChanges(ctx context.Context, wscfg *Config, w analytics.Writer, 
 	}
 }
 
-func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer, cfgobs config.ConfigInterface, gitpodAPI serverapi.APIInterface) {
-	ownerID, err := gitpodAPI.GetOwnerID(ctx, wscfg.WorkspaceID)
-	if err != nil {
-		log.WithError(err).Error("gitpod config analytics: failed to resolve workspace info")
-		return
+func analyzeImageFileChanges(ctx context.Context, wscfg *Config, w analytics.Writer, cfgobs config.ConfigInterface, debounceDuration time.Duration) {
+	var (
+		timer *time.Timer
+		mu    sync.Mutex
+	)
+	analyze := func(change *struct{}) {
+		mu.Lock()
+		defer mu.Unlock()
+		if timer != nil && !timer.Stop() {
+			<-timer.C
+		}
+		timer = time.AfterFunc(debounceDuration, func() {
+			mu.Lock()
+			defer mu.Unlock()
+			timer = nil
+			msg := analytics.TrackMessage{
+				Identity: analytics.Identity{UserID: wscfg.OwnerId},
+				Event:    "gitpod_image_file_changed",
+				Properties: map[string]interface{}{
+					"instanceId":  wscfg.WorkspaceInstanceID,
+					"workspaceId": wscfg.WorkspaceID,
+					"exists":      change != nil,
+				},
+			}
+			if !wscfg.isDebugWorkspace() {
+				w.Track(msg)
+			} else {
+				log.WithField("msg", msg).Info("gitpod config analytics: image file changed")
+			}
+		})
 	}
+	changes := cfgobs.ObserveImageFile(ctx)
+	initial := true
+	for {
+		select {
+		case change, ok := <-changes:
+			if !ok {
+				return
+			}
+			if initial {
+				// only report changes, not initial state
+				initial = false
+			} else {
+				analyze(change)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
 
+func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer, cfgobs config.ConfigInterface) {
 	var analyzer *config.ConfigAnalyzer
 	log.Debug("gitpod config analytics: watching...")
+
+	debounceDuration := 5 * time.Second
+	go analyzeImageFileChanges(ctx, wscfg, w, cfgobs, debounceDuration)
 
 	cfgs := cfgobs.Observe(ctx)
 	for {
@@ -1676,16 +1705,21 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 			if analyzer != nil {
 				analyzer.Analyse(cfg)
 			} else {
-				analyzer = config.NewConfigAnalyzer(log.Log, 5*time.Second, func(field string) {
-					w.Track(analytics.TrackMessage{
-						Identity: analytics.Identity{UserID: ownerID},
+				analyzer = config.NewConfigAnalyzer(log.Log, debounceDuration, func(field string) {
+					msg := analytics.TrackMessage{
+						Identity: analytics.Identity{UserID: wscfg.OwnerId},
 						Event:    "gitpod_config_changed",
 						Properties: map[string]interface{}{
 							"key":         field,
 							"instanceId":  wscfg.WorkspaceInstanceID,
 							"workspaceId": wscfg.WorkspaceID,
 						},
-					})
+					}
+					if !wscfg.isDebugWorkspace() {
+						w.Track(msg)
+					} else {
+						log.WithField("msg", msg).Info("gitpod config analytics: config changed")
+					}
 				}, cfg)
 			}
 
@@ -1695,26 +1729,18 @@ func analyseConfigChanges(ctx context.Context, wscfg *Config, w analytics.Writer
 	}
 }
 
-func trackReadiness(ctx context.Context, gitpodService serverapi.APIInterface, cfg *Config, cstate *InMemoryContentState, ideReady *ideReadyState, desktopIdeReady *ideReadyState) {
-	type SupervisorReadiness struct {
-		Kind                string `json:"kind,omitempty"`
-		WorkspaceId         string `json:"workspaceId,omitempty"`
-		WorkspaceInstanceId string `json:"instanceId,omitempty"`
-		Timestamp           int64  `json:"timestamp,omitempty"`
-	}
-	trackFn := func(ctx context.Context, gitpodService serverapi.APIInterface, cfg *Config, kind string) {
-		err := gitpodService.TrackEvent(ctx, &gitpod.RemoteTrackMessage{
-			Event: "supervisor_readiness",
-			Properties: SupervisorReadiness{
-				Kind:                kind,
-				WorkspaceId:         cfg.WorkspaceID,
-				WorkspaceInstanceId: cfg.WorkspaceInstanceID,
-				Timestamp:           time.Now().UnixMilli(),
+func trackReadiness(ctx context.Context, w analytics.Writer, cfg *Config, cstate *InMemoryContentState, ideReady *ideReadyState, desktopIdeReady *ideReadyState) {
+	trackFn := func(cfg *Config, kind string) {
+		w.Track(analytics.TrackMessage{
+			Identity: analytics.Identity{UserID: cfg.OwnerId},
+			Event:    "supervisor_readiness",
+			Properties: map[string]interface{}{
+				"kind":        kind,
+				"workspaceId": cfg.WorkspaceID,
+				"instanceId":  cfg.WorkspaceInstanceID,
+				"timestamp":   time.Now().UnixMilli(),
 			},
 		})
-		if err != nil {
-			log.WithError(err).Error("error tracking supervisor_readiness")
-		}
 	}
 	const (
 		readinessKindContent    = "content"
@@ -1723,16 +1749,16 @@ func trackReadiness(ctx context.Context, gitpodService serverapi.APIInterface, c
 	)
 	go func() {
 		<-cstate.ContentReady()
-		trackFn(ctx, gitpodService, cfg, readinessKindContent)
+		trackFn(cfg, readinessKindContent)
 	}()
 	go func() {
 		<-ideReady.Wait()
-		trackFn(ctx, gitpodService, cfg, readinessKindIDE)
+		trackFn(cfg, readinessKindIDE)
 	}()
 	if cfg.DesktopIDE != nil {
 		go func() {
 			<-desktopIdeReady.Wait()
-			trackFn(ctx, gitpodService, cfg, readinessKindDesktopIDE)
+			trackFn(cfg, readinessKindDesktopIDE)
 		}()
 	}
 }
@@ -1744,6 +1770,7 @@ func runAsGitpodUser(cmd *exec.Cmd) *exec.Cmd {
 	if cmd.SysProcAttr.Credential == nil {
 		cmd.SysProcAttr.Credential = &syscall.Credential{}
 	}
+	cmd.Env = append(cmd.Env, childProcEnvvars...)
 	cmd.SysProcAttr.Credential.Uid = gitpodUID
 	cmd.SysProcAttr.Credential.Gid = gitpodGID
 	return cmd

@@ -15,6 +15,12 @@ import (
 
 const maxBodyBytes = int64(65536)
 
+const (
+	InvoiceFinalizedEventType            = "invoice.finalized"
+	CustomerSubscriptionDeletedEventType = "customer.subscription.deleted"
+	ChargeDisputeCreatedEventType        = "charge.dispute.created"
+)
+
 type webhookHandler struct {
 	billingService         billingservice.Interface
 	stripeWebhookSignature string
@@ -58,28 +64,44 @@ func (h *webhookHandler) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	}
 
 	switch event.Type {
-	case "invoice.finalized":
-		invoiceId, ok := event.Data.Object["id"].(string)
+	case InvoiceFinalizedEventType:
+		invoiceID, ok := event.Data.Object["id"].(string)
 		if !ok {
 			log.Error("failed to find invoice id in Stripe event payload")
 			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
 
-		err = h.billingService.FinalizeInvoice(req.Context(), invoiceId)
+		err = h.billingService.FinalizeInvoice(req.Context(), invoiceID)
 		if err != nil {
 			log.WithError(err).Error("Failed to finalize invoice")
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-	case "customer.subscription.deleted":
-		subscriptionId, ok := event.Data.Object["id"].(string)
+	case CustomerSubscriptionDeletedEventType:
+		subscriptionID, ok := event.Data.Object["id"].(string)
 		if !ok {
 			log.Error("failed to find subscriptionId id in Stripe event payload")
 			w.WriteHeader(http.StatusBadRequest)
+			return
 		}
-		err = h.billingService.CancelSubscription(req.Context(), subscriptionId)
+		err = h.billingService.CancelSubscription(req.Context(), subscriptionID)
 		if err != nil {
 			log.WithError(err).Error("Failed to cancel subscription")
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+	case ChargeDisputeCreatedEventType:
+		log.Info("Handling charge dispute")
+		disputeID, ok := event.Data.Object["id"].(string)
+		if !ok {
+			log.Error("Failed to identify dispute ID from Stripe webhook.")
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		if err := h.billingService.OnChargeDispute(req.Context(), disputeID); err != nil {
+			log.WithError(err).Errorf("Failed to handle charge dispute event for dispute ID: %s", disputeID)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}

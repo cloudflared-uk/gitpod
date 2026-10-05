@@ -6,8 +6,7 @@ package server
 
 import (
 	"fmt"
-	"net"
-	"strconv"
+	"path/filepath"
 	"strings"
 
 	"github.com/gitpod-io/gitpod/installer/pkg/common"
@@ -34,11 +33,6 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		}
 		return nil
 	})
-
-	license := ""
-	if ctx.Config.License != nil {
-		license = licenseFilePath
-	}
 
 	workspaceImage := ctx.Config.Workspace.WorkspaceImage
 	if workspaceImage == "" {
@@ -115,6 +109,22 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil
 	})
 
+	disableLongRunningMigrationsJob := false
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		if cfg.WebApp != nil && cfg.WebApp.Server != nil {
+			disableLongRunningMigrationsJob = cfg.WebApp.Server.DisableLongRunningMigrationJob
+		}
+		return nil
+	})
+
+	disableCompleteSnapshotJob := false
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		if cfg.WebApp != nil && cfg.WebApp.Server != nil {
+			disableCompleteSnapshotJob = cfg.WebApp.Server.DisableCompleteSnapshotJob
+		}
+		return nil
+	})
+
 	githubApp := GitHubApp{}
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
 		if cfg.WebApp != nil && cfg.WebApp.Server != nil && cfg.WebApp.Server.GithubApp != nil {
@@ -176,20 +186,23 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil
 	})
 
-	var withoutWorkspaceComponents bool
+	showSetupModal := true // old default to make self-hosted continue to work!
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.WebApp != nil {
-			withoutWorkspaceComponents = cfg.WebApp.WithoutWorkspaceComponents
+		if cfg.WebApp != nil && cfg.WebApp.Server != nil && cfg.WebApp.Server.ShowSetupModal != nil {
+			showSetupModal = *cfg.WebApp.Server.ShowSetupModal
 		}
 		return nil
 	})
+
+	_, _, adminCredentialsPath := getAdminCredentials()
+
+	_, _, authPKI := getAuthPKI()
 
 	// todo(sje): all these values are configurable
 	scfg := ConfigSerialized{
 		Version:               ctx.VersionManifest.Version,
 		HostURL:               fmt.Sprintf("https://%s", ctx.Config.Domain),
 		InstallationShortname: ctx.Config.Metadata.InstallationShortname,
-		LicenseFile:           license,
 		WorkspaceHeartbeat: WorkspaceHeartbeat{
 			IntervalSeconds: 60,
 			TimeoutSeconds:  300,
@@ -218,6 +231,12 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 			PurgeRetentionPeriodDays:   365,
 			PurgeChunkLimit:            5000,
 		},
+		LongRunningMigrationsJob: JobConfig{
+			Disabled: disableLongRunningMigrationsJob,
+		},
+		CompleteSnapshotJob: JobConfig{
+			Disabled: disableCompleteSnapshotJob,
+		},
 		EnableLocalApp: enableLocalApp,
 		AuthProviderConfigFiles: func() []string {
 			providers := make([]string, 0)
@@ -234,7 +253,6 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		MaxConcurrentPrebuildsPerRef:      10,
 		IncrementalPrebuilds:              IncrementalPrebuilds{CommitHistory: 100, RepositoryPasslist: []string{}},
 		BlockNewUsers:                     ctx.Config.BlockNewUsers,
-		MakeNewUsersAdmin:                 false,
 		DefaultBaseImageRegistryWhitelist: defaultBaseImageRegistryWhitelist,
 		RunDbDeleter:                      runDbDeleter,
 		OAuthServer: OAuthServer{
@@ -255,16 +273,16 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 				"shareSnapshot":    {Group: "inWorkspaceUserAction"},
 			},
 		},
-		ContentServiceAddr:           net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", contentservice.Component, ctx.Namespace), strconv.Itoa(contentservice.RPCPort)),
-		ImageBuilderAddr:             net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", common.ImageBuilderComponent, ctx.Namespace), strconv.Itoa(common.ImageBuilderRPCPort)),
-		UsageServiceAddr:             net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", usage.Component, ctx.Namespace), strconv.Itoa(usage.GRPCServicePort)),
-		IDEServiceAddr:               net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", ideservice.Component, ctx.Namespace), strconv.Itoa(ideservice.GRPCServicePort)),
+		ContentServiceAddr:           common.ClusterAddress(contentservice.Component, ctx.Namespace, contentservice.RPCPort),
+		UsageServiceAddr:             common.ClusterAddress(usage.Component, ctx.Namespace, usage.GRPCServicePort),
+		IDEServiceAddr:               common.ClusterAddress(ideservice.Component, ctx.Namespace, ideservice.GRPCServicePort),
 		MaximumEventLoopLag:          0.35,
 		CodeSync:                     CodeSync{},
 		VSXRegistryUrl:               fmt.Sprintf("https://open-vsx.%s", ctx.Config.Domain), // todo(sje): or "https://{{ .Values.vsxRegistry.host | default "open-vsx.org" }}" if not using OpenVSX proxy
 		EnablePayment:                chargebeeSecret != "" || stripeSecret != "" || stripeConfig != "",
 		ChargebeeProviderOptionsFile: fmt.Sprintf("%s/providerOptions", chargebeeMountPath),
 		StripeSecretsFile:            fmt.Sprintf("%s/apikeys", stripeSecretMountPath),
+		LinkedInSecretsFile:          fmt.Sprintf("%s/linkedin", linkedInSecretMountPath),
 		InsecureNoDomain:             false,
 		PrebuildLimiter: PrebuildRateLimiters{
 			// default limit for all cloneURLs
@@ -276,7 +294,14 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		WorkspaceClasses:               workspaceClasses,
 		InactivityPeriodForReposInDays: inactivityPeriodForReposInDays,
 		PATSigningKeyFile:              personalAccessTokenSigningKeyPath,
-		WithoutWorkspaceComponents:     withoutWorkspaceComponents,
+		Admin: AdminConfig{
+			GrantFirstUserAdminRole: true, // existing default
+			CredentialsPath:         adminCredentialsPath,
+		},
+		ShowSetupModal: showSetupModal,
+		Auth: AuthConfig{
+			PKI: authPKI,
+		},
 	}
 
 	fc, err := common.ToJSONString(scfg)
@@ -330,4 +355,24 @@ func getPersonalAccessTokenSigningKey(cfg *experimental.Config) (corev1.Volume, 
 	}
 
 	return volume, mount, path, true
+}
+
+func getAdminCredentials() (corev1.Volume, corev1.VolumeMount, string) {
+	volume := corev1.Volume{
+		Name: "admin-credentials",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: AdminCredentialsSecretName,
+				Optional:   pointer.Bool(true),
+			},
+		},
+	}
+
+	mount := corev1.VolumeMount{
+		Name:      "admin-credentials",
+		MountPath: AdminCredentialsSecretMountPath,
+		ReadOnly:  true,
+	}
+
+	return volume, mount, filepath.Join(AdminCredentialsSecretMountPath, AdminCredentialsSecretKey)
 }

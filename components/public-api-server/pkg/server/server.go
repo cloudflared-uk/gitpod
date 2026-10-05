@@ -5,15 +5,21 @@
 package server
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/bufbuild/connect-go"
 	"github.com/gitpod-io/gitpod/common-go/experiments"
 	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/go-chi/chi/v5"
+	chi_middleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/redis/go-redis/v9"
 	"gorm.io/gorm"
 
 	"github.com/gitpod-io/gitpod/components/public-api/go/config"
@@ -22,9 +28,13 @@ import (
 
 	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	db "github.com/gitpod-io/gitpod/components/gitpod-db/go"
+	"github.com/gitpod-io/gitpod/public-api-server/middleware"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/apiv1"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/auth"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/billingservice"
+	"github.com/gitpod-io/gitpod/public-api-server/pkg/identityprovider"
+	"github.com/gitpod-io/gitpod/public-api-server/pkg/oidc"
+	"github.com/gitpod-io/gitpod/public-api-server/pkg/origin"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/proxy"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/webhooks"
 	"github.com/sirupsen/logrus"
@@ -38,7 +48,7 @@ func Start(logger *logrus.Entry, version string, cfg *config.Configuration) erro
 		return fmt.Errorf("failed to parse Gitpod API URL: %w", err)
 	}
 
-	connPool, err := proxy.NewConnectionPool(gitpodAPI, 3000)
+	connPool, err := proxy.NewConnectionPool(gitpodAPI, 500)
 	if err != nil {
 		return fmt.Errorf("failed to setup connection pool: %w", err)
 	}
@@ -46,6 +56,21 @@ func Start(logger *logrus.Entry, version string, cfg *config.Configuration) erro
 	dbConn, err := db.Connect(db.ConnectionParamsFromEnv())
 	if err != nil {
 		return fmt.Errorf("failed to establish database connection: %w", err)
+	}
+
+	cipherSet, err := db.NewCipherSetFromKeysInFile(filepath.Join(cfg.DatabaseConfigPath, "encryptionKeys"))
+	if err != nil {
+		return fmt.Errorf("failed to read cipherset from file: %w", err)
+	}
+
+	redisClient := redis.NewClient(&redis.Options{
+		Addr: cfg.Redis.Address,
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	err = redisClient.Ping(ctx).Err()
+	if err != nil {
+		return fmt.Errorf("redis is unavailable at %s", cfg.Redis.Address)
 	}
 
 	expClient := experiments.NewClient()
@@ -65,6 +90,17 @@ func Start(logger *logrus.Entry, version string, cfg *config.Configuration) erro
 		if err != nil {
 			return fmt.Errorf("failed to initialize billing service client: %w", err)
 		}
+	}
+
+	var stateJWT *oidc.StateJWT
+	if cfg.OIDCClientJWTSigningSecretPath != "" {
+		oidcClientJWTSigningSecret, err := readSecretFromFile(cfg.OIDCClientJWTSigningSecretPath)
+		if err != nil {
+			return fmt.Errorf("failed to read JWT signing secret for OIDC flows: %w", err)
+		}
+		stateJWT = oidc.NewStateJWT([]byte(oidcClientJWTSigningSecret))
+	} else {
+		log.Info("No JWT signing secret for OIDC flows is configured.")
 	}
 
 	var stripeWebhookHandler http.Handler = webhooks.NewNoopWebhookHandler()
@@ -92,7 +128,25 @@ func Start(logger *logrus.Entry, version string, cfg *config.Configuration) erro
 
 	srv.HTTPMux().Handle("/stripe/invoices/webhook", handlers.ContentTypeHandler(stripeWebhookHandler, "application/json"))
 
-	if registerErr := register(srv, connPool, expClient, dbConn, signer); registerErr != nil {
+	oidcService := oidc.NewService(cfg.SessionServiceAddress, dbConn, cipherSet, stateJWT)
+
+	if redisClient == nil {
+		return fmt.Errorf("no Redis configiured")
+	}
+	idpService, err := identityprovider.NewService(strings.TrimSuffix(cfg.PublicURL, "/")+"/idp", identityprovider.NewRedisCache(redisClient))
+	if err != nil {
+		return err
+	}
+
+	if registerErr := register(srv, &registerDependencies{
+		connPool:    connPool,
+		expClient:   expClient,
+		dbConn:      dbConn,
+		signer:      signer,
+		cipher:      cipherSet,
+		oidcService: oidcService,
+		idpService:  idpService,
+	}); registerErr != nil {
 		return fmt.Errorf("failed to register services: %w", registerErr)
 	}
 
@@ -103,7 +157,17 @@ func Start(logger *logrus.Entry, version string, cfg *config.Configuration) erro
 	return nil
 }
 
-func register(srv *baseserver.Server, connPool proxy.ServerConnectionPool, expClient experiments.Client, dbConn *gorm.DB, signer auth.Signer) error {
+type registerDependencies struct {
+	connPool    proxy.ServerConnectionPool
+	expClient   experiments.Client
+	dbConn      *gorm.DB
+	signer      auth.Signer
+	cipher      db.Cipher
+	oidcService *oidc.Service
+	idpService  *identityprovider.Service
+}
+
+func register(srv *baseserver.Server, deps *registerDependencies) error {
 	proxy.RegisterMetrics(srv.MetricsRegistry())
 
 	connectMetrics := NewConnectMetrics()
@@ -112,36 +176,41 @@ func register(srv *baseserver.Server, connPool proxy.ServerConnectionPool, expCl
 		return err
 	}
 
+	rootHandler := chi.NewRouter()
+	rootHandler.Use(chi_middleware.Recoverer)
+	rootHandler.Use(middleware.NewLoggingMiddleware())
+
 	handlerOptions := []connect.HandlerOption{
 		connect.WithInterceptors(
 			NewMetricsInterceptor(connectMetrics),
 			NewLogInterceptor(log.Log),
 			auth.NewServerInterceptor(),
+			origin.NewInterceptor(),
 		),
 	}
 
-	workspacesRoute, workspacesServiceHandler := v1connect.NewWorkspacesServiceHandler(apiv1.NewWorkspaceService(connPool), handlerOptions...)
-	srv.HTTPMux().Handle(workspacesRoute, workspacesServiceHandler)
+	rootHandler.Mount(v1connect.NewWorkspacesServiceHandler(apiv1.NewWorkspaceService(deps.connPool), handlerOptions...))
+	rootHandler.Mount(v1connect.NewTeamsServiceHandler(apiv1.NewTeamsService(deps.connPool), handlerOptions...))
+	rootHandler.Mount(v1connect.NewUserServiceHandler(apiv1.NewUserService(deps.connPool), handlerOptions...))
+	rootHandler.Mount(v1connect.NewIDEClientServiceHandler(apiv1.NewIDEClientService(deps.connPool), handlerOptions...))
+	rootHandler.Mount(v1connect.NewProjectsServiceHandler(apiv1.NewProjectsService(deps.connPool), handlerOptions...))
+	rootHandler.Mount(v1connect.NewOIDCServiceHandler(apiv1.NewOIDCService(deps.connPool, deps.expClient, deps.dbConn, deps.cipher), handlerOptions...))
+	rootHandler.Mount(v1connect.NewIdentityProviderServiceHandler(apiv1.NewIdentityProviderService(deps.connPool, deps.idpService), handlerOptions...))
 
-	teamsRoute, teamsServiceHandler := v1connect.NewTeamsServiceHandler(apiv1.NewTeamsService(connPool), handlerOptions...)
-	srv.HTTPMux().Handle(teamsRoute, teamsServiceHandler)
-
-	if signer != nil {
-		tokensRoute, tokensServiceHandler := v1connect.NewTokensServiceHandler(apiv1.NewTokensService(connPool, expClient, dbConn, signer), handlerOptions...)
-		srv.HTTPMux().Handle(tokensRoute, tokensServiceHandler)
+	if deps.signer != nil {
+		rootHandler.Mount(v1connect.NewTokensServiceHandler(apiv1.NewTokensService(deps.connPool, deps.expClient, deps.dbConn, deps.signer), handlerOptions...))
 	}
 
-	userRoute, userServiceHandler := v1connect.NewUserServiceHandler(apiv1.NewUserService(connPool), handlerOptions...)
-	srv.HTTPMux().Handle(userRoute, userServiceHandler)
+	// OIDC sign-in handlers
+	rootHandler.Mount("/oidc", oidc.Router(deps.oidcService))
 
-	ideClientRoute, ideClientServiceHandler := v1connect.NewIDEClientServiceHandler(apiv1.NewIDEClientService(connPool), handlerOptions...)
-	srv.HTTPMux().Handle(ideClientRoute, ideClientServiceHandler)
+	// The OIDC spec dictates how the identity provider endpoint needs to look like,
+	// hence the extra endpoint rather than making this part of the proto API.
+	// See https://openid.net/specs/openid-connect-discovery-1_0.html#ProviderConfigurationRequest
+	rootHandler.Mount("/idp", deps.idpService.Router())
 
-	projectsRoute, projectsServiceHandler := v1connect.NewProjectsServiceHandler(apiv1.NewProjectsService(connPool), handlerOptions...)
-	srv.HTTPMux().Handle(projectsRoute, projectsServiceHandler)
-
-	oidcRoute, oidcServiceHandler := v1connect.NewOIDCServiceHandler(apiv1.NewOIDCService(connPool, expClient), handlerOptions...)
-	srv.HTTPMux().Handle(oidcRoute, oidcServiceHandler)
+	// All requests are handled by our root router
+	srv.HTTPMux().Handle("/", rootHandler)
 
 	return nil
 }

@@ -46,11 +46,6 @@ var FSShiftMethodList = map[FSShiftMethod]struct{}{
 	FSShiftShiftFS: {},
 }
 
-var LicensorTypeList = map[LicensorType]struct{}{
-	LicensorTypeGitpod:     {},
-	LicensorTypeReplicated: {},
-}
-
 // LoadValidationFuncs load custom validation functions for this version of the config API
 func (v version) LoadValidationFuncs(validate *validator.Validate) error {
 	funcs := map[string]validator.Func{
@@ -136,11 +131,6 @@ func (v version) ClusterValidation(rcfg interface{}) cluster.ValidationChecks {
 		res = append(res, cluster.CheckSecret(secretName, cluster.CheckSecretRequiredData("service-account.json")))
 	}
 
-	if cfg.ObjectStorage.Azure != nil {
-		secretName := cfg.ObjectStorage.Azure.Credentials.Name
-		res = append(res, cluster.CheckSecret(secretName, cluster.CheckSecretRequiredData("accountName", "accountKey")))
-	}
-
 	if cfg.ObjectStorage.S3 != nil {
 		secretName := cfg.ObjectStorage.S3.Credentials.Name
 		res = append(res, cluster.CheckSecret(secretName, cluster.CheckSecretRequiredData("accessKeyId", "secretAccessKey")))
@@ -174,29 +164,6 @@ func (v version) ClusterValidation(rcfg interface{}) cluster.ValidationChecks {
 	if cfg.Database.SSL != nil && cfg.Database.SSL.CaCert != nil {
 		secretName := cfg.Database.SSL.CaCert.Name
 		res = append(res, cluster.CheckSecret(secretName, cluster.CheckSecretRequiredData("ca.crt")))
-	}
-
-	if cfg.License != nil {
-		secretName := cfg.License.Name
-		licensorKey := "type"
-		res = append(res, cluster.CheckSecret(secretName, cluster.CheckSecretRequiredData("license"), cluster.CheckSecretRecommendedData(licensorKey), cluster.CheckSecretRule(func(s *corev1.Secret) ([]cluster.ValidationError, error) {
-			errors := make([]cluster.ValidationError, 0)
-
-			licensor := LicensorType(s.Data[licensorKey])
-			if licensor != "" {
-				// This field is optional, so blank is valid
-				_, ok := LicensorTypeList[licensor]
-
-				if !ok {
-					errors = append(errors, cluster.ValidationError{
-						Message: fmt.Sprintf("Secret '%s' has invalid license type '%s'", secretName, licensor),
-						Type:    cluster.ValidationStatusError,
-					})
-				}
-			}
-
-			return errors, nil
-		})))
 	}
 
 	if len(cfg.AuthProviders) > 0 {
@@ -264,8 +231,8 @@ func (v version) ClusterValidation(rcfg interface{}) cluster.ValidationChecks {
 		})))
 	}
 
-	if cfg.CustomCACert != nil {
-		res = append(res, cluster.CheckSecret(cfg.CustomCACert.Name, cluster.CheckSecretRequiredData("ca.crt")))
+	if cfg.MessageBus != nil && cfg.MessageBus.Credentials != nil {
+		res = append(res, cluster.CheckSecret(cfg.MessageBus.Credentials.Name, cluster.CheckSecretRequiredData("rabbitmq-password")))
 	}
 
 	res = append(res, experimental.ClusterValidation(cfg.Experimental)...)

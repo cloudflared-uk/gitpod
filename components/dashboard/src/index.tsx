@@ -11,7 +11,6 @@ import { UserContextProvider } from "./user-context";
 import { AdminContextProvider } from "./admin-context";
 import { PaymentContextProvider } from "./payment-context";
 import { LicenseContextProvider } from "./license-context";
-import { TeamsContextProvider } from "./teams/teams-context";
 import { ProjectContextProvider } from "./projects/project-context";
 import { ThemeContextProvider } from "./theme-context";
 import { FeatureFlagContextProvider } from "./contexts/FeatureFlagContext";
@@ -22,12 +21,14 @@ import relativeTime from "dayjs/plugin/relativeTime";
 import utc from "dayjs/plugin/utc";
 import { getURLHash, isGitpodIo } from "./utils";
 import { isWebsiteSlug } from "./utils";
-
+import { setupQueryClientProvider } from "./data/setup";
+import { ConfettiContextProvider } from "./contexts/ConfettiContext";
+import { QueryErrorBoundary } from "./components/error-boundaries/QueryErrorBoundary";
+import { ReloadPageErrorBoundary } from "./components/error-boundaries/ReloadPageErrorBoundary";
 import "./index.css";
+import { ToastContextProvider } from "./components/toasts/Toasts";
 
 const bootApp = () => {
-    // Handle any boot logic prior to rendering app
-
     // gitpod.io specific boot logic
     if (isGitpodIo()) {
         // Redirect to www website for any website slugs
@@ -48,6 +49,8 @@ const bootApp = () => {
         );
     }
 
+    const GitpodQueryClientProvider = setupQueryClientProvider();
+
     // Configure libraries
     dayjs.extend(relativeTime);
     dayjs.extend(utc);
@@ -55,27 +58,36 @@ const bootApp = () => {
     // Render the App
     ReactDOM.render(
         <React.StrictMode>
-            <UserContextProvider>
-                <AdminContextProvider>
-                    <PaymentContextProvider>
-                        <LicenseContextProvider>
-                            <TeamsContextProvider>
-                                <ProjectContextProvider>
-                                    <ThemeContextProvider>
-                                        <StartWorkspaceModalContextProvider>
-                                            <BrowserRouter>
-                                                <FeatureFlagContextProvider>
-                                                    <App />
-                                                </FeatureFlagContextProvider>
-                                            </BrowserRouter>
-                                        </StartWorkspaceModalContextProvider>
-                                    </ThemeContextProvider>
-                                </ProjectContextProvider>
-                            </TeamsContextProvider>
-                        </LicenseContextProvider>
-                    </PaymentContextProvider>
-                </AdminContextProvider>
-            </UserContextProvider>
+            <ReloadPageErrorBoundary>
+                <GitpodQueryClientProvider>
+                    {/* This needs to be inside of the GitpodQueryClientProvider so it can reset queries if needed */}
+                    <QueryErrorBoundary>
+                        <ConfettiContextProvider>
+                            <ToastContextProvider>
+                                <UserContextProvider>
+                                    <AdminContextProvider>
+                                        <PaymentContextProvider>
+                                            <LicenseContextProvider>
+                                                <ProjectContextProvider>
+                                                    <ThemeContextProvider>
+                                                        <BrowserRouter>
+                                                            <StartWorkspaceModalContextProvider>
+                                                                <FeatureFlagContextProvider>
+                                                                    <App />
+                                                                </FeatureFlagContextProvider>
+                                                            </StartWorkspaceModalContextProvider>
+                                                        </BrowserRouter>
+                                                    </ThemeContextProvider>
+                                                </ProjectContextProvider>
+                                            </LicenseContextProvider>
+                                        </PaymentContextProvider>
+                                    </AdminContextProvider>
+                                </UserContextProvider>
+                            </ToastContextProvider>
+                        </ConfettiContextProvider>
+                    </QueryErrorBoundary>
+                </GitpodQueryClientProvider>
+            </ReloadPageErrorBoundary>
         </React.StrictMode>,
         document.getElementById("root"),
     );

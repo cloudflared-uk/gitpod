@@ -15,13 +15,13 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/xerrors"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
-	"github.com/gitpod-io/gitpod/common-go/util"
+	"github.com/gitpod-io/gitpod/gitpod-cli/pkg/supervisor"
 	serverapi "github.com/gitpod-io/gitpod/gitpod-protocol"
-	supervisor "github.com/gitpod-io/gitpod/supervisor/api"
+	"github.com/gitpod-io/gitpod/supervisor/api"
+	supervisorapi "github.com/gitpod-io/gitpod/supervisor/api"
 )
 
 var exportEnvs = false
@@ -30,8 +30,8 @@ var unsetEnvs = false
 // envCmd represents the env command
 var envCmd = &cobra.Command{
 	Use:   "env",
-	Short: "Controls user-defined, persistent environment variables.",
-	Long: `This command can print and modify the persistent environment variables associated with your user, for this repository.
+	Short: "Controls workspace environment variables.",
+	Long: `This command can print and modify the persistent environment variables associated with your workspace.
 
 To set the persistent environment variable 'foo' to the value 'bar' use:
 	gp env foo=bar
@@ -51,7 +51,7 @@ Note that you can delete/unset variables if their repository pattern matches the
 delete environment variables with a repository pattern of */foo, foo/* or */*.
 `,
 	Args: cobra.ArbitraryArgs,
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
 		log.SetOutput(io.Discard)
 		f, err := os.OpenFile(os.TempDir()+"/gp-env.log", os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0644)
 		if err == nil {
@@ -59,32 +59,57 @@ delete environment variables with a repository pattern of */foo, foo/* or */*.
 			log.SetOutput(f)
 		}
 
+		ctx, cancel := context.WithTimeout(cmd.Context(), 1*time.Minute)
+		defer cancel()
+
 		if len(args) > 0 {
 			if unsetEnvs {
-				deleteEnvs(args)
-				return
+				err = deleteEnvs(ctx, args)
+			} else {
+				err = setEnvs(ctx, args)
 			}
-
-			setEnvs(args)
 		} else {
-			getEnvs()
+			err = getEnvs(ctx)
 		}
+		return err
 	},
 }
 
 type connectToServerResult struct {
 	repositoryPattern string
+	wsInfo            *supervisorapi.WorkspaceInfoResponse
 	client            *serverapi.APIoverJSONRPC
+
+	useDeprecatedGetEnvVar bool
 }
 
-func connectToServer(ctx context.Context) (*connectToServerResult, error) {
-	supervisorConn, err := grpc.Dial(util.GetSupervisorAddress(), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, xerrors.Errorf("failed connecting to supervisor: %w", err)
+type connectToServerOptions struct {
+	supervisorClient *supervisor.SupervisorClient
+	wsInfo           *api.WorkspaceInfoResponse
+	log              *log.Entry
+}
+
+func connectToServer(ctx context.Context, options *connectToServerOptions) (*connectToServerResult, error) {
+	var err error
+	var supervisorClient *supervisor.SupervisorClient
+	if options != nil && options.supervisorClient != nil {
+		supervisorClient = options.supervisorClient
+	} else {
+		supervisorClient, err = supervisor.New(ctx)
+		if err != nil {
+			return nil, xerrors.Errorf("failed connecting to supervisor: %w", err)
+		}
+		defer supervisorClient.Close()
 	}
-	wsinfo, err := supervisor.NewInfoServiceClient(supervisorConn).WorkspaceInfo(ctx, &supervisor.WorkspaceInfoRequest{})
-	if err != nil {
-		return nil, xerrors.Errorf("failed getting workspace info from supervisor: %w", err)
+
+	var wsinfo *api.WorkspaceInfoResponse
+	if options != nil && options.wsInfo != nil {
+		wsinfo = options.wsInfo
+	} else {
+		wsinfo, err = supervisorClient.Info.WorkspaceInfo(ctx, &supervisorapi.WorkspaceInfoRequest{})
+		if err != nil {
+			return nil, xerrors.Errorf("failed getting workspace info from supervisor: %w", err)
+		}
 	}
 	if wsinfo.Repository == nil {
 		return nil, xerrors.New("workspace info is missing repository")
@@ -96,116 +121,130 @@ func connectToServer(ctx context.Context) (*connectToServerResult, error) {
 		return nil, xerrors.New("repository info is missing name")
 	}
 	repositoryPattern := wsinfo.Repository.Owner + "/" + wsinfo.Repository.Name
-	clientToken, err := supervisor.NewTokenServiceClient(supervisorConn).GetToken(ctx, &supervisor.GetTokenRequest{
+
+	var useDeprecatedGetEnvVar bool
+	clientToken, err := supervisorClient.Token.GetToken(ctx, &supervisorapi.GetTokenRequest{
 		Host: wsinfo.GitpodApi.Host,
 		Kind: "gitpod",
 		Scope: []string{
-			"function:getEnvVars",
+			"function:getWorkspaceEnvVars",
 			"function:setEnvVar",
 			"function:deleteEnvVar",
 			"resource:envVar::" + repositoryPattern + "::create/get/update/delete",
 		},
 	})
 	if err != nil {
+		// TODO remove then GetWorkspaceEnvVars is deployed
+		clientToken, err = supervisorClient.Token.GetToken(ctx, &supervisorapi.GetTokenRequest{
+			Host: wsinfo.GitpodApi.Host,
+			Kind: "gitpod",
+			Scope: []string{
+				"function:getEnvVars", // TODO remove then getWorkspaceEnvVars is deployed
+				"function:setEnvVar",
+				"function:deleteEnvVar",
+				"resource:envVar::" + repositoryPattern + "::create/get/update/delete",
+			},
+		})
+		useDeprecatedGetEnvVar = true
+	}
+	if err != nil {
 		return nil, xerrors.Errorf("failed getting token from supervisor: %w", err)
+	}
+	var serverLog *log.Entry
+	if options != nil && options.log != nil {
+		serverLog = options.log
+	} else {
+		serverLog = log.NewEntry(log.StandardLogger())
 	}
 	client, err := serverapi.ConnectToServer(wsinfo.GitpodApi.Endpoint, serverapi.ConnectToServerOpts{
 		Token:   clientToken.Token,
 		Context: ctx,
-		Log:     log.NewEntry(log.StandardLogger()),
+		Log:     serverLog,
 	})
 	if err != nil {
 		return nil, xerrors.Errorf("failed connecting to server: %w", err)
 	}
-	return &connectToServerResult{repositoryPattern, client}, nil
+	return &connectToServerResult{repositoryPattern, wsinfo, client, useDeprecatedGetEnvVar}, nil
 }
 
-func getEnvs() {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-	result, err := connectToServer(ctx)
+func getWorkspaceEnvs(ctx context.Context, options *connectToServerOptions) ([]*serverapi.EnvVar, error) {
+	result, err := connectToServer(ctx, options)
 	if err != nil {
-		fail(err.Error())
+		return nil, err
 	}
+	defer result.client.Close()
 
-	vars, err := result.client.GetEnvVars(ctx)
+	if !result.useDeprecatedGetEnvVar {
+		return result.client.GetWorkspaceEnvVars(ctx, result.wsInfo.WorkspaceId)
+	}
+	return result.client.GetEnvVars(ctx)
+}
+
+func getEnvs(ctx context.Context) error {
+	vars, err := getWorkspaceEnvs(ctx, nil)
 	if err != nil {
-		fail("failed to fetch env vars from server: " + err.Error())
+		return xerrors.Errorf("failed to fetch env vars from server: %w", err)
 	}
 
 	for _, v := range vars {
-		printVar(v, exportEnvs)
+		printVar(v.Name, v.Value, exportEnvs)
 	}
+
+	return nil
 }
 
-func setEnvs(args []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-	result, err := connectToServer(ctx)
+func setEnvs(ctx context.Context, args []string) error {
+	result, err := connectToServer(ctx, nil)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
+	defer result.client.Close()
 
 	vars, err := parseArgs(args, result.repositoryPattern)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
 
-	var exitCode int
-	var wg sync.WaitGroup
-	wg.Add(len(vars))
+	g, ctx := errgroup.WithContext(ctx)
 	for _, v := range vars {
-		go func(v *serverapi.UserEnvVarValue) {
+		v := v
+		g.Go(func() error {
 			err = result.client.SetEnvVar(ctx, v)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "cannot set %s: %v\n", v.Name, err)
-				exitCode = -1
-			} else {
-				printVar(v, exportEnvs)
+				return err
 			}
-			wg.Done()
-		}(v)
+			printVar(v.Name, v.Value, exportEnvs)
+			return nil
+		})
 	}
-	wg.Wait()
-	os.Exit(exitCode)
+	return g.Wait()
 }
 
-func deleteEnvs(args []string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Minute)
-	defer cancel()
-	result, err := connectToServer(ctx)
+func deleteEnvs(ctx context.Context, args []string) error {
+	result, err := connectToServer(ctx, nil)
 	if err != nil {
-		fail(err.Error())
+		return err
 	}
+	defer result.client.Close()
 
-	var exitCode int
+	g, ctx := errgroup.WithContext(ctx)
 	var wg sync.WaitGroup
 	wg.Add(len(args))
 	for _, name := range args {
-		go func(name string) {
-			err = result.client.DeleteEnvVar(ctx, &serverapi.UserEnvVarValue{Name: name, RepositoryPattern: result.repositoryPattern})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "cannot unset %s: %v\n", name, err)
-				exitCode = -1
-			}
-			wg.Done()
-		}(name)
+		name := name
+		g.Go(func() error {
+			return result.client.DeleteEnvVar(ctx, &serverapi.UserEnvVarValue{Name: name, RepositoryPattern: result.repositoryPattern})
+		})
 	}
-	wg.Wait()
-	os.Exit(exitCode)
+	return g.Wait()
 }
 
-func fail(msg string) {
-	fmt.Fprintln(os.Stderr, msg)
-	os.Exit(-1)
-}
-
-func printVar(v *serverapi.UserEnvVarValue, export bool) {
-	val := strings.Replace(v.Value, "\"", "\\\"", -1)
+func printVar(name string, value string, export bool) {
+	val := strings.Replace(value, "\"", "\\\"", -1)
 	if export {
-		fmt.Printf("export %s=\"%s\"\n", v.Name, val)
+		fmt.Printf("export %s=\"%s\"\n", name, val)
 	} else {
-		fmt.Printf("%s=%s\n", v.Name, val)
+		fmt.Printf("%s=%s\n", name, val)
 	}
 }
 

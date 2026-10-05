@@ -25,7 +25,6 @@ import {
     WorkspaceAndInstance,
     GetWorkspaceTimeoutResult,
     WorkspaceTimeoutDuration,
-    WorkspaceTimeoutValues,
     SetWorkspaceTimeoutResult,
     WorkspaceContext,
     WorkspaceCreationResult,
@@ -60,9 +59,7 @@ import {
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { v4 as uuidv4 } from "uuid";
 import { log, LogContext } from "@gitpod/gitpod-protocol/lib/util/logging";
-import { LicenseKeySource } from "@gitpod/licensor/lib";
-import { Feature } from "@gitpod/licensor/lib/api";
-import { LicenseValidationResult, LicenseFeature } from "@gitpod/gitpod-protocol/lib/license-protocol";
+import { LicenseValidationResult } from "@gitpod/gitpod-protocol/lib/license-protocol";
 import { PrebuildManager } from "../prebuilds/prebuild-manager";
 import { LicenseDB } from "@gitpod/gitpod-db/lib";
 import { GuardedCostCenter, ResourceAccessGuard, ResourceAccessOp } from "../../../src/auth/resource-access";
@@ -123,6 +120,7 @@ import {
 } from "@gitpod/usage-api/lib/usage/v1/billing.pb";
 import { IncrementalPrebuildsService } from "../prebuilds/incremental-prebuilds-service";
 import { ConfigProvider } from "../../../src/workspace/config-provider";
+import { ClientError } from "nice-grpc-common";
 
 @injectable()
 export class GitpodServerEEImpl extends GitpodServerImpl {
@@ -130,7 +128,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     @inject(IncrementalPrebuildsService) protected readonly incrementalPrebuildsService: IncrementalPrebuildsService;
     @inject(ConfigProvider) protected readonly configProvider: ConfigProvider;
     @inject(LicenseDB) protected readonly licenseDB: LicenseDB;
-    @inject(LicenseKeySource) protected readonly licenseKeySource: LicenseKeySource;
 
     // per-user state
     @inject(EligibilityService) protected readonly eligibilityService: EligibilityService;
@@ -186,7 +183,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
         this.listenToCreditAlerts();
         this.listenForPrebuildUpdates().catch((err) => log.error("error registering for prebuild updates", err));
-        this.listenForSubscriptionUpdates().catch((err) => log.error("error registering for prebuild updates", err));
     }
 
     protected async listenForPrebuildUpdates() {
@@ -212,32 +208,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
 
         // TODO(at) we need to keep the list of accessible project up to date
-    }
-
-    protected async listenForSubscriptionUpdates() {
-        if (!this.user) {
-            return;
-        }
-        const teamIds = (await this.teamDB.findTeamsByUser(this.user.id)).map(({ id }) =>
-            AttributionId.render({ kind: "team", teamId: id }),
-        );
-        for (const attributionId of [AttributionId.render({ kind: "user", userId: this.user.id }), ...teamIds]) {
-            this.disposables.push(
-                this.localMessageBroker.listenForSubscriptionUpdates(
-                    attributionId,
-                    (ctx: TraceContext, attributionId: AttributionId) =>
-                        TraceContext.withSpan(
-                            "forwardSubscriptionUpdateToClient",
-                            (ctx) => {
-                                traceClientMetadata(ctx, this.clientMetadata);
-                                TraceContext.setJsonRPCMetadata(ctx, "onSubscriptionUpdate");
-                                this.client?.onNotificationUpdated();
-                            },
-                            ctx,
-                        ),
-                ),
-            );
-        }
     }
 
     protected async getAccessibleProjects() {
@@ -292,14 +262,19 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     protected async mayStartWorkspace(
         ctx: TraceContext,
         user: User,
-        workspace: Workspace,
+        organizationId: string | undefined,
         runningInstances: Promise<WorkspaceInstance[]>,
     ): Promise<void> {
-        await super.mayStartWorkspace(ctx, user, workspace, runningInstances);
+        await super.mayStartWorkspace(ctx, user, organizationId, runningInstances);
 
         let result: MayStartWorkspaceResult = {};
         try {
-            result = await this.entitlementService.mayStartWorkspace(user, workspace, new Date(), runningInstances);
+            result = await this.entitlementService.mayStartWorkspace(
+                user,
+                organizationId,
+                new Date(),
+                runningInstances,
+            );
             TraceContext.addNestedTags(ctx, { mayStartWorkspace: { result } });
         } catch (err) {
             log.error({ userId: user.id }, "EntitlementSerivce.mayStartWorkspace error", err);
@@ -328,39 +303,40 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
     }
 
-    protected async requireEELicense(feature: Feature) {
-        const cachedUserCount = this.userCounter.count;
-
-        let userCount: number;
-        if (cachedUserCount === null) {
-            userCount = await this.userDB.getUserCount(true);
-            this.userCounter.count = userCount;
-        } else {
-            userCount = cachedUserCount;
-        }
-
-        if (!this.licenseEvaluator.isEnabled(feature, userCount)) {
-            throw new ResponseError(ErrorCodes.EE_LICENSE_REQUIRED, "enterprise license required");
-        }
+    async validateLicense(ctx: TraceContext): Promise<LicenseValidationResult> {
+        return { valid: true };
     }
 
-    async validateLicense(ctx: TraceContext): Promise<LicenseValidationResult> {
-        const v = this.licenseEvaluator.validate();
-        if (!v.valid) {
-            return v;
+    goDurationToHumanReadable(goDuration: string): string {
+        const [, value, unit] = goDuration.match(/^(\d+)([mh])$/)!;
+        let duration = parseInt(value);
+
+        switch (unit) {
+            case "m":
+                duration *= 60;
+                break;
+            case "h":
+                duration *= 60 * 60;
+                break;
         }
 
-        const userCount = await this.userDB.getUserCount(true);
-        const canAnotherUserSignUp = this.licenseEvaluator.hasEnoughSeats(userCount + 1);
-        if (!canAnotherUserSignUp) {
-            return {
-                valid: true,
-                issue: "seats-exhausted",
-                msg: "maximum number of users reached",
-            };
+        const hours = Math.floor(duration / 3600);
+        duration %= 3600;
+        const minutes = Math.floor(duration / 60);
+        duration %= 60;
+
+        let result = "";
+        if (hours) {
+            result += `${hours} hour${hours === 1 ? "" : "s"}`;
+            if (minutes) {
+                result += " and ";
+            }
+        }
+        if (minutes) {
+            result += `${minutes} minute${minutes === 1 ? "" : "s"}`;
         }
 
-        return { valid: true };
+        return result;
     }
 
     public async setWorkspaceTimeout(
@@ -371,15 +347,17 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         traceAPIParams(ctx, { workspaceId, duration });
         traceWI(ctx, { workspaceId });
 
-        await this.requireEELicense(Feature.FeatureSetTimeout);
         const user = this.checkUser("setWorkspaceTimeout");
 
-        if (!WorkspaceTimeoutValues.includes(duration)) {
-            throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "Invalid duration");
+        if (!(await this.entitlementService.maySetTimeout(user, new Date()))) {
+            throw new ResponseError(ErrorCodes.PLAN_PROFESSIONAL_REQUIRED, "Plan upgrade is required");
         }
 
-        if (!(await this.maySetTimeout(user))) {
-            throw new ResponseError(ErrorCodes.PLAN_PROFESSIONAL_REQUIRED, "Plan upgrade is required");
+        let validatedDuration;
+        try {
+            validatedDuration = WorkspaceTimeoutDuration.validate(duration);
+        } catch (err) {
+            throw new ResponseError(ErrorCodes.INVALID_VALUE, "Invalid duration : " + err.message);
         }
 
         const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
@@ -390,36 +368,16 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
         await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "update");
 
-        // if any other running instance has a custom timeout other than the user's default, we'll reset that timeout
-        const client = await this.workspaceManagerClientProvider.get(
-            runningInstance.region,
-            this.config.installationShortname,
-        );
-        const defaultTimeout = await this.entitlementService.getDefaultWorkspaceTimeout(user, new Date());
-        const instancesWithReset = runningInstances.filter(
-            (i) => i.workspaceId !== workspaceId && i.status.timeout !== defaultTimeout && i.status.phase === "running",
-        );
-        await Promise.all(
-            instancesWithReset.map(async (i) => {
-                const req = new SetTimeoutRequest();
-                req.setId(i.id);
-                req.setDuration(this.userService.workspaceTimeoutToDuration(defaultTimeout));
-
-                const client = await this.workspaceManagerClientProvider.get(
-                    i.region,
-                    this.config.installationShortname,
-                );
-                return client.setTimeout(ctx, req);
-            }),
-        );
+        const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
 
         const req = new SetTimeoutRequest();
         req.setId(runningInstance.id);
-        req.setDuration(this.userService.workspaceTimeoutToDuration(duration));
+        req.setDuration(validatedDuration);
         await client.setTimeout(ctx, req);
 
         return {
-            resetTimeoutOnWorkspaces: instancesWithReset.map((i) => i.workspaceId),
+            resetTimeoutOnWorkspaces: [workspace.id],
+            humanReadableDuration: this.goDurationToHumanReadable(validatedDuration),
         };
     }
 
@@ -427,41 +385,31 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         traceAPIParams(ctx, { workspaceId });
         traceWI(ctx, { workspaceId });
 
-        // Allowed in the free version, because it is read only.
-        // this.requireEELicense(Feature.FeatureSetTimeout);
-
         const user = this.checkUser("getWorkspaceTimeout");
 
-        const canChange = await this.maySetTimeout(user);
+        const canChange = await this.entitlementService.maySetTimeout(user, new Date());
 
         const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
         const runningInstance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
         if (!runningInstance) {
             log.warn({ userId: user.id, workspaceId }, "Can only get keep-alive for running workspaces");
             const duration = WORKSPACE_TIMEOUT_DEFAULT_SHORT;
-            return { duration, durationRaw: this.userService.workspaceTimeoutToDuration(duration), canChange };
+            return { duration, canChange, humanReadableDuration: this.goDurationToHumanReadable(duration) };
         }
         await this.guardAccess({ kind: "workspaceInstance", subject: runningInstance, workspace: workspace }, "get");
 
         const req = new DescribeWorkspaceRequest();
         req.setId(runningInstance.id);
 
-        const client = await this.workspaceManagerClientProvider.get(
-            runningInstance.region,
-            this.config.installationShortname,
-        );
+        const client = await this.workspaceManagerClientProvider.get(runningInstance.region);
         const desc = await client.describeWorkspace(ctx, req);
-        const duration = this.userService.durationToWorkspaceTimeout(desc.getStatus()!.getSpec()!.getTimeout());
-        const durationRaw = this.userService.workspaceTimeoutToDuration(duration);
+        const duration = desc.getStatus()!.getSpec()!.getTimeout();
 
-        return { duration, durationRaw, canChange };
+        return { duration, canChange, humanReadableDuration: this.goDurationToHumanReadable(duration) };
     }
 
     public async isPrebuildDone(ctx: TraceContext, pwsId: string): Promise<boolean> {
         traceAPIParams(ctx, { pwsId });
-
-        // Allowed in the free version, because it is read only.
-        // this.requireEELicense(Feature.FeaturePrebuild);
 
         const pws = await this.workspaceDb.trace(ctx).findPrebuildByID(pwsId);
         if (!pws) {
@@ -472,18 +420,10 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         return PrebuiltWorkspace.isDone(pws);
     }
 
-    /**
-     * gitpod.io Extension point for implementing eligibility checks. Throws a ResponseError if not eligible.
-     */
-    protected async maySetTimeout(user: User): Promise<boolean> {
-        return this.entitlementService.maySetTimeout(user, new Date());
-    }
-
     public async controlAdmission(ctx: TraceContext, workspaceId: string, level: "owner" | "everyone"): Promise<void> {
         traceAPIParams(ctx, { workspaceId, level });
         traceWI(ctx, { workspaceId });
 
-        await this.requireEELicense(Feature.FeatureWorkspaceSharing);
         this.checkAndBlockUser("controlAdmission");
 
         const lvlmap = new Map<string, AdmissionLevel>();
@@ -496,6 +436,16 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         const workspace = await this.internalGetWorkspace(workspaceId, this.workspaceDb.trace(ctx));
         await this.guardAccess({ kind: "workspace", subject: workspace }, "update");
 
+        if (level != "owner" && workspace.organizationId) {
+            const settings = await this.teamDB.findOrgSettings(workspace.organizationId);
+            if (settings?.workspaceSharingDisabled) {
+                throw new ResponseError(
+                    ErrorCodes.PERMISSION_DENIED,
+                    "An Organization Owner has disabled workspace sharing for workspaces in this Organization. ",
+                );
+            }
+        }
+
         const instance = await this.workspaceDb.trace(ctx).findRunningInstance(workspaceId);
         if (instance) {
             await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace: workspace }, "update");
@@ -504,10 +454,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
             req.setId(instance.id);
             req.setLevel(lvlmap.get(level)!);
 
-            const client = await this.workspaceManagerClientProvider.get(
-                instance.region,
-                this.config.installationShortname,
-            );
+            const client = await this.workspaceManagerClientProvider.get(instance.region);
             await client.controlAdmission(ctx, req);
         }
 
@@ -522,7 +469,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         const { workspaceId, dontWait } = options;
         traceWI(ctx, { workspaceId });
 
-        await this.requireEELicense(Feature.FeatureSnapshot);
         const user = this.checkAndBlockUser("takeSnapshot");
 
         const workspace = await this.guardSnaphotAccess(ctx, user.id, workspaceId);
@@ -533,10 +479,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
         await this.guardAccess({ kind: "workspaceInstance", subject: instance, workspace }, "get");
 
-        const client = await this.workspaceManagerClientProvider.get(
-            instance.region,
-            this.config.installationShortname,
-        );
+        const client = await this.workspaceManagerClientProvider.get(instance.region);
         const request = new TakeSnapshotRequest();
         request.setId(instance.id);
         request.setReturnImmediately(true);
@@ -580,7 +523,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async waitForSnapshot(ctx: TraceContext, snapshotId: string): Promise<void> {
         traceAPIParams(ctx, { snapshotId });
 
-        await this.requireEELicense(Feature.FeatureSnapshot);
         const user = this.checkAndBlockUser("waitForSnapshot");
 
         const snapshot = await this.workspaceDb.trace(ctx).findSnapshotById(snapshotId);
@@ -604,9 +546,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         traceAPIParams(ctx, { workspaceId });
         traceWI(ctx, { workspaceId });
 
-        // Allowed in the free version, because it is read only.
-        // this.requireEELicense(Feature.FeatureSnapshot);
-
         const user = this.checkAndBlockUser("getSnapshots");
 
         const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
@@ -622,8 +561,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
     async adminGetUsers(ctx: TraceContext, req: AdminGetListRequest<User>): Promise<AdminGetListResult<User>> {
         traceAPIParams(ctx, { req: censor(req, "searchTerm") }); // searchTerm may contain PII
-
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminGetUsers", { req }, Permission.ADMIN_USERS);
 
@@ -645,8 +582,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async adminGetUser(ctx: TraceContext, userId: string): Promise<User> {
         traceAPIParams(ctx, { userId });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminGetUser", { id: userId }, Permission.ADMIN_USERS);
 
         let result: User | undefined;
@@ -665,31 +600,21 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async adminBlockUser(ctx: TraceContext, req: AdminBlockUserRequest): Promise<User> {
         traceAPIParams(ctx, { req });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminBlockUser", { req }, Permission.ADMIN_USERS);
 
-        let targetUser;
-        try {
-            targetUser = await this.userService.blockUser(req.id, req.blocked);
-        } catch (error) {
-            throw new ResponseError(ErrorCodes.NOT_FOUND, "not found");
-        }
+        const targetUser = await this.userService.blockUser(req.id, req.blocked);
 
-        const workspaceDb = this.workspaceDb.trace(ctx);
-        const workspaces = await workspaceDb.findWorkspacesByUser(req.id);
-        const isDefined = <T>(x: T | undefined): x is T => x !== undefined;
-        (await Promise.all(workspaces.map((workspace) => workspaceDb.findRunningInstance(workspace.id))))
-            .filter(isDefined)
-            .forEach((instance) =>
-                this.workspaceStarter.stopWorkspaceInstance(
-                    ctx,
-                    instance.id,
-                    instance.region,
-                    "user blocked by admin",
-                    StopWorkspacePolicy.IMMEDIATELY,
-                ),
-            );
+        const stoppedWorkspaces = await this.workspaceStarter.stopRunningWorkspacesForUser(
+            ctx,
+            req.id,
+            "user blocked by admin",
+            StopWorkspacePolicy.IMMEDIATELY,
+        );
+
+        log.info(`Stopped ${stoppedWorkspaces.length} workspaces in response to admin initiated block.`, {
+            userId: targetUser.id,
+            workspaceIds: stoppedWorkspaces.map((w) => w.id),
+        });
 
         // For some reason, returning the result of `this.userDB.storeUser(target)` does not work. The response never arrives the caller.
         // Returning `target` instead (which should be equivalent).
@@ -697,8 +622,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     }
 
     async adminVerifyUser(ctx: TraceContext, userId: string): Promise<User> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminVerifyUser", { id: userId }, Permission.ADMIN_USERS);
         try {
             const user = await this.userDB.findUserById(userId);
@@ -716,8 +639,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async adminDeleteUser(ctx: TraceContext, userId: string): Promise<void> {
         traceAPIParams(ctx, { userId });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminDeleteUser", { id: userId }, Permission.ADMIN_USERS);
 
         try {
@@ -732,7 +653,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         req: AdminGetListRequest<BlockedRepository>,
     ): Promise<AdminGetListResult<BlockedRepository>> {
         traceAPIParams(ctx, { req: censor(req, "searchTerm") }); // searchTerm may contain PII
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminGetBlockedRepositories", { req }, Permission.ADMIN_USERS);
 
@@ -756,7 +676,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         blockUser: boolean,
     ): Promise<BlockedRepository> {
         traceAPIParams(ctx, { urlRegexp, blockUser });
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminCreateBlockedRepository", { urlRegexp, blockUser }, Permission.ADMIN_USERS);
 
@@ -765,7 +684,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
     async adminDeleteBlockedRepository(ctx: TraceContext, id: number): Promise<void> {
         traceAPIParams(ctx, { id });
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminDeleteBlockedRepository", { id }, Permission.ADMIN_USERS);
 
@@ -774,8 +692,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
     async adminModifyRoleOrPermission(ctx: TraceContext, req: AdminModifyRoleOrPermissionRequest): Promise<User> {
         traceAPIParams(ctx, { req });
-
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminModifyRoleOrPermission", { req }, Permission.ADMIN_USERS);
 
@@ -807,8 +723,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     ): Promise<User> {
         traceAPIParams(ctx, { req });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminModifyPermanentWorkspaceFeatureFlag", { req }, Permission.ADMIN_USERS);
         const target = await this.userDB.findUserById(req.id);
         if (!target) {
@@ -835,7 +749,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     }
 
     async adminGetTeamMembers(ctx: TraceContext, teamId: string): Promise<TeamMemberInfo[]> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminGetTeamMembers", { teamId }, Permission.ADMIN_WORKSPACES);
 
         const team = await this.teamDB.findTeamById(teamId);
@@ -847,7 +760,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     }
 
     async adminGetTeams(ctx: TraceContext, req: AdminGetListRequest<Team>): Promise<AdminGetListResult<Team>> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminGetTeams", { req }, Permission.ADMIN_WORKSPACES);
 
         return await this.teamDB.findTeams(
@@ -860,7 +772,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     }
 
     async adminGetTeamById(ctx: TraceContext, id: string): Promise<Team | undefined> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminGetTeamById", { id }, Permission.ADMIN_WORKSPACES);
         return await this.teamDB.findTeamById(id);
     }
@@ -871,7 +782,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         userId: string,
         role: TeamMemberRole,
     ): Promise<void> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminSetTeamMemberRole", { teamId, userId, role }, Permission.ADMIN_WORKSPACES);
         return this.teamDB.setTeamMemberRole(userId, teamId, role);
     }
@@ -881,8 +791,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         req: AdminGetWorkspacesRequest,
     ): Promise<AdminGetListResult<WorkspaceAndInstance>> {
         traceAPIParams(ctx, { req });
-
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess("adminGetWorkspaces", { req }, Permission.ADMIN_WORKSPACES);
 
@@ -900,8 +808,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async adminGetWorkspace(ctx: TraceContext, workspaceId: string): Promise<WorkspaceAndInstance> {
         traceAPIParams(ctx, { workspaceId });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminGetWorkspace", { id: workspaceId }, Permission.ADMIN_WORKSPACES);
 
         const result = await this.workspaceDb.trace(ctx).findWorkspaceAndInstance(workspaceId);
@@ -914,8 +820,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     async adminForceStopWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
         traceAPIParams(ctx, { workspaceId });
 
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
-
         await this.guardAdminAccess("adminForceStopWorkspace", { id: workspaceId }, Permission.ADMIN_WORKSPACES);
 
         const workspace = await this.workspaceDb.trace(ctx).findById(workspaceId);
@@ -926,8 +830,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
     async adminRestoreSoftDeletedWorkspace(ctx: TraceContext, workspaceId: string): Promise<void> {
         traceAPIParams(ctx, { workspaceId });
-
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
 
         await this.guardAdminAccess(
             "adminRestoreSoftDeletedWorkspace",
@@ -958,7 +860,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         ctx: TraceContext,
         req: AdminGetListRequest<Project>,
     ): Promise<AdminGetListResult<Project>> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminGetProjectsBySearchTerm", { req }, Permission.ADMIN_PROJECTS);
         return await this.projectDB.findProjectsBySearchTerm(
             req.offset,
@@ -970,7 +871,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     }
 
     async adminGetProjectById(ctx: TraceContext, id: string): Promise<Project | undefined> {
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminGetProjectById", { id }, Permission.ADMIN_PROJECTS);
         return await this.projectDB.findProjectById(id);
     }
@@ -1037,7 +937,11 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                     prebuiltWorkspace,
                 };
                 return result;
-            } else if (prebuiltWorkspace.state === "queued" || prebuiltWorkspace.state === "building") {
+            } else if (prebuiltWorkspace.state === "queued") {
+                // waiting for a prebuild that has not even started yet, doesn't make sense.
+                // starting a workspace from git will be faster anyway
+                return;
+            } else if (prebuiltWorkspace.state === "building") {
                 if (ignoreRunningPrebuild) {
                     // in force mode we ignore running prebuilds as we want to start a workspace as quickly as we can.
                     return;
@@ -1058,22 +962,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
                 const wsi = await this.workspaceDb.trace(ctx).findCurrentInstance(workspaceID);
                 if (!wsi || wsi.stoppedTime !== undefined) {
-                    if (prebuiltWorkspace.state === "queued") {
-                        if (Date.now() - Date.parse(prebuiltWorkspace.creationTime) > 1000 * 60) {
-                            // queued for long than a minute? Let's retrigger
-                            console.warn("Retriggering queued prebuild.", prebuiltWorkspace);
-                            try {
-                                const project = prebuiltWorkspace.projectId
-                                    ? await this.projectDB.findProjectById(prebuiltWorkspace.projectId)
-                                    : undefined;
-                                await this.prebuildManager.retriggerPrebuild(ctx, user, project, workspaceID);
-                            } catch (err) {
-                                console.error(err);
-                            }
-                        }
-                        return makeResult(wsi!.id);
-                    }
-
                     return;
                 }
 
@@ -1170,26 +1058,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         await this.guardAdminAccess("adminGetWorkspaces", { key }, Permission.ADMIN_API);
 
         await this.licenseDB.store(uuidv4(), key);
-        await this.licenseEvaluator.reloadLicense();
-    }
-
-    async licenseIncludesFeature(ctx: TraceContext, licenseFeature: LicenseFeature): Promise<boolean> {
-        traceAPIParams(ctx, { licenseFeature });
-
-        this.checkAndBlockUser("licenseIncludesFeature");
-
-        let feature: Feature | undefined;
-        switch (licenseFeature) {
-            case LicenseFeature.CreateSnapshot:
-                feature = Feature.FeatureSnapshot;
-            // room for more
-            default:
-        }
-        if (feature) {
-            const userCount = await this.userDB.getUserCount(true);
-            return this.licenseEvaluator.isEnabled(feature, userCount);
-        }
-        return false;
     }
 
     // (SaaS) – accounting
@@ -1613,8 +1481,27 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
     // Team Subscriptions 2
     async getTeamSubscription(ctx: TraceContext, teamId: string): Promise<TeamSubscription2 | undefined> {
         this.checkUser("getTeamSubscription");
-        await this.guardTeamOperation(teamId, "get");
+        await this.guardTeamOperation(teamId, "get", "not_implemented");
         return this.teamSubscription2DB.findForTeam(teamId, new Date().toISOString());
+    }
+
+    async cancelTeamSubscription(ctx: TraceContext, teamId: string): Promise<void> {
+        this.checkUser("cancelTeamSubscription", { teamId });
+
+        await this.guardTeamOperation(teamId, "update", "not_implemented");
+        const ts2 = await this.teamSubscription2DB.findForTeam(teamId, new Date().toISOString());
+        if (!ts2) {
+            throw new ResponseError(ErrorCodes.NOT_FOUND, "Cannot find Team Subscription!");
+        }
+
+        const chargebeeSubscriptionId = ts2.paymentReference;
+        await this.chargebeeService.cancelSubscription(
+            chargebeeSubscriptionId,
+            {},
+            { teamId, chargebeeSubscriptionId },
+        );
+
+        // Cancellation of team memberships is handled here: https://github.com/gitpod-io/gitpod/blob/5c90cd56572f55749b39e5b7134ff6be6f247357/components/ee/payment-endpoint/src/chargebee/team-subscription-handler.ts#L136-L139
     }
 
     protected async onTeamMemberAdded(userId: string, teamId: string): Promise<void> {
@@ -1678,9 +1565,75 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         return this.teamSubscriptionDB.findTeamSubscriptionsForUser(user.id, new Date().toISOString());
     }
 
+    async tsCancel(ctx: TraceContext, teamSubscriptionId: string): Promise<void> {
+        traceAPIParams(ctx, { teamSubscriptionId });
+        const user = this.checkUser("tsCancel");
+
+        try {
+            const allTS = await this.teamSubscriptionDB.findTeamSubscriptionsForUser(user.id, new Date().toISOString());
+            const ts = allTS.find((ts) => ts.id === teamSubscriptionId);
+            if (!ts) {
+                log.error({ userId: user.id }, "Cannot cancel: unknown Team Subscription (legacy)", {
+                    teamSubscriptionId,
+                });
+                return;
+            }
+
+            await this.chargebeeService.cancelSubscription(
+                ts.paymentReference,
+                {},
+                {
+                    teamSubscriptionId,
+                    kind: "Team Subscription (legacy)",
+                },
+            );
+        } catch (err) {
+            throw new ResponseError(ErrorCodes.PAYMENT_ERROR, `${err.api_error_code}: ${err.message}`);
+        }
+    }
+
     async tsGetSlots(ctx: TraceContext): Promise<TeamSubscriptionSlotResolved[]> {
         const user = this.checkUser("tsGetSlots");
         return this.teamSubscriptionService.findTeamSubscriptionSlotsBy(user.id, new Date());
+    }
+
+    async tsAddMembersToOrg(ctx: TraceContext, teamSubscriptionId: string, organizationId: string): Promise<void> {
+        const user = this.checkUser("tsAddMembersToOrg");
+
+        // Add logging to help us identify trouble with this operation very easily
+        try {
+            log.info({ userId: user.id }, "tsAddMembersToOrg: Started", { teamSubscriptionId, organizationId });
+
+            // TeamSubscription
+            const ts = await this.teamSubscriptionDB.findTeamSubscriptionById(teamSubscriptionId);
+            if (!ts || ts.userId !== user.id) {
+                throw new ResponseError(ErrorCodes.NOT_FOUND, "Cannot find TeamSubscription");
+            }
+
+            // Organization
+            const { team, members } = await this.guardTeamOperation(organizationId, "update", "org_write");
+            const teamOwner = members.find((m) => m.userId === user.id && m.role === "owner");
+            if (!teamOwner) {
+                throw new ResponseError(ErrorCodes.PERMISSION_DENIED, "You are not an owner of this Organization");
+            }
+
+            // Take all slots, identify the members, and add to the Organization
+            const slots = await this.teamSubscriptionDB.findSlotsByTeamSubscriptionId(teamSubscriptionId);
+            const adds = [];
+            for (const slot of slots) {
+                if (!slot.assigneeId) {
+                    // Totally ok, it's just not assigned atm.
+                    continue;
+                }
+                adds.push(this.teamDB.addMemberToTeam(slot.assigneeId, team.id));
+            }
+            await Promise.all(adds);
+
+            log.info({ userId: user.id }, "tsAddMembersToOrg: DONE", { teamSubscriptionId, organizationId });
+        } catch (err) {
+            log.error({ userId: user.id }, "tsAddMembersToOrg: ERROR", err, { teamSubscriptionId, organizationId });
+            throw err;
+        }
     }
 
     async tsGetUnassignedSlot(
@@ -2115,7 +2068,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
         try {
             if (attrId.kind == "team") {
-                await this.guardTeamOperation(attrId.teamId, "get");
+                await this.guardTeamOperation(attrId.teamId, "get", "not_implemented");
             }
             const subscriptionId = await this.stripeService.findUncancelledSubscriptionByAttributionId(attributionId);
             return subscriptionId;
@@ -2128,16 +2081,43 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
     }
 
-    async createStripeCustomerIfNeeded(ctx: TraceContext, attributionId: string, currency: string): Promise<void> {
-        const user = this.checkAndBlockUser("createStripeCustomerIfNeeded");
+    async getPriceInformation(ctx: TraceContext, attributionId: string): Promise<string | undefined> {
+        const user = this.checkAndBlockUser("getPriceInformation");
         const attrId = AttributionId.parse(attributionId);
         if (!attrId) {
             throw new ResponseError(ErrorCodes.BAD_REQUEST, `Invalid attributionId '${attributionId}'`);
         }
         let team: Team | undefined;
         if (attrId.kind === "team") {
-            team = await this.guardTeamOperation(attrId.teamId, "update");
+            team = (await this.guardTeamOperation(attrId.teamId, "update", "not_implemented")).team;
             await this.ensureStripeApiIsAllowed({ team });
+        } else {
+            if (attrId.userId !== user.id) {
+                throw new ResponseError(
+                    ErrorCodes.PERMISSION_DENIED,
+                    "Cannot get pricing information for another user",
+                );
+            }
+            await this.ensureStripeApiIsAllowed({ user });
+        }
+        return this.stripeService.getPriceInformation(attributionId);
+    }
+
+    async createStripeCustomerIfNeeded(ctx: TraceContext, attributionId: string, currency: string): Promise<void> {
+        const user = this.checkAndBlockUser("createStripeCustomerIfNeeded");
+        const attrId = AttributionId.parse(attributionId);
+        if (!attrId) {
+            throw new ResponseError(ErrorCodes.BAD_REQUEST, `Invalid attributionId '${attributionId}'`);
+        }
+
+        const switchToPAYG = await this.isEnabledSwitchToPAYG(user);
+
+        let team: Team | undefined;
+        if (attrId.kind === "team") {
+            team = (await this.guardTeamOperation(attrId.teamId, "update", "not_implemented")).team;
+            if (!switchToPAYG) {
+                await this.ensureStripeApiIsAllowed({ team });
+            }
         } else {
             if (attrId.userId !== user.id) {
                 throw new ResponseError(
@@ -2145,7 +2125,9 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                     "Cannot create Stripe customer profile for another user",
                 );
             }
-            await this.ensureStripeApiIsAllowed({ user });
+            if (!switchToPAYG) {
+                await this.ensureStripeApiIsAllowed({ user });
+            }
         }
 
         const billingEmail = User.getPrimaryEmail(user);
@@ -2155,7 +2137,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         try {
             customer = (await this.billingService.getStripeCustomer({ attributionId })).customer;
         } catch (e) {
-            log.error(e);
+            log.info(e);
         }
         if (customer) {
             // NOTE: this is a temporary workaround, as long as we're not automatically re-create the customer
@@ -2178,6 +2160,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                 currency,
                 email: billingEmail,
                 name: billingName,
+                billingCreatorUserId: user.id,
             });
             return;
         } catch (error) {
@@ -2202,14 +2185,19 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         }
 
         const user = this.checkAndBlockUser("subscribeToStripe");
+        const switchToPAYG = await this.isEnabledSwitchToPAYG(user);
 
         let team: Team | undefined;
         try {
             if (attrId.kind === "team") {
-                team = await this.guardTeamOperation(attrId.teamId, "update");
-                await this.ensureStripeApiIsAllowed({ team });
+                team = (await this.guardTeamOperation(attrId.teamId, "update", "not_implemented")).team;
+                if (!switchToPAYG) {
+                    await this.ensureStripeApiIsAllowed({ team });
+                }
             } else {
-                await this.ensureStripeApiIsAllowed({ user });
+                if (!switchToPAYG) {
+                    await this.ensureStripeApiIsAllowed({ user });
+                }
             }
             const customerId = await this.stripeService.findCustomerByAttributionId(attributionId);
             if (!customerId) {
@@ -2227,11 +2215,12 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                 },
             });
 
-            this.messageBus.notifyOnSubscriptionUpdate(ctx, attrId).catch();
-
             return costCenter?.spendingLimit;
         } catch (error) {
             log.error(`Failed to subscribe '${attributionId}' to Stripe`, error);
+            if (error instanceof ClientError) {
+                throw new ResponseError(error.code, error.details);
+            }
             throw new ResponseError(
                 ErrorCodes.INTERNAL_SERVER_ERROR,
                 `Failed to subscribe '${attributionId}' to Stripe`,
@@ -2248,13 +2237,15 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
         const user = this.checkAndBlockUser("getStripePortalUrl");
 
-        let returnUrl = this.config.hostUrl.with(() => ({ pathname: `/billing` })).toString();
+        let returnUrl = this.config.hostUrl
+            .with(() => ({ pathname: `/billing`, search: `org=${attrId.kind === "team" ? attrId.teamId : "0"}` }))
+            .toString();
         if (attrId.kind === "user") {
             await this.ensureStripeApiIsAllowed({ user });
+            returnUrl = this.config.hostUrl.with(() => ({ pathname: `/user/billing`, search: `org=0` })).toString();
         } else if (attrId.kind === "team") {
-            const team = await this.guardTeamOperation(attrId.teamId, "update");
+            const team = (await this.guardTeamOperation(attrId.teamId, "update", "not_implemented")).team;
             await this.ensureStripeApiIsAllowed({ team });
-            returnUrl = this.config.hostUrl.with(() => ({ pathname: `/t/${team.slug}/billing` })).toString();
         }
         let url: string;
         try {
@@ -2330,51 +2321,15 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                 billingStrategy: response.costCenter.billingStrategy,
             },
         });
-
-        this.messageBus.notifyOnSubscriptionUpdate(ctx, attrId).catch();
     }
 
-    async getNotifications(ctx: TraceContext): Promise<string[]> {
-        const result = await super.getNotifications(ctx);
-        const user = this.checkAndBlockUser("getNotifications");
-
-        try {
-            const billingMode = await this.billingModes.getBillingModeForUser(user, new Date());
-            if (billingMode.mode === "usage-based") {
-                const limit = await this.userService.checkUsageLimitReached(user);
-                await this.guardCostCenterAccess(ctx, user.id, limit.attributionId, "get");
-
-                switch (limit.attributionId.kind) {
-                    case "user": {
-                        if (limit.reached) {
-                            result.unshift(`You have reached your usage limit.`);
-                        } else if (limit.almostReached) {
-                            result.unshift(`You have reached 80% or more of your usage limit.`);
-                        }
-                        break;
-                    }
-                    case "team": {
-                        const teamOrUser = await this.teamDB.findTeamById(limit.attributionId.teamId);
-                        if (teamOrUser) {
-                            if (limit.reached) {
-                                result.push(teamOrUser?.slug);
-                                result.unshift(`Your team '${teamOrUser?.name}' has reached its usage limit.`);
-                            } else if (limit.almostReached) {
-                                result.push(teamOrUser?.slug);
-                                result.unshift(
-                                    `Your team '${teamOrUser?.name}' has reached 80% or more of its usage limit.`,
-                                );
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        } catch (error) {
-            log.warn({ userId: user.id }, "Could not get usage-based notifications for user", { error });
-        }
-
-        return result;
+    /**
+     * The "switchToPAYG" flag controls the nudge of subscribers to switch to PAYG.
+     */
+    protected async isEnabledSwitchToPAYG(user: User | undefined) {
+        return await this.configCatClientFactory().getValueAsync("switchToPAYG", false, {
+            user,
+        });
     }
 
     async listUsage(ctx: TraceContext, req: ListUsageRequest): Promise<ListUsageResponse> {
@@ -2486,7 +2441,7 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
         traceAPIParams(ctx, { teamId });
 
         this.checkAndBlockUser("getBillingModeForTeam");
-        const team = await this.guardTeamOperation(teamId, "get");
+        const { team } = await this.guardTeamOperation(teamId, "get", "not_implemented");
 
         return this.billingModes.getBillingModeForTeam(team, new Date());
     }
@@ -2720,7 +2675,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
 
     async adminFindPrebuilds(ctx: TraceContext, params: FindPrebuildsParams): Promise<PrebuildWithStatus[]> {
         traceAPIParams(ctx, { params });
-        await this.requireEELicense(Feature.FeatureAdminDashboard);
         await this.guardAdminAccess("adminFindPrebuilds", { params }, Permission.ADMIN_PROJECTS);
 
         return this.projectsService.findPrebuilds(params);
@@ -2813,8 +2767,6 @@ export class GitpodServerEEImpl extends GitpodServerImpl {
                 billingStrategy: response.costCenter.billingStrategy,
             },
         });
-
-        this.messageBus.notifyOnSubscriptionUpdate(ctx, attrId).catch((e) => log.error(e));
     }
 
     async adminListUsage(ctx: TraceContext, req: ListUsageRequest): Promise<ListUsageResponse> {

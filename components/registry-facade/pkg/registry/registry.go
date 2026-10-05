@@ -28,12 +28,12 @@ import (
 	"github.com/docker/distribution/reference"
 	"github.com/docker/distribution/registry/api/errcode"
 	distv2 "github.com/docker/distribution/registry/api/v2"
-	"github.com/go-redis/redis/v8"
 	"github.com/golang/protobuf/jsonpb"
 	"github.com/gorilla/mux"
 	httpapi "github.com/ipfs/go-ipfs-http-client"
 	ma "github.com/multiformats/go-multiaddr"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/xerrors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -164,29 +164,19 @@ func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus
 
 	specProvider := map[string]ImageSpecProvider{}
 	if cfg.RemoteSpecProvider != nil {
-		grpcOpts := common_grpc.DefaultClientOptions()
-		if cfg.RemoteSpecProvider.TLS != nil {
-			tlsConfig, err := common_grpc.ClientAuthTLSConfig(
-				cfg.RemoteSpecProvider.TLS.Authority, cfg.RemoteSpecProvider.TLS.Certificate, cfg.RemoteSpecProvider.TLS.PrivateKey,
-				common_grpc.WithSetRootCAs(true),
-				common_grpc.WithServerName("ws-manager"),
-			)
+		var providers []ImageSpecProvider
+		for _, providerCfg := range cfg.RemoteSpecProvider {
+			rsp, err := createRemoteSpecProvider(providerCfg)
 			if err != nil {
-				log.WithField("config", cfg.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
-				return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+				return nil, err
 			}
 
-			grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
-		} else {
-			grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+			providers = append(providers, rsp)
 		}
 
-		specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.RemoteSpecProvider.Addr, grpcOpts))
-		if err != nil {
-			return nil, xerrors.Errorf("cannot create caching spec provider: %w", err)
-		}
-		specProvider[api.ProviderPrefixRemote] = specprov
+		specProvider[api.ProviderPrefixRemote] = NewCompositeSpecProvider(providers...)
 	}
+
 	if cfg.FixedSpecProvider != "" {
 		fc, err := ioutil.ReadFile(cfg.FixedSpecProvider)
 		if err != nil {
@@ -253,6 +243,32 @@ func NewRegistry(cfg config.Config, newResolver ResolverProvider, reg prometheus
 	}, nil
 }
 
+func createRemoteSpecProvider(cfg *config.RSProvider) (ImageSpecProvider, error) {
+	grpcOpts := common_grpc.DefaultClientOptions()
+	if cfg.TLS != nil {
+		tlsConfig, err := common_grpc.ClientAuthTLSConfig(
+			cfg.TLS.Authority, cfg.TLS.Certificate, cfg.TLS.PrivateKey,
+			common_grpc.WithSetRootCAs(true),
+			common_grpc.WithServerName("ws-manager"),
+		)
+		if err != nil {
+			log.WithField("config", cfg.TLS).Error("Cannot load ws-manager certs - this is a configuration issue.")
+			return nil, xerrors.Errorf("cannot load ws-manager certs: %w", err)
+		}
+
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)))
+	} else {
+		grpcOpts = append(grpcOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	}
+
+	specprov, err := NewCachingSpecProvider(128, NewRemoteSpecProvider(cfg.Addr, grpcOpts))
+	if err != nil {
+		return nil, xerrors.Errorf("cannot create caching spec provider: %w", err)
+	}
+
+	return specprov, nil
+}
+
 func getRedisClient(cfg *config.RedisCacheConfig) (*redis.Client, error) {
 	if cfg.SingleHostAddress == "" {
 		return nil, xerrors.Errorf("registry-facade setting 'singleHostAddr' is missing")
@@ -260,8 +276,12 @@ func getRedisClient(cfg *config.RedisCacheConfig) (*redis.Client, error) {
 
 	opts := &redis.Options{
 		Addr:     cfg.SingleHostAddress,
-		Username: cfg.Username,
+		Username: "default",
 		Password: cfg.Password,
+	}
+
+	if cfg.Username != "" {
+		opts.Username = cfg.Username
 	}
 
 	if cfg.UseTLS {
@@ -271,7 +291,7 @@ func getRedisClient(cfg *config.RedisCacheConfig) (*redis.Client, error) {
 		}
 	}
 
-	log.WithField("addr", cfg.SingleHostAddress).WithField("tls", cfg.UseTLS).Info("connecting to single Redis host")
+	log.WithField("addr", cfg.SingleHostAddress).WithField("username", cfg.Username).WithField("tls", cfg.UseTLS).Info("connecting to Redis")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

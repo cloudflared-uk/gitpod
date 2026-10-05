@@ -26,9 +26,10 @@ GITPOD_CONTAINER_REGISTRY_URL="eu.gcr.io/gitpod-core-dev/build/";
 GITPOD_IMAGE_PULL_SECRET_NAME="gcp-sa-registry-auth";
 GITPOD_PROXY_SECRET_NAME="proxy-config-certificates";
 GITPOD_ANALYTICS="${GITPOD_ANALYTICS:-}"
-GITPOD_WITH_EE_LICENSE="${GITPOD_WITH_EE_LICENSE:-true}"
 GITPOD_WORKSPACE_FEATURE_FLAGS="${GITPOD_WORKSPACE_FEATURE_FLAGS:-}"
-GITPOD_WITH_SLOW_DATABASE="${GITPOD_WITH_SLOW_DATABASE:-false}"
+GITPOD_WITH_DEDICATED_EMU="${GITPOD_WITH_DEDICATED_EMU:-false}"
+GITPOD_WSMANAGER_MK2="${GITPOD_WSMANAGER_MK2:-false}"
+
 
 if [[ "${VERSION:-}" == "" ]]; then
   if [[ ! -f  /tmp/local-dev-version ]]; then
@@ -132,35 +133,16 @@ EOF
 }
 
 function installRookCeph {
-  kubectl \
-    --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-    --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-    apply -f "$ROOT/.werft/vm/manifests/rook-ceph/crds.yaml" --server-side --force-conflicts
+  diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" "$ROOT/.werft/vm/manifests/rook-ceph/crds.yaml"
 
   kubectl \
     --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
     --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
     wait --for condition=established --timeout=120s crd/cephclusters.ceph.rook.io
 
-  kubectl \
-    --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-    --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-    apply -f "$ROOT/.werft/vm/manifests/rook-ceph/common.yaml" -f "$ROOT/.werft/vm/manifests/rook-ceph/operator.yaml"
-
-  kubectl \
-    --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-    --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-    apply -f "$ROOT/.werft/vm/manifests/rook-ceph/cluster-test.yaml"
-
-  kubectl \
-    --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-    --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-    apply -f "$ROOT/.werft/vm/manifests/rook-ceph/storageclass-test.yaml"
-
-  kubectl \
-    --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-    --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-    apply -f "$ROOT/.werft/vm/manifests/rook-ceph/snapshotclass.yaml"
+  for file in common operator cluster-test storageclass-test snapshotclass;do
+      diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" "$ROOT/.werft/vm/manifests/rook-ceph/$file.yaml"
+  done
 }
 
 # Install Fluent-Bit sending logs to GCP
@@ -197,6 +179,23 @@ function installFluentBit {
       upgrade --install fluent-bit fluent/fluent-bit --version 0.21.6 -n "${PREVIEW_NAMESPACE}" -f "$ROOT/.werft/vm/charts/fluentbit/values.yaml"
 }
 
+function installTrustManager {
+    helm3 \
+      --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
+      --kube-context "${PREVIEW_K3S_KUBE_CONTEXT}" \
+      repo add jetstack https://charts.jetstack.io
+
+    helm3 \
+      --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
+      --kube-context "${PREVIEW_K3S_KUBE_CONTEXT}" \
+      repo update
+
+    helm3 \
+      --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
+      --kube-context "${PREVIEW_K3S_KUBE_CONTEXT}" \
+      upgrade --install --namespace cert-manager trust-manager jetstack/trust-manager --wait
+}
+
 # ====================================
 # Prerequisites
 # ====================================
@@ -219,6 +218,7 @@ done
 copyImagePullSecret
 installRookCeph
 installFluentBit
+installTrustManager
 
 # ========
 # Init
@@ -333,24 +333,38 @@ yq w -i "${INSTALLER_CONFIG_PATH}" observability.tracing.endpoint "${TRACING_END
 #
 # configureAuthProviders
 #
-for row in $(kubectl --kubeconfig "$DEV_KUBE_PATH" --context "${DEV_KUBE_CONTEXT}" get secret preview-envs-authproviders-harvester --namespace=keys -o jsonpath="{.data.authProviders}" \
-| base64 -d -w 0 \
-| yq r - authProviders -j \
-| jq -r 'to_entries | .[] | @base64'); do
-    key=$(echo "${row}" | base64 -d | jq -r '.key')
-    providerId=$(echo "$row" | base64 -d | jq -r '.value.id | ascii_downcase')
-    data=$(echo "$row" | base64 -d | yq r - value --prettyPrint)
-    yq w -i "${INSTALLER_CONFIG_PATH}" authProviders["$key"].kind "secret"
-    yq w -i "${INSTALLER_CONFIG_PATH}" authProviders["$key"].name "$providerId"
 
-    kubectl create secret generic "$providerId" \
-        --namespace "${PREVIEW_NAMESPACE}" \
-        --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
-        --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
-        --from-literal=provider="$data" \
-        --dry-run=client -o yaml | \
-        kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" replace --force -f -
-done
+if [[ "${GITPOD_WITH_DEDICATED_EMU}" != "true" ]]
+then
+  for row in $(kubectl --kubeconfig "$DEV_KUBE_PATH" --context "${DEV_KUBE_CONTEXT}" get secret preview-envs-authproviders-harvester --namespace=keys -o jsonpath="{.data.authProviders}" \
+  | base64 -d -w 0 \
+  | yq r - authProviders -j \
+  | jq -r 'to_entries | .[] | @base64'); do
+      key=$(echo "${row}" | base64 -d | jq -r '.key')
+      providerId=$(echo "$row" | base64 -d | jq -r '.value.id | ascii_downcase')
+      data=$(echo "$row" | base64 -d | yq r - value --prettyPrint)
+      yq w -i "${INSTALLER_CONFIG_PATH}" authProviders["$key"].kind "secret"
+      yq w -i "${INSTALLER_CONFIG_PATH}" authProviders["$key"].name "$providerId"
+
+      kubectl create secret generic "$providerId" \
+          --namespace "${PREVIEW_NAMESPACE}" \
+          --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" \
+          --context "${PREVIEW_K3S_KUBE_CONTEXT}" \
+          --from-literal=provider="$data" \
+          --dry-run=client -o yaml | \
+          kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" replace --force -f -
+  done
+fi
+
+#
+# configure dedicated emulation
+#
+
+if [[ "${GITPOD_WITH_DEDICATED_EMU}" == "true" ]]
+then
+  # Suppress the Self-Hosted setup modal
+  yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.server.showSetupModal "false"
+fi
 
 #
 # configureStripeAPIKeys
@@ -360,8 +374,19 @@ yq w -i stripe-api-keys.secret.yaml metadata.namespace "default"
 yq d -i stripe-api-keys.secret.yaml metadata.creationTimestamp
 yq d -i stripe-api-keys.secret.yaml metadata.uid
 yq d -i stripe-api-keys.secret.yaml metadata.resourceVersion
-kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" apply -f stripe-api-keys.secret.yaml
+diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" stripe-api-keys.secret.yaml
 rm -f stripe-api-keys.secret.yaml
+
+#
+# configureLinkedIn
+#
+kubectl --kubeconfig "${DEV_KUBE_PATH}" --context "${DEV_KUBE_CONTEXT}" -n werft get secret linked-in -o yaml > linked-in.secret.yaml
+yq w -i linked-in.secret.yaml metadata.namespace "default"
+yq d -i linked-in.secret.yaml metadata.creationTimestamp
+yq d -i linked-in.secret.yaml metadata.uid
+yq d -i linked-in.secret.yaml metadata.resourceVersion
+diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" linked-in.secret.yaml
+rm -f linked-in.secret.yaml
 
 #
 # configureSSHGateway
@@ -370,8 +395,9 @@ kubectl --kubeconfig "${DEV_KUBE_PATH}" --context "${DEV_KUBE_CONTEXT}" --namesp
 | yq w - metadata.namespace ${PREVIEW_NAMESPACE} \
 | yq d - metadata.uid \
 | yq d - metadata.resourceVersion \
-| yq d - metadata.creationTimestamp \
-| kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" apply -f -
+| yq d - metadata.creationTimestamp > host-key.yaml
+diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" host-key.yaml
+rm -f host-key.yaml
 
 yq w -i "${INSTALLER_CONFIG_PATH}" sshGatewayHostKey.kind "secret"
 yq w -i "${INSTALLER_CONFIG_PATH}" sshGatewayHostKey.name "host-key"
@@ -389,8 +415,8 @@ yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.usage.defaultSpendingLimi
 # Configure Price IDs
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.individualUsagePriceIds['EUR'] "price_1LmYVxGadRXm50o3AiLq0Qmo"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.individualUsagePriceIds['USD'] "price_1LmYWRGadRXm50o3Ym8PLqnG"
-yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.teamUsagePriceIds['EUR'] "price_1LiId7GadRXm50o3OayAS2y4"
-yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.teamUsagePriceIds['USD'] "price_1LiIdbGadRXm50o3ylg5S44r"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.teamUsagePriceIds['EUR'] "price_1LmYVxGadRXm50o3AiLq0Qmo"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.stripe.teamUsagePriceIds['USD'] "price_1LmYWRGadRXm50o3Ym8PLqnG"
 
 #
 # configureConfigCat
@@ -401,24 +427,29 @@ yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.proxy.configcat.baseUrl "
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.proxy.configcat.pollInterval "1m"
 
 #
+# configure JWT signign key
+#
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.publicApi.oidcClientJWTSigningKeySecretName "oidc-client-jwt-signing-key"
+
+#
 # configure Personal Access Token signign key
 #
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.publicApi.personalAccessTokenSigningKeySecretName "personal-access-token-signing-key"
 
 #
-# configureDefaultTemplate
+# configure workspace template and workspace class template
 #
 yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers[+].name' "workspace"
 yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_PREVENT_METADATA_ACCESS"
 yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_PREVENT_METADATA_ACCESS).value' "true"
 
-#
-# configureSlowDatabase
-#
-if [[ "${GITPOD_WITH_SLOW_DATABASE}" == "true" ]]
-then
-  yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.webapp.slowDatabase" "true"
-fi
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers[+].name' "workspace"
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_PREVENT_METADATA_ACCESS"
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_PREVENT_METADATA_ACCESS).value' "true"
+
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers[+].name' "workspace"
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_PREVENT_METADATA_ACCESS"
+yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_PREVENT_METADATA_ACCESS).value' "true"
 
 #
 # includeAnalytics
@@ -431,9 +462,29 @@ if [[ "${GITPOD_ANALYTICS}" == "segment" ]]; then
   yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_WRITER).value' "segment"
   yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_ANALYTICS_SEGMENT_KEY"
   yq w -i "${INSTALLER_CONFIG_PATH}" 'workspace.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_SEGMENT_KEY).value' "${GITPOD_ANALYTICS_SEGMENT_TOKEN}"
+
+  # add to default workspace class
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_ANALYTICS_WRITER"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_WRITER).value' "segment"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_ANALYTICS_SEGMENT_KEY"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.default.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_SEGMENT_KEY).value' "${GITPOD_ANALYTICS_SEGMENT_TOKEN}"
+
+  # add to small workspace class
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_ANALYTICS_WRITER"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_WRITER).value' "segment"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env[+].name' "GITPOD_ANALYTICS_SEGMENT_KEY"
+  yq w -i "${INSTALLER_CONFIG_PATH}" 'experimental.workspace.classes.small.templates.default.spec.containers.(name==workspace).env.(name==GITPOD_ANALYTICS_SEGMENT_KEY).value' "${GITPOD_ANALYTICS_SEGMENT_TOKEN}"
 else
   yq w -i "${INSTALLER_CONFIG_PATH}" analytics.writer ""
 fi
+
+#
+# wsManagerMk2
+#
+if [[ "${GITPOD_WSMANAGER_MK2}" == "true" ]]; then
+  yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.workspace.useWsmanagerMk2" "true"
+fi
+
 
 #
 # chargebee
@@ -447,22 +498,31 @@ yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.webapp.server.stripeSecret" "st
 yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.webapp.server.stripeConfig" "stripe-config"
 
 #
-# IAM
+# LinkedIn
 #
+yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.webapp.server.linkedInSecret" "linked-in"
 
-# copy secret from werft's space
-kubectl --kubeconfig "${DEV_KUBE_PATH}" --context "${DEV_KUBE_CONTEXT}" -n werft get secret preview-envs-oidc-clients-config-secret -o yaml > preview-envs-oidc-clients-config-secret.secret.yaml
-yq d -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.name
-yq d -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.creationTimestamp
-yq d -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.uid
-yq d -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.resourceVersion
-yq w -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.name "oidc-clients-config-secret"
-yq w -i preview-envs-oidc-clients-config-secret.secret.yaml metadata.namespace "default"
-kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" apply -f preview-envs-oidc-clients-config-secret.secret.yaml
-rm -f preview-envs-oidc-clients-config-secret.secret.yaml
+#
+# Enable SpiceDB on all preview envs
+#
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.spicedb.enabled "true"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.spicedb.secretRef "spicedb-secret"
 
-# enable config
-yq w -i "${INSTALLER_CONFIG_PATH}" "experimental.webapp.iam.oidsClientsConfigSecret" "oidc-clients-config-secret"
+#
+# Configure spicedb secret
+#
+kubectl --kubeconfig "${DEV_KUBE_PATH}" --context "${DEV_KUBE_CONTEXT}" -n werft get secret spicedb-secret -o yaml > spicedb-secret.yaml
+yq w -i spicedb-secret.yaml metadata.namespace "default"
+yq d -i spicedb-secret.yaml metadata.creationTimestamp
+yq d -i spicedb-secret.yaml metadata.uid
+yq d -i spicedb-secret.yaml metadata.resourceVersion
+diff-apply "${PREVIEW_K3S_KUBE_CONTEXT}" spicedb-secret.yaml
+rm -f spicedb-secret.yaml
+
+#
+# Enable "Frontend Dev" on all preview envs
+#
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.proxy.frontendDevEnabled "true"
 
 
 log_success "Generated config at $INSTALLER_CONFIG_PATH"
@@ -489,16 +549,6 @@ installer --debug-version-file="/tmp/versions.yaml" render \
 # ===============
 
 log_info "Post-processing"
-
-#
-# configureLicense
-#
-if [[ "${GITPOD_WITH_EE_LICENSE}" == "true" ]]
-then
-  readWerftSecret "gpsh-harvester-license" "license" > /tmp/license
-else
-  touch /tmp/license
-fi
 
 #
 # configureWorkspaceFeatureFlags
@@ -548,7 +598,6 @@ WITH_VM=true "$ROOT/.werft/jobs/build/installer/post-process.sh" "${PREVIEW_NAME
 #
 rm -f /tmp/payment
 rm -f /tmp/defaultFeatureFlags
-rm -f /tmp/license
 rm -f /tmp/public-api
 
 # ===============
@@ -556,15 +605,29 @@ rm -f /tmp/public-api
 # ===============
 
 log_info "Applying manifests (installing)"
-
+# avoid random werft namespace errors
+kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" create namespace werft || true
 kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" delete -n "${PREVIEW_NAMESPACE}" job migrations || true
-kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" apply -f "${INSTALLER_RENDER_PATH}"
+# export the function so we can use it in xargs
+export -f diff-apply
+mkdir temp-installer || true
+pushd temp-installer
+# this will split the big yaml produced by the installer, so we can diff individual parts of it and run them in parallel
+yq4 -s '.kind + "_" + (.metadata.namespace // "") + "_" + .metadata.name' "../${INSTALLER_RENDER_PATH}"
+rm .yml || true # this one is a leftover from the split
+# shellcheck disable=SC2038
+find . | xargs -n 1 -I {} -P 5 bash -c "diff-apply ${PREVIEW_K3S_KUBE_CONTEXT} {}"
+log_info "Applied all"
+popd
+rm -rf temp-installer
 rm -f "${INSTALLER_RENDER_PATH}"
 
 # =========================
-# Wait for pods to be ready
+# Wait for objects to be ready
 # =========================
-waitUntilAllPodsAreReady "${PREVIEW_K3S_KUBE_PATH}" "${PREVIEW_K3S_KUBE_CONTEXT}" "$PREVIEW_NAMESPACE"
+for item in deployment.apps/blobserve deployment.apps/content-service deployment.apps/dashboard deployment.apps/ide-metrics deployment.apps/ide-proxy deployment.apps/ide-service deployment.apps/image-builder-mk3 deployment.apps/minio deployment.apps/node-labeler deployment.apps/payment-endpoint deployment.apps/proxy deployment.apps/public-api-server deployment.apps/redis deployment.apps/server deployment.apps/spicedb deployment.apps/usage deployment.apps/ws-manager deployment.apps/ws-manager-bridge deployment.apps/ws-proxy statefulset.apps/messagebus statefulset.apps/mysql statefulset.apps/openvsx-proxy daemonset.apps/agent-smith daemonset.apps/fluent-bit daemonset.apps/registry-facade daemonset.apps/ws-daemon; do
+  kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" rollout status "${item}" --namespace="${PREVIEW_NAMESPACE}"
+done
 
 # =====================
 # Add agent smith token
@@ -574,5 +637,11 @@ leeway run components:add-smith-token \
   -DPREVIEW_K3S_KUBE_PATH="${PREVIEW_K3S_KUBE_PATH}" \
   -DPREVIEW_K3S_KUBE_CONTEXT="${PREVIEW_K3S_KUBE_CONTEXT}" \
   -DPREVIEW_NAMESPACE="${PREVIEW_NAMESPACE}"
+
+# Add experimental node label if ws-manager-mk2 is enabled.
+# Remove once mk2 workspaces no longer run on experimental nodes.
+if [[ "${GITPOD_WSMANAGER_MK2}" == "true" ]]; then
+  kubectl --kubeconfig "${PREVIEW_K3S_KUBE_PATH}" --context "${PREVIEW_K3S_KUBE_CONTEXT}" --namespace="${PREVIEW_NAMESPACE}" label nodes "${PREVIEW_K3S_KUBE_CONTEXT}" gitpod.io/experimental="true" --overwrite
+fi
 
 log_success "Installation is happy: https://${DOMAIN}/workspaces"

@@ -4,46 +4,38 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { forwardRef, useEffect, useState } from "react";
-import { getGitpodService, gitpodHostUrl } from "../service/service";
-import {
-    ListUsageRequest,
-    Ordering,
-    ListUsageResponse,
-    WorkspaceInstanceUsageData,
-    Usage,
-} from "@gitpod/gitpod-protocol/lib/usage";
-import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
-import { Item, ItemField, ItemsList } from "../components/ItemsList";
-import Pagination from "../Pagination/Pagination";
-import Header from "../components/Header";
-import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import { ReactComponent as CreditsSvg } from "../images/credits.svg";
-import Spinner from "../icons/Spinner.svg";
-import { ReactComponent as UsageIcon } from "../images/usage-default.svg";
-import { toRemoteURL } from "../projects/render-utils";
 import { WorkspaceType } from "@gitpod/gitpod-protocol";
-import { SupportedWorkspaceClass } from "@gitpod/gitpod-protocol/lib/workspace-class";
+import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
+import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { ListUsageRequest, Ordering, Usage, WorkspaceInstanceUsageData } from "@gitpod/gitpod-protocol/lib/usage";
+import dayjs from "dayjs";
+import { forwardRef, useEffect, useMemo, useState } from "react";
 import DatePicker from "react-datepicker";
 import "react-datepicker/dist/react-datepicker.css";
-import "./react-datepicker.css";
 import { useLocation } from "react-router";
-import dayjs from "dayjs";
+import Header from "../components/Header";
+import { Item, ItemField, ItemsList } from "../components/ItemsList";
+import { useListUsage } from "../data/usage/usage-query";
+import { useWorkspaceClasses } from "../data/workspaces/workspace-classes-query";
+import Spinner from "../icons/Spinner.svg";
+import { ReactComponent as UsageIcon } from "../images/usage-default.svg";
+import Pagination from "../Pagination/Pagination";
+import { toRemoteURL } from "../projects/render-utils";
+import { gitpodHostUrl } from "../service/service";
+import "./react-datepicker.css";
+import { Heading1, Heading2, Subheading } from "./typography/headings";
 
 interface UsageViewProps {
     attributionId: AttributionId;
 }
 
 function UsageView({ attributionId }: UsageViewProps) {
-    const [usagePage, setUsagePage] = useState<ListUsageResponse | undefined>(undefined);
+    const [page, setPage] = useState(1);
     const [errorMessage, setErrorMessage] = useState("");
     const startOfCurrentMonth = dayjs().startOf("month");
     const [startDate, setStartDate] = useState(startOfCurrentMonth);
     const [endDate, setEndDate] = useState(dayjs());
-    const [totalCreditsUsed, setTotalCreditsUsed] = useState<number>(0);
-    const [isLoading, setIsLoading] = useState<boolean>(true);
-    const [supportedClasses, setSupportedClasses] = useState<SupportedWorkspaceClass[]>([]);
-
+    const supportedClasses = useWorkspaceClasses();
     const location = useLocation();
     useEffect(() => {
         const match = /#(\d{4}-\d{2}-\d{2}):(\d{4}-\d{2}-\d{2})/.exec(location.hash);
@@ -55,17 +47,8 @@ function UsageView({ attributionId }: UsageViewProps) {
                 console.error(e);
             }
         }
-        (async () => {
-            const classes = await getGitpodService().server.getSupportedWorkspaceClasses();
-            setSupportedClasses(classes);
-        })();
     }, [location]);
-
-    const loadPage = async (page: number = 1) => {
-        if (usagePage === undefined) {
-            setIsLoading(true);
-            setTotalCreditsUsed(0);
-        }
+    const request = useMemo(() => {
         const request: ListUsageRequest = {
             attributionId: AttributionId.render(attributionId),
             from: startDate.startOf("day").valueOf(),
@@ -76,20 +59,18 @@ function UsageView({ attributionId }: UsageViewProps) {
                 page,
             },
         };
-        try {
-            const page = await getGitpodService().server.listUsage(request);
-            setUsagePage(page);
-            setTotalCreditsUsed(page.creditsUsed);
-        } catch (error) {
-            if (error.code === ErrorCodes.PERMISSION_DENIED) {
-                setErrorMessage("Access to usage details is restricted to team owners.");
-            } else {
-                setErrorMessage(`Error: ${error?.message}`);
-            }
-        } finally {
-            setIsLoading(false);
+        return request;
+    }, [attributionId, endDate, page, startDate]);
+    const usagePage = useListUsage(request);
+
+    if (usagePage.error) {
+        if ((usagePage.error as any).code === ErrorCodes.PERMISSION_DENIED) {
+            setErrorMessage("Access to usage details is restricted to team owners.");
+        } else {
+            setErrorMessage(`Error: ${usagePage.error?.message}`);
         }
-    };
+    }
+
     useEffect(() => {
         if (startDate.isAfter(endDate)) {
             setErrorMessage("The start date needs to be before the end date.");
@@ -100,8 +81,8 @@ function UsageView({ attributionId }: UsageViewProps) {
             return;
         }
         setErrorMessage("");
-        loadPage(1);
-    }, [startDate, endDate]);
+        setPage(1);
+    }, [startDate, endDate, setPage]);
 
     const getType = (type: WorkspaceType) => {
         if (type === "regular") {
@@ -111,7 +92,7 @@ function UsageView({ attributionId }: UsageViewProps) {
     };
 
     const getDisplayName = (workspaceClass: string) => {
-        const workspaceDisplayName = supportedClasses.find((wc) => wc.id === workspaceClass)?.displayName;
+        const workspaceDisplayName = supportedClasses.data?.find((wc) => wc.id === workspaceClass)?.displayName;
         if (!workspaceDisplayName) {
             return workspaceClass;
         }
@@ -173,10 +154,8 @@ function UsageView({ attributionId }: UsageViewProps) {
         return new Date(time).toLocaleDateString(undefined, options).replace("at ", "");
     };
 
-    const currentPaginatedResults = usagePage?.usageEntriesList.filter((u) => u.kind === "workspaceinstance") ?? [];
-
-    const headerTitle = attributionId.kind === "team" ? "Team Usage" : "Personal Usage";
-
+    const currentPaginatedResults =
+        usagePage.data?.usageEntriesList.filter((u) => u.kind === "workspaceinstance") ?? [];
     const DateDisplay = forwardRef((arg: any, ref: any) => (
         <div
             className="px-2 py-0.5 text-gray-500 bg-gray-50 dark:text-gray-400 dark:bg-gray-800 rounded-md cursor-pointer flex items-center hover:bg-gray-100 dark:hover:bg-gray-700"
@@ -209,13 +188,13 @@ function UsageView({ attributionId }: UsageViewProps) {
             <Header
                 title={
                     <div className="flex items-baseline">
-                        <h1 className="tracking-tight">{headerTitle}</h1>
-                        <h2 className="ml-3">(updated every 15 minutes).</h2>
+                        <Heading1 tracking="tight">Usage</Heading1>
+                        <Subheading className="ml-3">(updated every 15 minutes).</Subheading>
                     </div>
                 }
                 subtitle={
                     <div className="tracking-wide flex mt-3 items-center">
-                        <h2 className="mr-1">Showing usage from </h2>
+                        <Subheading className="mr-1">Showing usage from </Subheading>
                         <DatePicker
                             selected={startDate.toDate()}
                             onChange={(date) => date && setStartDate(dayjs(date))}
@@ -226,7 +205,7 @@ function UsageView({ attributionId }: UsageViewProps) {
                             customInput={<DateDisplay />}
                             dateFormat={"MMM d, yyyy"}
                         />
-                        <h2 className="mx-1">to</h2>
+                        <Subheading className="mx-1">to</Subheading>
                         <DatePicker
                             selected={endDate.toDate()}
                             onChange={(date) => date && setEndDate(dayjs(date))}
@@ -257,41 +236,42 @@ function UsageView({ attributionId }: UsageViewProps) {
                                     <div className="text-base text-gray-500 truncate">Previous Months</div>
                                     {getBillingHistory()}
                                 </div>
-                                {!isLoading && (
+                                {!usagePage.isLoading && (
                                     <div>
                                         <div className="flex flex-col truncate">
-                                            <div className="text-base text-gray-500">Total Usage</div>
+                                            <div className="text-base text-gray-500">Credits</div>
                                             <div className="flex text-lg text-gray-600 font-semibold">
-                                                <CreditsSvg className="my-auto mr-1" />
-                                                <span>{totalCreditsUsed.toLocaleString()} Credits</span>
+                                                <span className="dark:text-gray-400">
+                                                    {usagePage.data?.creditsUsed.toLocaleString()}
+                                                </span>
                                             </div>
                                         </div>
                                     </div>
                                 )}
                             </div>
                         </div>
-                        {!isLoading &&
+                        {!usagePage.isLoading &&
                             (usagePage === undefined || currentPaginatedResults.length === 0) &&
                             !errorMessage && (
                                 <div className="flex flex-col w-full mb-8">
-                                    <h3 className="text-center text-gray-500 mt-8">No sessions found.</h3>
-                                    <p className="text-center text-gray-500 mt-1">
+                                    <Heading2 className="text-center mt-8">No sessions found.</Heading2>
+                                    <Subheading className="text-center mt-1">
                                         Have you started any
                                         <a className="gp-link" href={gitpodHostUrl.asWorkspacePage().toString()}>
                                             {" "}
                                             workspaces
                                         </a>{" "}
-                                        in {startDate.format("MMMM YYYY")} or checked your other teams?
-                                    </p>
+                                        in {startDate.format("MMMM YYYY")} or checked your other organizations?
+                                    </Subheading>
                                 </div>
                             )}
-                        {isLoading && (
+                        {usagePage.isLoading && (
                             <div className="flex items-center justify-center w-full space-x-2 text-gray-400 text-sm pt-16 pb-40">
                                 <img alt="Loading Spinner" className="h-4 w-4 animate-spin" src={Spinner} />
                                 <span>Fetching usage...</span>
                             </div>
                         )}
-                        {!isLoading && currentPaginatedResults.length > 0 && (
+                        {!usagePage.isLoading && currentPaginatedResults.length > 0 && (
                             <div className="flex flex-col w-full mb-8">
                                 <ItemsList className="mt-2 text-gray-400 dark:text-gray-500">
                                     <Item
@@ -405,13 +385,15 @@ function UsageView({ attributionId }: UsageViewProps) {
                                             );
                                         })}
                                 </ItemsList>
-                                {usagePage && usagePage.pagination && usagePage.pagination.totalPages > 1 && (
-                                    <Pagination
-                                        currentPage={usagePage.pagination.page}
-                                        setPage={(page) => loadPage(page)}
-                                        totalNumberOfPages={usagePage.pagination.totalPages}
-                                    />
-                                )}
+                                {usagePage.data &&
+                                    usagePage.data.pagination &&
+                                    usagePage.data.pagination.totalPages > 1 && (
+                                        <Pagination
+                                            currentPage={usagePage.data.pagination.page}
+                                            setPage={setPage}
+                                            totalNumberOfPages={usagePage.data.pagination.totalPages}
+                                        />
+                                    )}
                             </div>
                         )}
                     </div>

@@ -64,7 +64,7 @@ export class Team extends Message<Team> {
   name = "";
 
   /**
-   * slug is the short version of the Team name
+   * slug is the slug of the Team
    *
    * @generated from field: string slug = 3;
    */
@@ -841,3 +841,4 @@ export class DeleteTeamMemberResponse extends Message<DeleteTeamMemberResponse> 
     return proto3.util.equals(DeleteTeamMemberResponse, a, b);
   }
 }
+

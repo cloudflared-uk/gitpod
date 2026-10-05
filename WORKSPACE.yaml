@@ -7,21 +7,23 @@ defaultArgs:
   publishToNPM: true
   publishToJBMarketplace: true
   localAppVersion: unknown
-  codeCommit: 8ee664e58e31e81e9dd9da10fb31809e249f0d61
-  codeVersion: 1.75.0
+  codeCommit: da355915c07d6bc5b965cb2a886c3c92303c2304
+  codeVersion: 1.77.3
   codeQuality: stable
   noVerifyJBPlugin: false
-  intellijDownloadUrl: "https://download.jetbrains.com/idea/ideaIU-2022.3.1.tar.gz"
-  golandDownloadUrl: "https://download.jetbrains.com/go/goland-2022.3.1.tar.gz"
-  pycharmDownloadUrl: "https://download.jetbrains.com/python/pycharm-professional-2022.3.1.tar.gz"
-  phpstormDownloadUrl: "https://download.jetbrains.com/webide/PhpStorm-2022.3.1.tar.gz"
-  rubymineDownloadUrl: "https://download.jetbrains.com/ruby/RubyMine-2022.3.1.tar.gz"
-  webstormDownloadUrl: "https://download.jetbrains.com/webstorm/WebStorm-2022.3.1.tar.gz"
-  riderDownloadUrl: "https://download.jetbrains.com/rider/JetBrains.Rider-2022.3.1.tar.gz"
-  clionDownloadUrl: "https://download.jetbrains.com/cpp/CLion-2022.3.1.tar.gz"
+  intellijDownloadUrl: "https://download.jetbrains.com/idea/ideaIU-2022.3.3.tar.gz"
+  golandDownloadUrl: "https://download.jetbrains.com/go/goland-2022.3.4.tar.gz"
+  pycharmDownloadUrl: "https://download.jetbrains.com/python/pycharm-professional-2022.3.3.tar.gz"
+  phpstormDownloadUrl: "https://download.jetbrains.com/webide/PhpStorm-2022.3.3.tar.gz"
+  rubymineDownloadUrl: "https://download.jetbrains.com/ruby/RubyMine-2022.3.3.tar.gz"
+  webstormDownloadUrl: "https://download.jetbrains.com/webstorm/WebStorm-2022.3.4.tar.gz"
+  riderDownloadUrl: "https://download.jetbrains.com/rider/JetBrains.Rider-2022.3.3.tar.gz"
+  clionDownloadUrl: "https://download.jetbrains.com/cpp/CLion-2022.3.3.tar.gz"
   jbBackendVersion: "latest"
   REPLICATED_API_TOKEN: ""
   REPLICATED_APP: ""
+  dockerVersion: 20.10.23
+  dockerComposeVersion: "2.17.2-gitpod.0"
 provenance:
   enabled: true
   slsa: true
@@ -32,7 +34,7 @@ defaultVariant:
       - "**/node_modules/**"
   config:
     go:
-      lintCommand: ["sh", "-c", "golangci-lint run --disable govet,errcheck,typecheck,staticcheck,structcheck --allow-parallel-runners --timeout 5m"]
+      lintCommand: ["sh", "-c", "golangci-lint run --disable govet,errcheck,typecheck,staticcheck,structcheck --allow-parallel-runners --timeout 15m"]
 variants:
   - name: oss
     srcs:

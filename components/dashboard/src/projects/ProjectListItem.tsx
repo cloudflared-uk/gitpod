@@ -4,43 +4,61 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { FunctionComponent, useMemo, useState } from "react";
+import { FunctionComponent, useContext, useState } from "react";
 import dayjs from "dayjs";
-import { PrebuildWithStatus, Project } from "@gitpod/gitpod-protocol";
+import { Project } from "@gitpod/gitpod-protocol";
 import { Link } from "react-router-dom";
 import ContextMenu from "../components/ContextMenu";
-import { useCurrentTeam } from "../teams/teams-context";
 import { RemoveProjectModal } from "./RemoveProjectModal";
 import { toRemoteURL } from "./render-utils";
 import { prebuildStatusIcon } from "./Prebuilds";
+import { gitpodHostUrl } from "../service/service";
+import { useLatestProjectPrebuildQuery } from "../data/prebuilds/latest-project-prebuild-query";
+import { StartWorkspaceModalContext } from "../workspaces/start-workspace-modal-context";
+import { useNewCreateWorkspacePage } from "../workspaces/CreateWorkspacePage";
 
 type ProjectListItemProps = {
     project: Project;
-    prebuild?: PrebuildWithStatus;
     onProjectRemoved: () => void;
 };
 
-export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ project, prebuild, onProjectRemoved }) => {
-    const team = useCurrentTeam();
+export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ project, onProjectRemoved }) => {
     const [showRemoveModal, setShowRemoveModal] = useState(false);
-
-    const teamOrUserSlug = useMemo(() => {
-        return !!team ? "t/" + team.slug : "projects";
-    }, [team]);
+    const { data: prebuild, isLoading } = useLatestProjectPrebuildQuery({ projectId: project.id });
+    const { setStartWorkspaceModalProps } = useContext(StartWorkspaceModalContext);
+    const isNewCreateWsPage = useNewCreateWorkspacePage();
 
     return (
         <div key={`project-${project.id}`} className="h-52">
             <div className="h-42 border border-gray-100 dark:border-gray-800 rounded-t-xl">
                 <div className="h-32 p-6">
                     <div className="flex text-gray-700 dark:text-gray-200 font-medium">
-                        <ProjectLink project={project} teamOrUserSlug={teamOrUserSlug} />
+                        <ProjectLink project={project} />
                         <span className="flex-grow" />
                         <div className="justify-end">
                             <ContextMenu
                                 menuEntries={[
                                     {
                                         title: "New Workspace",
-                                        href: `/#${project.cloneUrl}`,
+                                        href: gitpodHostUrl.withContext(`${project.cloneUrl}`).toString(),
+                                        separator: true,
+                                    },
+                                    ...(isNewCreateWsPage
+                                        ? []
+                                        : [
+                                              {
+                                                  title: "New Workspace with ...",
+                                                  onClick: () =>
+                                                      setStartWorkspaceModalProps({
+                                                          contextUrl: project.cloneUrl,
+                                                          allowContextUrlChange: true,
+                                                      }),
+                                                  separator: true,
+                                              },
+                                          ]),
+                                    {
+                                        title: "Settings",
+                                        link: `/projects/${Project.slug(project)}/settings`,
                                         separator: true,
                                     },
                                     {
@@ -53,7 +71,7 @@ export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ proje
                             />
                         </div>
                     </div>
-                    <a href={project.cloneUrl.replace(/\.git$/, "")}>
+                    <a target="_blank" rel="noreferrer noopener" href={project.cloneUrl.replace(/\.git$/, "")}>
                         <p className="hover:text-gray-600 dark:hover:text-gray-400 dark:text-gray-500 pr-10 truncate">
                             {toRemoteURL(project.cloneUrl)}
                         </p>
@@ -61,11 +79,11 @@ export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ proje
                 </div>
                 <div className="h-10 px-6 py-1 text-gray-400 text-sm">
                     <span className="hover:text-gray-600 dark:hover:text-gray-300">
-                        <Link to={`/${teamOrUserSlug}/${project.slug || project.name}`}>Branches</Link>
+                        <Link to={`/projects/${Project.slug(project!)}`}>Branches</Link>
                     </span>
                     <span className="mx-2 my-auto">·</span>
                     <span className="hover:text-gray-600 dark:hover:text-gray-300">
-                        <Link to={`/${teamOrUserSlug}/${project.slug || project.name}/prebuilds`}>Prebuilds</Link>
+                        <Link to={`/projects/${Project.slug(project!)}/prebuilds`}>Prebuilds</Link>
                     </span>
                 </div>
             </div>
@@ -73,7 +91,7 @@ export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ proje
                 {prebuild ? (
                     <div className="flex flex-row h-full text-sm space-x-4">
                         <Link
-                            to={`/${teamOrUserSlug}/${project.slug || project.name}/${prebuild?.info?.id}`}
+                            to={`/projects/${Project.slug(project!)}/${prebuild?.info?.id}`}
                             className="flex-grow flex items-center group space-x-2 truncate"
                         >
                             {prebuildStatusIcon(prebuild)}
@@ -89,11 +107,15 @@ export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ proje
                             </div>
                         </Link>
                         <Link
-                            to={`/${teamOrUserSlug}/${project.slug || project.name}/prebuilds`}
+                            to={`/projects/${Project.slug(project!)}/prebuilds`}
                             className="flex-shrink-0 flex items-center text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
                         >
                             View All &rarr;
                         </Link>
+                    </div>
+                ) : isLoading ? (
+                    <div className="flex h-full text-md">
+                        <p className="my-auto ">...</p>
                     </div>
                 ) : (
                     <div className="flex h-full text-md">
@@ -114,22 +136,11 @@ export const ProjectListItem: FunctionComponent<ProjectListItemProps> = ({ proje
 
 type ProjectLinkProps = {
     project: Project;
-    teamOrUserSlug: string;
 };
-const ProjectLink: FunctionComponent<ProjectLinkProps> = ({ project, teamOrUserSlug }) => {
-    let slug = "";
-    const name = project.name;
-
-    if (project.slug) {
-        slug = project.slug;
-    } else {
-        // For existing GitLab projects that don't have a slug yet
-        slug = name;
-    }
-
+const ProjectLink: FunctionComponent<ProjectLinkProps> = ({ project }) => {
     return (
-        <Link to={`/${teamOrUserSlug}/${slug}`}>
-            <span className="text-xl font-semibold">{name}</span>
+        <Link to={`/projects/${Project.slug(project)}`}>
+            <span className="text-xl font-semibold">{project.name}</span>
         </Link>
     );
 };

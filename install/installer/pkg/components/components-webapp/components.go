@@ -9,21 +9,19 @@ import (
 	contentservice "github.com/gitpod-io/gitpod/installer/pkg/components/content-service"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/dashboard"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/database"
-	"github.com/gitpod-io/gitpod/installer/pkg/components/iam"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/migrations"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/minio"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/proxy"
 	public_api_server "github.com/gitpod-io/gitpod/installer/pkg/components/public-api-server"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/rabbitmq"
+	"github.com/gitpod-io/gitpod/installer/pkg/components/redis"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/server"
-	"github.com/gitpod-io/gitpod/installer/pkg/components/slowserver"
-	"github.com/gitpod-io/gitpod/installer/pkg/components/toxiproxy"
+	"github.com/gitpod-io/gitpod/installer/pkg/components/spicedb"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/usage"
 	wsmanagerbridge "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager-bridge"
 )
 
 var Objects = common.CompositeRenderFunc(
-	iam.Objects,
 	contentservice.Objects,
 	dashboard.Objects,
 	database.Objects,
@@ -32,11 +30,11 @@ var Objects = common.CompositeRenderFunc(
 	proxy.Objects,
 	rabbitmq.Objects,
 	server.Objects,
-	slowserver.Objects,
 	wsmanagerbridge.Objects,
 	public_api_server.Objects,
 	usage.Objects,
-	toxiproxy.Objects,
+	spicedb.Objects,
+	redis.Objects,
 )
 
 var Helm = common.CompositeHelmFunc(

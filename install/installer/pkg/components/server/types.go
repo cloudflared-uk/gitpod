@@ -13,45 +13,49 @@ import (
 
 // ConfigSerialized interface from components/server/src/config.ts
 type ConfigSerialized struct {
-	Version                           string   `json:"version"`
-	HostURL                           string   `json:"hostUrl"`
-	InstallationShortname             string   `json:"installationShortname"`
-	DevBranch                         string   `json:"devBranch"`
-	InsecureNoDomain                  bool     `json:"insecureNoDomain"`
-	License                           string   `json:"license"`
-	LicenseFile                       string   `json:"licenseFile"`
-	DefinitelyGpDisabled              bool     `json:"definitelyGpDisabled"`
-	EnableLocalApp                    bool     `json:"enableLocalApp"`
-	DisableDynamicAuthProviderLogin   bool     `json:"disableDynamicAuthProviderLogin"`
-	MaxEnvvarPerUserCount             int32    `json:"maxEnvvarPerUserCount"`
-	MaxConcurrentPrebuildsPerRef      int32    `json:"maxConcurrentPrebuildsPerRef"`
-	MakeNewUsersAdmin                 bool     `json:"makeNewUsersAdmin"`
-	DefaultBaseImageRegistryWhitelist []string `json:"defaultBaseImageRegistryWhitelist"`
-	RunDbDeleter                      bool     `json:"runDbDeleter"`
-	ContentServiceAddr                string   `json:"contentServiceAddr"`
-	ImageBuilderAddr                  string   `json:"imageBuilderAddr"`
-	UsageServiceAddr                  string   `json:"usageServiceAddr"`
-	IDEServiceAddr                    string   `json:"ideServiceAddr"`
-	MaximumEventLoopLag               float64  `json:"maximumEventLoopLag"`
-	VSXRegistryUrl                    string   `json:"vsxRegistryUrl"`
-	ChargebeeProviderOptionsFile      string   `json:"chargebeeProviderOptionsFile"`
-	StripeSecretsFile                 string   `json:"stripeSecretsFile"`
-	StripeConfigFile                  string   `json:"stripeConfigFile"`
-	EnablePayment                     bool     `json:"enablePayment"`
-	PATSigningKeyFile                 string   `json:"patSigningKeyFile"`
-	WithoutWorkspaceComponents        bool     `json:"withoutWorkspaceComponents"`
+	Version                           string     `json:"version"`
+	HostURL                           string     `json:"hostUrl"`
+	InstallationShortname             string     `json:"installationShortname"`
+	DevBranch                         string     `json:"devBranch"`
+	InsecureNoDomain                  bool       `json:"insecureNoDomain"`
+	License                           string     `json:"license"`
+	DefinitelyGpDisabled              bool       `json:"definitelyGpDisabled"`
+	EnableLocalApp                    bool       `json:"enableLocalApp"`
+	DisableDynamicAuthProviderLogin   bool       `json:"disableDynamicAuthProviderLogin"`
+	MaxEnvvarPerUserCount             int32      `json:"maxEnvvarPerUserCount"`
+	MaxConcurrentPrebuildsPerRef      int32      `json:"maxConcurrentPrebuildsPerRef"`
+	MakeNewUsersAdmin                 bool       `json:"makeNewUsersAdmin"`
+	DefaultBaseImageRegistryWhitelist []string   `json:"defaultBaseImageRegistryWhitelist"`
+	RunDbDeleter                      bool       `json:"runDbDeleter"`
+	ContentServiceAddr                string     `json:"contentServiceAddr"`
+	UsageServiceAddr                  string     `json:"usageServiceAddr"`
+	IDEServiceAddr                    string     `json:"ideServiceAddr"`
+	MaximumEventLoopLag               float64    `json:"maximumEventLoopLag"`
+	VSXRegistryUrl                    string     `json:"vsxRegistryUrl"`
+	ChargebeeProviderOptionsFile      string     `json:"chargebeeProviderOptionsFile"`
+	StripeSecretsFile                 string     `json:"stripeSecretsFile"`
+	StripeConfigFile                  string     `json:"stripeConfigFile"`
+	EnablePayment                     bool       `json:"enablePayment"`
+	LinkedInSecretsFile               string     `json:"linkedInSecretsFile"`
+	PATSigningKeyFile                 string     `json:"patSigningKeyFile"`
+	ShowSetupModal                    bool       `json:"showSetupModal"`
+	Auth                              AuthConfig `json:"auth"`
 
 	WorkspaceHeartbeat         WorkspaceHeartbeat         `json:"workspaceHeartbeat"`
 	WorkspaceDefaults          WorkspaceDefaults          `json:"workspaceDefaults"`
 	Session                    Session                    `json:"session"`
 	GitHubApp                  GitHubApp                  `json:"githubApp"`
 	WorkspaceGarbageCollection WorkspaceGarbageCollection `json:"workspaceGarbageCollection"`
+	CompleteSnapshotJob        JobConfig                  `json:"completeSnapshotJob"`
+	LongRunningMigrationsJob   JobConfig                  `json:"longRunningMigrationsJob"`
 	AuthProviderConfigFiles    []string                   `json:"authProviderConfigFiles"`
 	IncrementalPrebuilds       IncrementalPrebuilds       `json:"incrementalPrebuilds"`
 	BlockNewUsers              config.BlockNewUsers       `json:"blockNewUsers"`
 	OAuthServer                OAuthServer                `json:"oauthServer"`
 	RateLimiter                RateLimiter                `json:"rateLimiter"`
 	CodeSync                   CodeSync                   `json:"codeSync"`
+	Admin                      AdminConfig                `json:"admin"`
+	AdminLoginKeyFile          string                     `json:"adminLoginKeyFile"`
 	// PrebuildLimiter defines the number of prebuilds allowed for each cloneURL in a given 1 minute interval
 	// Key of "*" defines the default limit, unless there exists a cloneURL in the map which overrides it.
 	PrebuildLimiter                PrebuildRateLimiters `json:"prebuildLimiter"`
@@ -60,6 +64,23 @@ type ConfigSerialized struct {
 }
 type CodeSyncResources struct {
 	RevLimit int32 `json:"revLimit"`
+}
+
+type AuthConfig struct {
+	PKI AuthPKIConfig `json:"pki"`
+}
+
+type AuthPKIConfig struct {
+	// Signing KeyPair is always used to issue new auth tokens
+	Signing KeyPair `json:"signing"`
+
+	// Validating KeyPairs are used for checking validity only
+	Validating []KeyPair `json:"validating,omitempty"`
+}
+
+type KeyPair struct {
+	PrivateKeyPath string `json:"privateKeyPath"`
+	PublicKeyPath  string `json:"publicKeyPath"`
 }
 
 type CodeSync struct {
@@ -104,6 +125,10 @@ type WorkspaceGarbageCollection struct {
 	ContentChunkLimit          int32 `json:"contentChunkLimit"`
 	PurgeRetentionPeriodDays   int32 `json:"purgeRetentionPeriodDays"`
 	PurgeChunkLimit            int32 `json:"purgeChunkLimit"`
+}
+
+type JobConfig struct {
+	Disabled bool `json:"disabled"`
 }
 
 type GitHubApp struct {
@@ -164,4 +189,11 @@ type PrebuildRateLimiters = map[string]PrebuildRateLimiterConfig
 type PrebuildRateLimiterConfig struct {
 	Limit  uint32 `json:"limit"`
 	Period uint32 `json:"period"`
+}
+
+type AdminConfig struct {
+	GrantFirstUserAdminRole bool `json:"grantFirstUserAdminRole"`
+
+	// Absolute path to a file containg credentials (as JSON) which can be used to log-in as admin
+	CredentialsPath string `json:"credentialsPath"`
 }

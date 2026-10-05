@@ -77,8 +77,15 @@ export class GitpodHostUrl {
         return updated.with((url) => ({ pathname: `/api${url.pathname}` }));
     }
 
-    withContext(contextUrl: string) {
-        return this.with((url) => ({ hash: contextUrl }));
+    withContext(
+        contextUrl: string,
+        startOptions?: { showOptions?: boolean; editor?: string; workspaceClass?: string },
+    ) {
+        const searchParams = new URLSearchParams();
+        if (startOptions?.showOptions) {
+            searchParams.append("showOptions", "true");
+        }
+        return this.with((url) => ({ hash: contextUrl, search: searchParams.toString() }));
     }
 
     asWebsocket(): GitpodHostUrl {
@@ -94,15 +101,11 @@ export class GitpodHostUrl {
     }
 
     asBilling(): GitpodHostUrl {
-        return this.with((url) => ({ pathname: "/billing" }));
+        return this.with((url) => ({ pathname: "/user/billing" }));
     }
 
     asLogin(): GitpodHostUrl {
         return this.with((url) => ({ pathname: "/login" }));
-    }
-
-    asUpgradeSubscription(): GitpodHostUrl {
-        return this.with((url) => ({ pathname: "/plans" }));
     }
 
     asAccessControl(): GitpodHostUrl {
@@ -110,11 +113,11 @@ export class GitpodHostUrl {
     }
 
     asSettings(): GitpodHostUrl {
-        return this.with((url) => ({ pathname: "/settings" }));
+        return this.with((url) => ({ pathname: "/user/account" }));
     }
 
     asPreferences(): GitpodHostUrl {
-        return this.with((url) => ({ pathname: "/preferences" }));
+        return this.with((url) => ({ pathname: "/user/preferences" }));
     }
 
     asStart(workspaceId = this.workspaceId): GitpodHostUrl {
@@ -124,10 +127,9 @@ export class GitpodHostUrl {
         });
     }
 
-    asWorkspaceAuth(instanceID: string, redirect?: boolean): GitpodHostUrl {
+    asWorkspaceAuth(instanceID: string): GitpodHostUrl {
         return this.with((url) => ({
             pathname: `/api/auth/workspace-cookie/${instanceID}`,
-            search: redirect ? "redirect" : "",
         }));
     }
 
@@ -161,6 +163,11 @@ export class GitpodHostUrl {
         const pathSegs = this.url.pathname.split("/");
         if (pathSegs.length > 3 && pathSegs[1] === "workspace") {
             return pathSegs[2];
+        }
+
+        const cleanHash = this.url.hash.replace(/^#/, "");
+        if (this.url.pathname == "/start/" && cleanHash.match(workspaceIDRegex)) {
+            return cleanHash;
         }
 
         return undefined;

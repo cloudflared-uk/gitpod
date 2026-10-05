@@ -4,7 +4,13 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { Team, TeamMemberInfo, TeamMemberRole, TeamMembershipInvite } from "@gitpod/gitpod-protocol";
+import {
+    Team,
+    TeamMemberInfo,
+    TeamMemberRole,
+    TeamMembershipInvite,
+    OrganizationSettings,
+} from "@gitpod/gitpod-protocol";
 import { DBTeamMembership } from "./typeorm/entity/db-team-membership";
 
 export const TeamDB = Symbol("TeamDB");
@@ -23,6 +29,7 @@ export interface TeamDB {
     findTeamsByUser(userId: string): Promise<Team[]>;
     findTeamsByUserAsSoleOwner(userId: string): Promise<Team[]>;
     createTeam(userId: string, name: string): Promise<Team>;
+    updateTeam(teamId: string, team: Pick<Team, "name">): Promise<Team>;
     addMemberToTeam(userId: string, teamId: string): Promise<"added" | "already_member">;
     setTeamMemberRole(userId: string, teamId: string, role: TeamMemberRole): Promise<void>;
     setTeamMemberSubscription(userId: string, teamId: string, subscriptionId: string): Promise<void>;
@@ -31,4 +38,7 @@ export interface TeamDB {
     findGenericInviteByTeamId(teamId: string): Promise<TeamMembershipInvite | undefined>;
     resetGenericInvite(teamId: string): Promise<TeamMembershipInvite>;
     deleteTeam(teamId: string): Promise<void>;
+
+    findOrgSettings(teamId: string): Promise<OrganizationSettings | undefined>;
+    setOrgSettings(teamId: string, settings: Partial<OrganizationSettings>): Promise<void>;
 }

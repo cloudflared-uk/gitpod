@@ -57,8 +57,6 @@ import { ProjectDB } from "./project-db";
 import { ProjectDBImpl } from "./typeorm/project-db-impl";
 import { PersonalAccessTokenDB } from "./personal-access-token-db";
 import { EntityManager } from "typeorm";
-import { OssAllowListDB } from "./oss-allowlist-db";
-import { OssAllowListDBImpl } from "./typeorm/oss-allowlist-db-impl";
 import { TypeORMInstallationAdminImpl } from "./typeorm/installation-admin-db-impl";
 import { InstallationAdminDB } from "./installation-admin-db";
 import { TeamSubscription2DB } from "./team-subscription-2-db";
@@ -68,6 +66,12 @@ import { BlockedRepositoryDB } from "./blocked-repository-db";
 import { WebhookEventDB } from "./webhook-event-db";
 import { WebhookEventDBImpl } from "./typeorm/webhook-event-db-impl";
 import { PersonalAccessTokenDBImpl } from "./typeorm/personal-access-token-db-impl";
+import { UserToTeamMigrationService } from "./user-to-team-migration-service";
+import { Synchronizer } from "./typeorm/synchronizer";
+import { WorkspaceOrganizationIdMigration } from "./long-running-migration/workspace-organizationid-migration";
+import { LongRunningMigration, LongRunningMigrationService } from "./long-running-migration/long-running-migration";
+import { LinkedInProfileDBImpl } from "./typeorm/linked-in-profile-db-impl";
+import { LinkedInProfileDB } from "./linked-in-profile-db";
 
 // THE DB container module that contains all DB implementations
 export const dbContainerModule = new ContainerModule((bind, unbind, isBound, rebind) => {
@@ -160,5 +164,12 @@ export const dbContainerModule = new ContainerModule((bind, unbind, isBound, reb
     bind(EmailDomainFilterDB).to(EmailDomainFilterDBImpl).inSingletonScope();
     bind(EduEmailDomainDB).to(EduEmailDomainDBImpl).inSingletonScope();
     bind(LicenseDB).to(LicenseDBImpl).inSingletonScope();
-    bind(OssAllowListDB).to(OssAllowListDBImpl).inSingletonScope();
+    bind(UserToTeamMigrationService).toSelf().inSingletonScope();
+    bind(WorkspaceOrganizationIdMigration).toSelf().inSingletonScope();
+    bind(Synchronizer).toSelf().inSingletonScope();
+    bind(LinkedInProfileDBImpl).toSelf().inSingletonScope();
+    bind(LinkedInProfileDB).toService(LinkedInProfileDBImpl);
+
+    bind(LongRunningMigrationService).toSelf().inSingletonScope();
+    bind(LongRunningMigration).to(WorkspaceOrganizationIdMigration).inSingletonScope();
 });

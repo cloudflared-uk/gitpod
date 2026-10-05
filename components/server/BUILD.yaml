@@ -14,11 +14,11 @@ packages:
       - components/ee/payment-endpoint:lib
       - components/gitpod-protocol:lib
       - components/image-builder-api/typescript:lib
-      - components/licensor/typescript:lib
       - components/ws-manager-api/typescript:lib
       - components/supervisor-api/typescript-grpcweb:lib
       - components/usage-api/typescript:lib
       - components/ide-service-api/typescript:lib
+      - components/public-api/typescript:lib
     config:
       packaging: offline-mirror
       yarnLock: ${coreYarnLockBase}/yarn.lock
@@ -54,11 +54,11 @@ packages:
       - components/ee/payment-endpoint:lib
       - components/gitpod-protocol:lib
       - components/image-builder-api/typescript:lib
-      - components/licensor/typescript:lib
       - components/ws-manager-api/typescript:lib
       - components/supervisor-api/typescript-grpcweb:lib
       - components/usage-api/typescript:lib
       - components/ide-service-api/typescript:lib
+      - components/public-api/typescript:lib
       - :dbtest
     config:
       packaging: library
@@ -81,11 +81,11 @@ packages:
       - components/ee/payment-endpoint:lib
       - components/gitpod-protocol:lib
       - components/image-builder-api/typescript:lib
-      - components/licensor/typescript:lib
       - components/ws-manager-api/typescript:lib
       - components/supervisor-api/typescript-grpcweb:lib
       - components/usage-api/typescript:lib
       - components/ide-service-api/typescript:lib
+      - components/public-api/typescript:lib
     config:
       packaging: library
       yarnLock: ${coreYarnLockBase}/yarn.lock
@@ -115,6 +115,7 @@ scripts:
             - name: server
               securityContext:
                 privileged: true
+                allowPrivilegeEscalation: true
                 runAsUser: 0
             serviceAccountName: ws-daemon
       EOF

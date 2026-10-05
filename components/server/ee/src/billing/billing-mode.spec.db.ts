@@ -280,7 +280,47 @@ class BillingModeSpec {
                     hasChargebeeTeamSubscription: true,
                 },
             },
+            // user: "Switch PAYG" transition chargebee -> UBB
+            {
+                name: "user: chargebee paid personal + UBB personal",
+                subject: user(),
+                config: {
+                    enablePayment: true,
+                    usageBasedPricingEnabled: true,
+                    subscriptions: [subscription(Plans.PERSONAL_EUR)],
+                    stripeSubscription: stripeSubscription(),
+                },
+                expectation: {
+                    mode: "usage-based", // here we have to rely on our automation to cancel the Chargebee plan, bc user will no longer see their "Plans"
+                },
+            },
+            {
+                name: "user: chargebee paid personal + chargebee team seat + UBB personal",
+                subject: user(),
+                config: {
+                    enablePayment: true,
+                    usageBasedPricingEnabled: true,
+                    subscriptions: [subscription(Plans.PERSONAL_EUR), teamSubscription(Plans.TEAM_PROFESSIONAL_EUR)],
+                    stripeSubscription: stripeSubscription(),
+                },
+                expectation: {
+                    mode: "usage-based", // here we have to rely on our automation to cancel the Chargebee plan, bc user will no longer see their "Plans"
+                    hasChargebeeTeamSubscription: true,
+                },
+            },
             // user: usage-based
+            {
+                name: "user: stripe free, chargebee FREE (old)",
+                subject: user(),
+                config: {
+                    enablePayment: true,
+                    usageBasedPricingEnabled: true,
+                    subscriptions: [subscription(Plans.FREE)],
+                },
+                expectation: {
+                    mode: "usage-based",
+                },
+            },
             {
                 name: "user: stripe free, chargebee paid personal (inactive) + team seat (inactive)",
                 subject: user(),
@@ -515,8 +555,7 @@ class BillingModeSpec {
             },
         ];
 
-        const onlyTest = tests.find((t) => t.only);
-        for (const test of onlyTest ? [onlyTest] : tests) {
+        for (const test of tests) {
             // Setup test code, environment and data
             const testContainer = new Container();
             testContainer.load(dbContainerModule);

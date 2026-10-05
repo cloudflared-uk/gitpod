@@ -31,6 +31,13 @@ export class DBWorkspace implements Workspace {
     @Index("ind_creationTime")
     creationTime: string;
 
+    @Column({
+        ...TypeORM.UUID_COLUMN_TYPE,
+        transformer: Transformer.MAP_NULL_TO_UNDEFINED,
+    })
+    @Index()
+    organizationId?: string;
+
     @Column(TypeORM.UUID_COLUMN_TYPE)
     @Index()
     ownerId: string;
@@ -97,7 +104,7 @@ export class DBWorkspace implements Workspace {
     })
     contentDeletedTime?: string;
 
-    // This column triggers the db-sync deletion mechanism. It's not intended for public consumption.
+    // This column triggers the periodic deleter deletion mechanism. It's not intended for public consumption.
     @Column()
     deleted?: boolean;
 

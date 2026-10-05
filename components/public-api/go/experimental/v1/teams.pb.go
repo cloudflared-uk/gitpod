@@ -87,7 +87,7 @@ type Team struct {
 	Id string `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	// name is the name of the Team
 	Name string `protobuf:"bytes,2,opt,name=name,proto3" json:"name,omitempty"`
-	// slug is the short version of the Team name
+	// slug is the slug of the Team
 	Slug string `protobuf:"bytes,3,opt,name=slug,proto3" json:"slug,omitempty"`
 	// members are the team members of this Team
 	Members []*TeamMember `protobuf:"bytes,4,rep,name=members,proto3" json:"members,omitempty"`

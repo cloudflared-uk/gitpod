@@ -22,7 +22,7 @@ pod:
         secretName: gcp-sa-gitpod-dev-deployer
   containers:
     - name: build
-      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:mads-leeway-v0.7.3.4
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:kylos101-prebuild-jam-gha.5832
       workingDir: /workspace
       imagePullPolicy: IfNotPresent
       volumeMounts:
@@ -34,4 +34,4 @@ pod:
         - .werft/platform-trigger-werft-cleanup.sh
 
 plugins:
-  cron: "15 */4 * * *"
+  cron: "15 * * * *"

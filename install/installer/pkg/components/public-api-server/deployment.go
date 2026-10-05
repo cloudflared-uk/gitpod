@@ -33,6 +33,8 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil, err
 	}
 
+	databaseSecretVolume, databaseSecretMount, _ := common.DatabaseEnvSecret(ctx.Config)
+
 	volumes := []corev1.Volume{
 		{
 			Name: configmapVolume,
@@ -44,6 +46,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 				},
 			},
 		},
+		databaseSecretVolume,
 	}
 	volumeMounts := []corev1.VolumeMount{
 		{
@@ -52,7 +55,19 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 			MountPath: configMountPath,
 			SubPath:   configJSONFilename,
 		},
+		databaseSecretMount,
 	}
+
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		volume, mount, _, ok := getOIDCClientJWTSecretConfig(cfg)
+		if !ok {
+			return nil
+		}
+
+		volumes = append(volumes, volume)
+		volumeMounts = append(volumeMounts, mount)
+		return nil
+	})
 
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
 		volume, mount, _, ok := getStripeConfig(cfg)
@@ -75,6 +90,10 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		volumeMounts = append(volumeMounts, mount)
 		return nil
 	})
+
+	authPKIVolumes, authPKIMounts, _ := getAuthPKI()
+	volumes = append(volumes, authPKIVolumes...)
+	volumeMounts = append(volumeMounts, authPKIMounts...)
 
 	labels := common.CustomizeLabel(ctx, Component, common.TypeMetaDeployment)
 	return []runtime.Object{
@@ -102,11 +121,12 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						Annotations: common.CustomizeAnnotation(ctx, Component, common.TypeMetaDeployment),
 					},
 					Spec: corev1.PodSpec{
-						Affinity:                      common.NodeAffinity(cluster.AffinityLabelMeta),
+						Affinity:                      cluster.WithNodeAffinityHostnameAntiAffinity(Component, cluster.AffinityLabelMeta),
+						TopologySpreadConstraints:     cluster.WithHostnameTopologySpread(Component),
 						ServiceAccountName:            Component,
 						EnableServiceLinks:            pointer.Bool(false),
-						DNSPolicy:                     "ClusterFirst",
-						RestartPolicy:                 "Always",
+						DNSPolicy:                     corev1.DNSClusterFirst,
+						RestartPolicy:                 corev1.RestartPolicyAlways,
 						TerminationGracePeriodSeconds: pointer.Int64(30),
 						InitContainers:                []corev1.Container{*common.DatabaseWaiterContainer(ctx)},
 						Containers: []corev1.Container{
@@ -166,7 +186,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								},
 								VolumeMounts: volumeMounts,
 							},
-							*common.KubeRBACProxyContainerWithConfig(ctx),
+							*common.KubeRBACProxyContainer(ctx),
 						},
 						Volumes: volumes,
 					},

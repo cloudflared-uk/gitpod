@@ -7,6 +7,7 @@ package apiv1
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	connect "github.com/bufbuild/connect-go"
 	"github.com/gitpod-io/gitpod/common-go/log"
@@ -14,9 +15,6 @@ import (
 	"github.com/gitpod-io/gitpod/components/public-api/go/experimental/v1/v1connect"
 	protocol "github.com/gitpod-io/gitpod/gitpod-protocol"
 	"github.com/gitpod-io/gitpod/public-api-server/pkg/proxy"
-	"github.com/google/uuid"
-	"github.com/relvacode/iso8601"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 func NewTeamsService(pool proxy.ServerConnectionPool) *TeamService {
@@ -45,13 +43,13 @@ func (s *TeamService) CreateTeam(ctx context.Context, req *connect.Request[v1.Cr
 
 	created, err := conn.CreateTeam(ctx, req.Msg.GetName())
 	if err != nil {
-		log.WithError(err).Error("Failed to create team.")
+		log.Extract(ctx).Error("Failed to create team.")
 		return nil, proxy.ConvertError(err)
 	}
 
 	team, err := s.toTeamAPIResponse(ctx, conn, created)
 	if err != nil {
-		log.WithError(err).Error("Failed to populate team with details.")
+		log.Extract(ctx).WithError(err).Error("Failed to populate team with details.")
 		return nil, err
 	}
 
@@ -61,7 +59,7 @@ func (s *TeamService) CreateTeam(ctx context.Context, req *connect.Request[v1.Cr
 }
 
 func (s *TeamService) GetTeam(ctx context.Context, req *connect.Request[v1.GetTeamRequest]) (*connect.Response[v1.GetTeamResponse], error) {
-	teamID, err := validateTeamID(req.Msg.GetTeamId())
+	teamID, err := validateTeamID(ctx, req.Msg.GetTeamId())
 	if err != nil {
 		return nil, err
 	}
@@ -94,19 +92,49 @@ func (s *TeamService) ListTeams(ctx context.Context, req *connect.Request[v1.Lis
 
 	teams, err := conn.GetTeams(ctx)
 	if err != nil {
-		log.WithError(err).Error("Failed to list teams from server.")
+		log.Extract(ctx).WithError(err).Error("Failed to list teams from server.")
 		return nil, proxy.ConvertError(err)
 	}
 
-	var response []*v1.Team
+	type result struct {
+		team *v1.Team
+		err  error
+	}
+
+	wg := sync.WaitGroup{}
+	resultsChan := make(chan result, len(teams))
 	for _, t := range teams {
-		team, err := s.toTeamAPIResponse(ctx, conn, t)
-		if err != nil {
-			log.WithError(err).Error("Failed to populate team with details.")
-			return nil, err
+		wg.Add(1)
+		go func(t *protocol.Team) {
+			team, err := s.toTeamAPIResponse(ctx, conn, t)
+			resultsChan <- result{
+				team: team,
+				err:  err,
+			}
+			defer wg.Done()
+		}(t)
+	}
+
+	// Block until we've fetched all teams
+	wg.Wait()
+	close(resultsChan)
+
+	// We want to maintain the order of results that we got from server
+	// So we convert our concurrent results to a map, so we can index into it
+	resultMap := map[string]*v1.Team{}
+	for res := range resultsChan {
+		if res.err != nil {
+			log.Extract(ctx).WithError(err).Error("Failed to populate team with details.")
+			return nil, res.err
 		}
 
-		response = append(response, team)
+		resultMap[res.team.GetId()] = res.team
+	}
+
+	// Map the original order of teams against the populated results
+	var response []*v1.Team
+	for _, t := range teams {
+		response = append(response, resultMap[t.ID])
 	}
 
 	return connect.NewResponse(&v1.ListTeamsResponse{
@@ -115,7 +143,7 @@ func (s *TeamService) ListTeams(ctx context.Context, req *connect.Request[v1.Lis
 }
 
 func (s *TeamService) DeleteTeam(ctx context.Context, req *connect.Request[v1.DeleteTeamRequest]) (*connect.Response[v1.DeleteTeamResponse], error) {
-	teamID, err := validateTeamID(req.Msg.GetTeamId())
+	teamID, err := validateTeamID(ctx, req.Msg.GetTeamId())
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +178,7 @@ func (s *TeamService) JoinTeam(ctx context.Context, req *connect.Request[v1.Join
 
 	response, err := s.toTeamAPIResponse(ctx, conn, team)
 	if err != nil {
-		log.WithError(err).Error("Failed to populate team with details.")
+		log.Extract(ctx).WithError(err).Error("Failed to populate team with details.")
 		return nil, err
 	}
 
@@ -160,7 +188,7 @@ func (s *TeamService) JoinTeam(ctx context.Context, req *connect.Request[v1.Join
 }
 
 func (s *TeamService) ResetTeamInvitation(ctx context.Context, req *connect.Request[v1.ResetTeamInvitationRequest]) (*connect.Response[v1.ResetTeamInvitationResponse], error) {
-	teamID, err := validateTeamID(req.Msg.GetTeamId())
+	teamID, err := validateTeamID(ctx, req.Msg.GetTeamId())
 	if err != nil {
 		return nil, err
 	}
@@ -242,15 +270,16 @@ func (s *TeamService) DeleteTeamMember(ctx context.Context, req *connect.Request
 }
 
 func (s *TeamService) toTeamAPIResponse(ctx context.Context, conn protocol.APIInterface, team *protocol.Team) (*v1.Team, error) {
+	logger := log.Extract(ctx).WithFields(log.OrganizationID(team.ID))
 	members, err := conn.GetTeamMembers(ctx, team.ID)
 	if err != nil {
-		log.WithError(err).Error("Failed to get team members.")
+		logger.WithError(err).Error("Failed to get team members.")
 		return nil, proxy.ConvertError(err)
 	}
 
 	invite, err := conn.GetGenericInvite(ctx, team.ID)
 	if err != nil {
-		log.WithError(err).Error("Failed to get generic invite.")
+		logger.WithError(err).Error("Failed to get generic invite.")
 		return nil, proxy.ConvertError(err)
 	}
 
@@ -274,7 +303,7 @@ func teamMembersToAPIResponse(members []*protocol.TeamMemberInfo) []*v1.TeamMemb
 		result = append(result, &v1.TeamMember{
 			UserId:       m.UserId,
 			Role:         teamRoleToAPIResponse(m.Role),
-			MemberSince:  parseTimeStamp(m.MemberSince),
+			MemberSince:  parseGitpodTimeStampOrDefault(m.MemberSince),
 			AvatarUrl:    m.AvatarUrl,
 			FullName:     m.FullName,
 			PrimaryEmail: m.PrimaryEmail,
@@ -299,26 +328,4 @@ func teamInviteToAPIResponse(invite *protocol.TeamMembershipInvite) *v1.TeamInvi
 	return &v1.TeamInvitation{
 		Id: invite.ID,
 	}
-}
-
-func parseTimeStamp(s string) *timestamppb.Timestamp {
-	parsed, err := iso8601.ParseString(s)
-	if err != nil {
-		return &timestamppb.Timestamp{}
-	}
-
-	return timestamppb.New(parsed)
-}
-
-func validateTeamID(s string) (uuid.UUID, error) {
-	if s == "" {
-		return uuid.Nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("Team ID is a required argument."))
-	}
-
-	teamID, err := uuid.Parse(s)
-	if err != nil {
-		return uuid.Nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("Team ID must be a valid UUID."))
-	}
-
-	return teamID, nil
 }

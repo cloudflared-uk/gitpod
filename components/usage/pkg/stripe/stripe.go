@@ -23,8 +23,10 @@ import (
 )
 
 const (
-	AttributionIDMetadataKey     = "attributionId"
-	PreferredCurrencyMetadataKey = "preferredCurrency"
+	// Metadata keys are used for storing additional context in Stripe
+	AttributionIDMetadataKey        = "attributionId"
+	PreferredCurrencyMetadataKey    = "preferredCurrency"
+	BillingCreaterUserIDMetadataKey = "billingCreatorUserId"
 )
 
 type Client struct {
@@ -72,10 +74,7 @@ func New(config ClientConfig) (*Client, error) {
 func NewWithHTTPClient(config ClientConfig, c *http.Client) (*Client, error) {
 	sc := &client.API{}
 
-	sc.Init(config.SecretKey, stripe.NewBackends(&http.Client{
-		Transport: http.DefaultTransport,
-		Timeout:   10 * time.Second,
-	}))
+	sc.Init(config.SecretKey, stripe.NewBackends(c))
 
 	return &Client{sc: sc}, nil
 }
@@ -251,11 +250,38 @@ func (c *Client) GetCustomer(ctx context.Context, customerID string) (customer *
 	return customer, nil
 }
 
+func (c *Client) GetPriceInformation(ctx context.Context, priceID string) (price *stripe.Price, err error) {
+	now := time.Now()
+	reportStripeRequestStarted("prices_get")
+	defer func() {
+		reportStripeRequestCompleted("prices_get", err, time.Since(now))
+	}()
+
+	price, err = c.sc.Prices.Get(priceID, &stripe.PriceParams{
+		Params: stripe.Params{
+			Context: ctx,
+		},
+	})
+	if err != nil {
+		if stripeErr, ok := err.(*stripe.Error); ok {
+			switch stripeErr.Code {
+			case stripe.ErrorCodeMissing:
+				return nil, status.Errorf(codes.NotFound, "price %s does not exist in stripe", priceID)
+			}
+		}
+
+		return nil, fmt.Errorf("failed to get price by price ID %s", priceID)
+	}
+
+	return price, nil
+}
+
 type CreateCustomerParams struct {
-	AttributuonID string
-	Currency      string
-	Email         string
-	Name          string
+	AttributuonID        string
+	Currency             string
+	Email                string
+	Name                 string
+	BillingCreatorUserID string
 }
 
 func (c *Client) CreateCustomer(ctx context.Context, params CreateCustomerParams) (customer *stripe.Customer, err error) {
@@ -272,8 +298,9 @@ func (c *Client) CreateCustomer(ctx context.Context, params CreateCustomerParams
 				// We set the preferred currency on the metadata such that we can later retreive it when we're creating a Subscription
 				// This is also done to propagate the preference into the Customer such that we can inform them when their
 				// new subscription would use a different currency to the previous one
-				PreferredCurrencyMetadataKey: params.Currency,
-				AttributionIDMetadataKey:     params.AttributuonID,
+				PreferredCurrencyMetadataKey:    params.Currency,
+				AttributionIDMetadataKey:        params.AttributuonID,
+				BillingCreaterUserIDMetadataKey: params.BillingCreatorUserID,
 			},
 		},
 		Email: stripe.String(params.Email),
@@ -392,6 +419,92 @@ func (c *Client) SetDefaultPaymentForCustomer(ctx context.Context, customerID st
 	}
 
 	return customer, nil
+}
+
+func (c *Client) GetDispute(ctx context.Context, disputeID string) (dispute *stripe.Dispute, err error) {
+	now := time.Now()
+	reportStripeRequestStarted("dispute_get")
+	defer func() {
+		reportStripeRequestCompleted("dispute_get", err, time.Since(now))
+	}()
+	params := &stripe.DisputeParams{
+		Params: stripe.Params{
+			Context: ctx,
+		},
+	}
+	params.AddExpand("payment_intent.customer")
+
+	dispute, err = c.sc.Disputes.Get(disputeID, params)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve dispute ID: %s", disputeID)
+	}
+
+	return dispute, nil
+}
+
+type PaymentHoldResult string
+
+// List of values that PaymentIntentStatus can take
+const (
+	PaymentHoldResultRequiresAction        PaymentHoldResult = "requires_action"
+	PaymentHoldResultRequiresConfirmation  PaymentHoldResult = "requires_confirmation"
+	PaymentHoldResultRequiresPaymentMethod PaymentHoldResult = "requires_payment_method"
+	PaymentHoldResultSucceeded             PaymentHoldResult = "succeeded"
+	PaymentHoldResultFailed                PaymentHoldResult = "failed"
+)
+
+func (c *Client) TryHoldAmount(ctx context.Context, customer *stripe.Customer, amountInCents int) (PaymentHoldResult, error) {
+	if customer == nil {
+		return PaymentHoldResultFailed, fmt.Errorf("no customer specified")
+	}
+
+	if amountInCents <= 0 {
+		return PaymentHoldResultFailed, fmt.Errorf("amountInCents must be greater than 0")
+	}
+
+	currency := customer.Metadata["preferredCurrency"]
+	if currency == "" {
+		currency = string(stripe.CurrencyUSD)
+	}
+
+	// we create a payment intent with the amount we want to hold
+	// and then cancel it immediately
+	paymentIntent, err := c.sc.PaymentIntents.New(&stripe.PaymentIntentParams{
+		Amount:   stripe.Int64(int64(amountInCents)),
+		Currency: stripe.String(currency),
+		Customer: stripe.String(customer.ID),
+		PaymentMethodTypes: stripe.StringSlice([]string{
+			"card",
+		}),
+		PaymentMethod: stripe.String(customer.InvoiceSettings.DefaultPaymentMethod.ID),
+		CaptureMethod: stripe.String(string(stripe.PaymentIntentCaptureMethodManual)),
+		Confirm:       stripe.Bool(true),
+	})
+	if err != nil {
+		return PaymentHoldResultFailed, fmt.Errorf("failed to confirm payment intent: %w", err)
+	}
+	if paymentIntent.Status != stripe.PaymentIntentStatusRequiresCapture {
+		result := PaymentHoldResultFailed
+		if paymentIntent.Status == stripe.PaymentIntentStatusRequiresAction {
+			result = PaymentHoldResultRequiresAction
+		} else if paymentIntent.Status == stripe.PaymentIntentStatusRequiresConfirmation {
+			result = PaymentHoldResultRequiresConfirmation
+		} else if paymentIntent.Status == stripe.PaymentIntentStatusRequiresPaymentMethod {
+			result = PaymentHoldResultRequiresPaymentMethod
+		}
+		return result, fmt.Errorf("Couldn't put a hold on the card: %s", paymentIntent.Status)
+	}
+	paymentIntent, err = c.sc.PaymentIntents.Cancel(paymentIntent.ID, nil)
+	if err != nil {
+		log.Errorf("Failed to cancel payment intent: %v", err)
+		return PaymentHoldResultSucceeded, nil
+	}
+	if paymentIntent.Status != stripe.PaymentIntentStatusCanceled {
+		log.Errorf("Failed to cancel payment intent: %v", err)
+		return PaymentHoldResultSucceeded, nil
+	}
+	log.Info("Successfully put a hold on the card. Payment intent canceled.", customer.ID)
+	return PaymentHoldResultSucceeded, nil
 }
 
 func GetAttributionID(ctx context.Context, customer *stripe.Customer) (db.AttributionID, error) {

@@ -22,6 +22,7 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/namegen"
 	csapi "github.com/gitpod-io/gitpod/content-service/api"
 	protocol "github.com/gitpod-io/gitpod/gitpod-protocol"
+	ide "github.com/gitpod-io/gitpod/ide-service-api/config"
 	imgbldr "github.com/gitpod-io/gitpod/image-builder/api"
 	wsmanapi "github.com/gitpod-io/gitpod/ws-manager/api"
 )
@@ -193,10 +194,11 @@ func LaunchWorkspaceDirectly(t *testing.T, ctx context.Context, api *ComponentAP
 	}
 
 	ideImage := options.IdeImage
+	ideImageLayers := make([]string, 0)
 	if ideImage == "" {
-		var cfg *ServerIDEConfigPartial
+		var cfg *ide.IDEConfig
 		for i := 0; i < 3; i++ {
-			cfg, err = GetServerIDEConfig(api.namespace, api.client)
+			cfg, err = GetIDEConfig(api.namespace, api.client)
 			if err != nil {
 				continue
 			}
@@ -204,7 +206,8 @@ func LaunchWorkspaceDirectly(t *testing.T, ctx context.Context, api *ComponentAP
 		if err != nil {
 			return nil, nil, xerrors.Errorf("cannot find server IDE config: %w", err)
 		}
-		ideImage = cfg.IDEOptions.Options.Code.Image
+		ideImage = cfg.IdeOptions.Options["code"].Image
+		ideImageLayers = cfg.IdeOptions.Options["code"].ImageLayers
 		if ideImage == "" {
 			err = xerrors.Errorf("cannot start workspaces without an IDE image (required by registry-facade resolver)")
 			return nil, nil, err
@@ -225,6 +228,7 @@ func LaunchWorkspaceDirectly(t *testing.T, ctx context.Context, api *ComponentAP
 			IdeImage: &wsmanapi.IDEImage{
 				WebRef: ideImage,
 			},
+			IdeImageLayers:    ideImageLayers,
 			WorkspaceLocation: "/",
 			Timeout:           "30m",
 			Initializer: &csapi.WorkspaceInitializer{
@@ -318,6 +322,22 @@ func LaunchWorkspaceDirectly(t *testing.T, ctx context.Context, api *ComponentAP
 //
 // When possible, prefer the less complex LaunchWorkspaceDirectly.
 func LaunchWorkspaceFromContextURL(t *testing.T, ctx context.Context, contextURL string, username string, api *ComponentAPI, serverOpts ...GitpodServerOpt) (*protocol.WorkspaceInfo, StopWorkspaceFunc, error) {
+	return LaunchWorkspaceWithOptions(t, ctx, &LaunchWorkspaceOptions{
+		ContextURL: contextURL,
+	}, username, api, serverOpts...)
+}
+
+type LaunchWorkspaceOptions struct {
+	ContextURL  string
+	IDESettings *protocol.IDESettings
+}
+
+// LaunchWorkspaceWithOptions force-creates a new workspace using the Gitpod server API,
+// and waits for the workspace to start. If any step along the way fails, this function will
+// fail the test.
+//
+// When possible, prefer the less complex LaunchWorkspaceDirectly.
+func LaunchWorkspaceWithOptions(t *testing.T, ctx context.Context, opts *LaunchWorkspaceOptions, username string, api *ComponentAPI, serverOpts ...GitpodServerOpt) (*protocol.WorkspaceInfo, StopWorkspaceFunc, error) {
 	var (
 		defaultServerOpts []GitpodServerOpt
 		stopWs            StopWorkspaceFunc = nil
@@ -345,11 +365,14 @@ func LaunchWorkspaceFromContextURL(t *testing.T, ctx context.Context, contextURL
 
 	var resp *protocol.WorkspaceCreationResult
 	for i := 0; i < 3; i++ {
-		t.Logf("attemp to create the workspace: %s", contextURL)
+		t.Logf("attemp to create the workspace: %s", opts.ContextURL)
 		resp, err = server.CreateWorkspace(cctx, &protocol.CreateWorkspaceOptions{
-			ContextURL:                         contextURL,
+			ContextURL:                         opts.ContextURL,
 			IgnoreRunningPrebuild:              true,
 			IgnoreRunningWorkspaceOnSameCommit: true,
+			StartWorkspaceOptions: protocol.StartWorkspaceOptions{
+				IdeSettings: opts.IDESettings,
+			},
 		})
 		if err != nil {
 			scode := status.Code(err)
@@ -374,11 +397,20 @@ func LaunchWorkspaceFromContextURL(t *testing.T, ctx context.Context, contextURL
 	}
 
 	t.Logf("attemp to get the workspace information: %s", resp.CreatedWorkspaceID)
-	wi, err := server.GetWorkspace(ctx, resp.CreatedWorkspaceID)
-	if err != nil {
-		return nil, nil, xerrors.Errorf("cannot get workspace: %w", err)
+
+	var wi *protocol.WorkspaceInfo
+	for i := 0; i < 3; i++ {
+		wi, err = server.GetWorkspace(ctx, resp.CreatedWorkspaceID)
+		if err != nil || wi.LatestInstance == nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+		if wi.LatestInstance.Status.Phase != "preparing" {
+			break
+		}
+		time.Sleep(5 * time.Second)
 	}
-	if wi.LatestInstance == nil {
+	if wi == nil || wi.LatestInstance == nil {
 		return nil, nil, xerrors.Errorf("CreateWorkspace did not start the workspace")
 	}
 	t.Logf("got the workspace information: %s", wi.Workspace.ID)
@@ -387,6 +419,19 @@ func LaunchWorkspaceFromContextURL(t *testing.T, ctx context.Context, contextURL
 	// from ws-manager, in which case IdeURL is not set
 	if wi.LatestInstance.IdeURL == "" {
 		wi.LatestInstance.IdeURL = resp.WorkspaceURL
+	}
+
+	if wi.LatestInstance.Status.Conditions.NeededImageBuild {
+		for ctx.Err() == nil {
+			wi, err = server.GetWorkspace(ctx, resp.CreatedWorkspaceID)
+			if err != nil {
+				return nil, nil, xerrors.Errorf("cannot get workspace: %w", err)
+			}
+			if wi.LatestInstance.Status.Phase == "running" {
+				break
+			}
+			time.Sleep(10 * time.Second)
+		}
 	}
 
 	stopWs = stopWsF(t, wi.LatestInstance.ID, resp.CreatedWorkspaceID, api, false)
@@ -729,10 +774,7 @@ func WaitForWorkspaceStop(t *testing.T, ctx context.Context, ready chan<- struct
 
 			wss = resp.GetStatus()
 			if wss.Conditions.Failed != "" {
-				// TODO(toru): we have to fix https://github.com/gitpod-io/gitpod/issues/12021
-				if wss.Conditions.Failed != "The container could not be located when the pod was deleted.  The container used to be Running" && wss.Conditions.Failed != "The container could not be located when the pod was terminated" {
-					errCh <- xerrors.Errorf("workspace instance %s failed: %s", instanceID, wss.Conditions.Failed)
-				}
+				errCh <- xerrors.Errorf("workspace instance %s failed: %s", instanceID, wss.Conditions.Failed)
 				return
 			}
 			if wss.Phase == wsmanapi.WorkspacePhase_STOPPED {

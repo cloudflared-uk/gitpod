@@ -4,12 +4,16 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useEffect, useState } from "react";
-import Modal from "./components/Modal";
+import { useCallback, useEffect, useState } from "react";
+import { Button } from "./components/Button";
+import Modal, { ModalBody, ModalFooter, ModalHeader } from "./components/Modal";
 import { getGitpodService, gitpodHostUrl } from "./service/service";
-import { GitIntegrationModal } from "./settings/Integrations";
+import { GitIntegrationModal } from "./user-settings/Integrations";
 
-export default function Setup() {
+type Props = {
+    onComplete?: () => void;
+};
+export default function Setup({ onComplete }: Props) {
     const [showModal, setShowModal] = useState<boolean>(false);
 
     useEffect(() => {
@@ -22,16 +26,21 @@ export default function Setup() {
         })();
     }, []);
 
-    const acceptAndContinue = () => {
+    const acceptAndContinue = useCallback(() => {
         setShowModal(true);
-    };
+    }, []);
 
-    const onAuthorize = (payload?: string) => {
-        // run without await, so the integrated closing of new tab isn't blocked
-        (async () => {
-            window.location.href = gitpodHostUrl.asDashboard().toString();
-        })();
-    };
+    const onAuthorize = useCallback(
+        (payload?: string) => {
+            onComplete && onComplete();
+
+            // run without await, so the integrated closing of new tab isn't blocked
+            (async () => {
+                window.location.href = gitpodHostUrl.asDashboard().toString();
+            })();
+        },
+        [onComplete],
+    );
 
     const headerText = "Configure a Git integration with a GitLab, GitHub, or Bitbucket instance.";
 
@@ -40,8 +49,8 @@ export default function Setup() {
             {!showModal && (
                 // TODO: Use title and buttons props
                 <Modal visible={true} onClose={() => {}} closeable={false}>
-                    <h3 className="pb-2">Welcome to Gitpod 🎉</h3>
-                    <div className="border-t border-b border-gray-200 dark:border-gray-800 mt-2 -mx-6 px-6 py-4">
+                    <ModalHeader>Welcome to Gitpod 🎉</ModalHeader>
+                    <ModalBody>
                         <p className="pb-4 text-gray-500 text-base">
                             To start using Gitpod, you will need to set up a Git integration.
                         </p>
@@ -59,12 +68,12 @@ export default function Setup() {
                                 .
                             </span>
                         </div>
-                    </div>
-                    <div className="flex justify-end mt-6">
-                        <button className={"ml-2"} onClick={() => acceptAndContinue()}>
+                    </ModalBody>
+                    <ModalFooter>
+                        <Button className={"ml-2"} onClick={acceptAndContinue}>
                             Continue
-                        </button>
-                    </div>
+                        </Button>
+                    </ModalFooter>
                 </Modal>
             )}
             {showModal && (

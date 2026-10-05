@@ -26,17 +26,39 @@ export type Config = Omit<
     | "chargebeeProviderOptionsFile"
     | "stripeSecretsFile"
     | "stripeConfigFile"
+    | "linkedInSecretsFile"
     | "licenseFile"
     | "patSigningKeyFile"
+    | "auth"
 > & {
     hostUrl: GitpodHostUrl;
     workspaceDefaults: WorkspaceDefaults;
     chargebeeProviderOptions?: ChargebeeProviderOptions;
     stripeSecrets?: { publishableKey: string; secretKey: string };
+    linkedInSecrets?: { clientId: string; clientSecret: string };
     builtinAuthProvidersConfigured: boolean;
     inactivityPeriodForReposInDays?: number;
 
     patSigningKey: string;
+    admin: {
+        loginKey?: string;
+        // Absolute file path pointing to a file which contains admin credentials, encoded as JSON.
+        credentialsPath: string;
+    };
+
+    auth: {
+        // Public/Private key for signing authenticated sessions
+        pki: {
+            signing: {
+                privateKey: string;
+                publicKey: string;
+            };
+            validating: {
+                privateKey: string;
+                publicKey: string;
+            }[];
+        };
+    };
 };
 
 export interface WorkspaceDefaults {
@@ -115,6 +137,8 @@ export interface ConfigSerialized {
     definitelyGpDisabled: boolean;
 
     workspaceGarbageCollection: WorkspaceGarbageCollection;
+    completeSnapshotJob?: { disabled?: boolean };
+    longRunningMigrationsJob?: { disabled?: boolean };
 
     enableLocalApp: boolean;
 
@@ -141,7 +165,12 @@ export interface ConfigSerialized {
         passlist: string[];
     };
 
-    makeNewUsersAdmin: boolean;
+    showSetupModal: boolean;
+
+    admin: {
+        grantFirstUserAdminRole: boolean;
+        credentialsPath: string;
+    };
 
     /** defaultBaseImageRegistryWhitelist is the list of registryies users get acces to by default */
     defaultBaseImageRegistryWhitelist: string[];
@@ -163,12 +192,6 @@ export interface ConfigSerialized {
      * Example: content-service:8080
      */
     contentServiceAddr: string;
-
-    /**
-     * The address content service clients connect to
-     * Example: image-builder:8080
-     */
-    imageBuilderAddr: string;
 
     /**
      * The address usage service clients connect to
@@ -199,6 +222,11 @@ export interface ConfigSerialized {
     stripeSecretsFile?: string;
     stripeConfigFile?: string;
     enablePayment?: boolean;
+
+    /**
+     * LinkedIn OAuth2 configuration
+     */
+    linkedInSecretsFile?: string;
 
     /**
      * Number of prebuilds that can be started in a given time period.
@@ -232,12 +260,19 @@ export interface ConfigSerialized {
      */
     patSigningKeyFile?: string;
 
-    /**
-     * Whether the application cluster contains workspace components or not.
-     * Used to e.g. determine whether image builds need to happen in workspace
-     * clusters or application clusters.
-     */
-    withoutWorkspaceComponents: boolean;
+    auth: {
+        pki: AuthPKIConfig;
+    };
+}
+
+export interface AuthPKIConfig {
+    signing: KeyPair;
+    validating?: KeyPair[];
+}
+
+export interface KeyPair {
+    publicKeyPath: string;
+    privateKeyPath: string;
 }
 
 export namespace ConfigFile {
@@ -292,6 +327,16 @@ export namespace ConfigFile {
                 log.error("Could not load Stripe secrets", error);
             }
         }
+        let linkedInSecrets: { clientId: string; clientSecret: string } | undefined;
+        if (config.linkedInSecretsFile) {
+            try {
+                linkedInSecrets = JSON.parse(
+                    fs.readFileSync(filePathTelepresenceAware(config.linkedInSecretsFile), "utf-8"),
+                );
+            } catch (error) {
+                log.error("Could not load LinkedIn secrets", error);
+            }
+        }
         let license = config.license;
         const licenseFile = config.licenseFile;
         if (licenseFile) {
@@ -330,6 +375,18 @@ export namespace ConfigFile {
             }
         }
 
+        const authPKI: Config["auth"]["pki"] = {
+            signing: {
+                privateKey: fs.readFileSync(filePathTelepresenceAware(config.auth.pki.signing.privateKeyPath), "utf-8"),
+                publicKey: fs.readFileSync(filePathTelepresenceAware(config.auth.pki.signing.publicKeyPath), "utf-8"),
+            },
+            validating:
+                config.auth.pki.validating?.map((keypair) => ({
+                    privateKey: fs.readFileSync(filePathTelepresenceAware(keypair.privateKeyPath), "utf-8"),
+                    publicKey: fs.readFileSync(filePathTelepresenceAware(keypair.publicKeyPath), "utf-8"),
+                })) || [],
+        };
+
         return {
             ...config,
             hostUrl,
@@ -337,6 +394,7 @@ export namespace ConfigFile {
             builtinAuthProvidersConfigured,
             chargebeeProviderOptions,
             stripeSecrets,
+            linkedInSecrets,
             twilioConfig,
             license,
             workspaceGarbageCollection: {
@@ -347,6 +405,13 @@ export namespace ConfigFile {
             },
             inactivityPeriodForReposInDays,
             patSigningKey,
+            admin: {
+                ...config.admin,
+                credentialsPath: config.admin.credentialsPath,
+            },
+            auth: {
+                pki: authPKI,
+            },
         };
     }
 }

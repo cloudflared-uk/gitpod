@@ -13,7 +13,7 @@ message Team {
     // name is the name of the Team
     string name = 2;
 
-    // slug is the short version of the Team name
+    // slug is the slug of the Team
     string slug = 3;
 
     // members are the team members of this Team

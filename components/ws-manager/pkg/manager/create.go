@@ -393,6 +393,13 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		}
 		annotations[customTimeoutAnnotation] = req.Spec.Timeout
 	}
+	if req.Spec.ClosedTimeout != "" {
+		_, err := time.ParseDuration(req.Spec.ClosedTimeout)
+		if err != nil {
+			return nil, xerrors.Errorf("invalid closed timeout \"%s\": %w", req.Spec.ClosedTimeout, err)
+		}
+		annotations[customClosedTimeoutAnnotation] = req.Spec.ClosedTimeout
+	}
 
 	for k, v := range req.Metadata.Annotations {
 		annotations[workspaceAnnotationPrefix+k] = v
@@ -436,51 +443,6 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		},
 	}
 
-	// This is how we support custom CA certs in Gitpod workspaces.
-	// Keep workspace templates clean.
-	if m.Config.WorkspaceCACertSecret != "" {
-		const volumeName = "custom-ca-certs"
-		volumes = append(volumes, corev1.Volume{
-			Name: volumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: m.Config.WorkspaceCACertSecret,
-					Items: []corev1.KeyToPath{
-						{
-							Key:  "ca.crt",
-							Path: "ca.crt",
-						},
-					},
-				},
-			},
-		})
-
-		const mountPath = "/etc/ssl/certs/gitpod-ca.crt"
-		workspaceContainer.VolumeMounts = append(workspaceContainer.VolumeMounts, corev1.VolumeMount{
-			Name:      volumeName,
-			ReadOnly:  true,
-			MountPath: mountPath,
-			SubPath:   "ca.crt",
-		})
-		workspaceContainer.Env = append(workspaceContainer.Env, corev1.EnvVar{
-			Name:  "NODE_EXTRA_CA_CERTS",
-			Value: mountPath,
-		})
-	}
-
-	if req.Type == api.WorkspaceType_IMAGEBUILD {
-		// mount self-signed gitpod CA certificate to ensure
-		// we can push images to the in-cluster registry
-		workspaceContainer.VolumeMounts = append(workspaceContainer.VolumeMounts,
-			corev1.VolumeMount{
-				Name:      "gitpod-ca-certificate",
-				MountPath: "/usr/local/share/ca-certificates/gitpod-ca.crt",
-				SubPath:   "ca.crt",
-				ReadOnly:  true,
-			},
-		)
-	}
-
 	workloadType := "regular"
 	if startContext.Headless {
 		workloadType = "headless"
@@ -503,6 +465,10 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 							{
 								Key:      "gitpod.io/registry-facade_ready_ns_" + m.Config.Namespace,
 								Operator: corev1.NodeSelectorOpExists,
+							},
+							{
+								Key:      "gitpod.io/experimental",
+								Operator: corev1.NodeSelectorOpDoesNotExist,
 							},
 						},
 					},
@@ -529,7 +495,6 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 			Affinity:                     affinity,
 			SecurityContext: &corev1.PodSecurityContext{
 				// We're using a custom seccomp profile for user namespaces to allow clone, mount and chroot.
-				// Those syscalls don't make much sense in a non-userns setting, where we default to runtime/default using the PodSecurityPolicy.
 				SeccompProfile: &corev1.SeccompProfile{
 					Type:             corev1.SeccompProfileTypeLocalhost,
 					LocalhostProfile: pointer.String(m.Config.SeccompProfile),
@@ -636,20 +601,6 @@ func (m *Manager) createDefiniteWorkspacePod(startContext *startWorkspaceContext
 		default:
 			log.Warnf("Unknown feature flag %v", feature)
 		}
-	}
-
-	if req.Type == api.WorkspaceType_IMAGEBUILD {
-		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-			Name: "gitpod-ca-certificate",
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{
-					SecretName: "builtin-registry-facade-cert",
-					Items: []corev1.KeyToPath{
-						{Key: "ca.crt", Path: "ca.crt"},
-					},
-				},
-			},
-		})
 	}
 
 	return &pod, nil

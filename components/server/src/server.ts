@@ -50,8 +50,9 @@ import { WsConnectionHandler } from "./express/ws-connection-handler";
 import { InstallationAdminController } from "./installation-admin/installation-admin-controller";
 import { WebhookEventGarbageCollector } from "./projects/webhook-event-garbage-collector";
 import { LivenessController } from "./liveness/liveness-controller";
-import { FeatureFlagController } from "./feature-flag/featureflag-controller";
 import { IamSessionApp } from "./iam/iam-session-app";
+import { LongRunningMigrationService } from "@gitpod/gitpod-db/lib/long-running-migration/long-running-migration";
+import { API } from "./api/server";
 
 @injectable()
 export class Server<C extends GitpodClient, S extends GitpodServer> {
@@ -69,7 +70,6 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
     @inject(LocalMessageBroker) protected readonly localMessageBroker: LocalMessageBroker;
     @inject(WorkspaceDownloadService) protected readonly workspaceDownloadService: WorkspaceDownloadService;
     @inject(LivenessController) protected readonly livenessController: LivenessController;
-    @inject(FeatureFlagController) protected readonly featureFlagController: FeatureFlagController;
     @inject(MonitoringEndpointsApp) protected readonly monitoringEndpointsApp: MonitoringEndpointsApp;
     @inject(CodeSyncService) private readonly codeSyncService: CodeSyncService;
     @inject(HeadlessLogController) protected readonly headlessLogController: HeadlessLogController;
@@ -79,9 +79,9 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
     @inject(ConsensusLeaderQorum) protected readonly qorum: ConsensusLeaderQorum;
     @inject(WorkspaceGarbageCollector) protected readonly workspaceGC: WorkspaceGarbageCollector;
     @inject(OneTimeSecretServer) protected readonly oneTimeSecretServer: OneTimeSecretServer;
-
     @inject(PeriodicDbDeleter) protected readonly periodicDbDeleter: PeriodicDbDeleter;
     @inject(WebhookEventGarbageCollector) protected readonly webhookEventGarbageCollector: WebhookEventGarbageCollector;
+    @inject(LongRunningMigrationService) protected readonly migrationService: LongRunningMigrationService;
 
     @inject(BearerAuth) protected readonly bearerAuth: BearerAuth;
 
@@ -93,6 +93,9 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
     @inject(IamSessionApp) protected readonly iamSessionAppCreator: IamSessionApp;
     protected iamSessionApp?: express.Application;
     protected iamSessionAppServer?: http.Server;
+
+    @inject(API) protected readonly api: API;
+    protected apiServer?: http.Server;
 
     protected readonly eventEmitter = new EventEmitter();
     protected app?: express.Application;
@@ -153,12 +156,12 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
         // Websocket for client connection
         const websocketConnectionHandler = this.websocketConnectionHandler;
         this.eventEmitter.on(Server.EVENT_ON_START, (httpServer) => {
-            // CSRF protection: check "Origin" header, it must be either:
-            //  - gitpod.io (hostUrl.hostname) or
-            //  - a workspace location (ending of hostUrl.hostname)
+            // CSRF protection: check "Origin" header:
+            //  - for cookie/session AND Bearer auth: MUST be hostUrl.hostname (gitpod.io)
+            //  - edge case: empty "Origin" is always permitted
             // We rely on the origin header being set correctly (needed by regular clients to use Gitpod:
             // CORS allows subdomains to access gitpod.io)
-            const verifyCSRF = (origin: string) => {
+            const verifyOrigin = (origin: string) => {
                 let allowedRequest = isAllowedWebsocketDomain(origin, this.config.hostUrl.url.hostname);
                 if (!allowedRequest && this.config.insecureNoDomain) {
                     log.warn("Websocket connection CSRF guard disabled");
@@ -171,13 +174,19 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
              * Verify the web socket handshake request.
              */
             const verifyClient: ws.VerifyClientCallbackAsync = async (info, callback) => {
-                if (!verifyCSRF(info.origin)) {
-                    log.warn("Websocket connection attempt with non-matching Origin header: " + info.origin);
-                    return callback(false, 403);
-                }
+                let authenticatedUsingBearerToken = false;
                 if (info.req.url === "/v1") {
+                    // Connection attempt with Bearer-Token: be less strict for now
+                    if (!verifyOrigin(info.origin)) {
+                        log.debug("Websocket connection attempt with non-matching Origin header.", {
+                            origin: info.origin,
+                        });
+                        return callback(false, 403);
+                    }
+
                     try {
                         await this.bearerAuth.auth(info.req as express.Request);
+                        authenticatedUsingBearerToken = true;
                     } catch (e) {
                         if (isBearerAuthError(e)) {
                             return callback(false, 401, e.message);
@@ -185,7 +194,17 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
                         log.warn("authentication failed: ", e);
                         return callback(false, 500);
                     }
+                    // intentional fall-through to cookie/session based authentication
                 }
+
+                if (!authenticatedUsingBearerToken) {
+                    // Connection attempt with cookie/session based authentication: be strict about where we accept connections from!
+                    if (!verifyOrigin(info.origin)) {
+                        log.debug("Websocket connection attempt with non-matching Origin header: " + info.origin);
+                        return callback(false, 403);
+                    }
+                }
+
                 return callback(true);
             };
 
@@ -283,23 +302,45 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
         // Start DB updater
         this.startDbDeleter().catch((err) => log.error("starting DB deleter", err));
 
+        // Start long running migrations
+        this.startLongRunningMigrations().catch((err) => log.error("long running migrations errored", err));
+
         // Start WebhookEvent GC
         this.webhookEventGarbageCollector
             .start()
             .catch((err) => log.error("webhook-event-gc: error during startup", err));
 
         this.app = app;
+
         log.info("server initialized.");
+    }
+
+    protected async startLongRunningMigrations(): Promise<void> {
+        if (this.config.longRunningMigrationsJob?.disabled) {
+            return;
+        }
+        log.info("Starting long running migrations job...");
+        let completed = false;
+        while (!completed) {
+            if (await this.qorum.areWeLeader()) {
+                completed = await this.migrationService.runMigrationBatch();
+            }
+            // sleep 5min
+            await new Promise((resolve) => setTimeout(resolve, 5 * 60 * 1000));
+        }
     }
 
     protected async startDbDeleter() {
         if (!this.config.runDbDeleter) {
             return;
         }
-        const areWeLeader = await this.qorum.areWeLeader();
-        if (areWeLeader) {
-            this.periodicDbDeleter.start();
-        }
+        this.periodicDbDeleter.start(async () => {
+            const areWeLeader = await this.qorum.areWeLeader();
+            log.info(
+                "[PeriodicDbDeleter]" + areWeLeader ? "Deleter should run." : "Current instance is not the leader",
+            );
+            return areWeLeader;
+        });
     }
 
     protected async registerRoutes(app: express.Application) {
@@ -316,7 +357,6 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
             res.send(this.config.version);
         });
         app.use(this.oauthController.oauthRouter);
-        app.use("/feature-flags", this.featureFlagController.apiRouter);
     }
 
     public async start(port: number) {
@@ -356,6 +396,8 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
             });
         }
 
+        this.apiServer = this.api.listen(9877);
+
         this.debugApp.start();
     }
 
@@ -365,6 +407,7 @@ export class Server<C extends GitpodClient, S extends GitpodServer> {
         await this.stopServer(this.monitoringHttpServer);
         await this.stopServer(this.installationAdminHttpServer);
         await this.stopServer(this.httpServer);
+        await this.stopServer(this.apiServer);
         this.disposables.dispose();
         log.info("server stopped.");
     }

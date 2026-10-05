@@ -51,12 +51,7 @@ import { ConsensusLeaderMessenger } from "./consensus/consensus-leader-messenger
 import { RabbitMQConsensusLeaderMessenger } from "./consensus/rabbitmq-consensus-leader-messenger";
 import { ConsensusLeaderQorum } from "./consensus/consensus-leader-quorum";
 import { StorageClient } from "./storage/storage-client";
-import {
-    ImageBuilderClientConfig,
-    ImageBuilderClientProvider,
-    CachingImageBuilderClientProvider,
-    ImageBuilderClientCallMetrics,
-} from "@gitpod/image-builder/lib";
+import { ImageBuilderClientProvider, ImageBuilderClientCallMetrics } from "@gitpod/image-builder/lib";
 import { ImageSourceProvider } from "./workspace/image-source-provider";
 import { WorkspaceGarbageCollector } from "./workspace/garbage-collector";
 import { TokenGarbageCollector } from "./user/token-garbage-collector";
@@ -95,7 +90,6 @@ import { LocalMessageBroker, LocalRabbitMQBackedMessageBroker } from "./messagin
 import { ReferrerPrefixParser } from "./workspace/referrer-prefix-context-parser";
 import { InstallationAdminTelemetryDataProvider } from "./installation-admin/telemetry-data-provider";
 import { IDEService } from "./ide-service";
-import { LicenseEvaluator } from "@gitpod/licensor/lib";
 import { WorkspaceClusterImagebuilderClientProvider } from "./workspace/workspace-cluster-imagebuilder-client-provider";
 import { UsageServiceClient, UsageServiceDefinition } from "@gitpod/usage-api/lib/usage/v1/usage.pb";
 import { BillingServiceClient, BillingServiceDefinition } from "@gitpod/usage-api/lib/usage/v1/billing.pb";
@@ -108,7 +102,6 @@ import {
 import { VerificationService } from "./auth/verification-service";
 import { WebhookEventGarbageCollector } from "./projects/webhook-event-garbage-collector";
 import { LivenessController } from "./liveness/liveness-controller";
-import { FeatureFlagController } from "./feature-flag/featureflag-controller";
 import { IDEServiceClient, IDEServiceDefinition } from "@gitpod/ide-service-api/lib/ide.pb";
 import { prometheusClientMiddleware } from "@gitpod/gitpod-protocol/lib/util/nice-grpc";
 import { UsageService, UsageServiceImpl } from "./user/usage-service";
@@ -117,6 +110,13 @@ import { contentServiceBinder } from "./util/content-service-sugar";
 import { UbpResetOnCancel } from "@gitpod/gitpod-payment-endpoint/lib/chargebee/ubp-reset-on-cancel";
 import { retryMiddleware } from "nice-grpc-client-middleware-retry";
 import { IamSessionApp } from "./iam/iam-session-app";
+import { spicedbClientFromEnv, SpiceDBClient } from "./authorization/spicedb";
+import { Authorizer, PermissionChecker } from "./authorization/perms";
+import { EnvVarService } from "./workspace/env-var-service";
+import { APIUserService } from "./api/user";
+import { APITeamsService } from "./api/teams";
+import { API } from "./api/server";
+import { LinkedInService } from "./linkedin-service";
 
 export const productionContainerModule = new ContainerModule((bind, unbind, isBound, rebind) => {
     bind(Config).toConstantValue(ConfigFile.fromFile());
@@ -174,13 +174,8 @@ export const productionContainerModule = new ContainerModule((bind, unbind, isBo
     bind(PrometheusClientCallMetrics).toSelf().inSingletonScope();
     bind(IClientCallMetrics).to(PrometheusClientCallMetrics).inSingletonScope();
 
-    bind(ImageBuilderClientConfig).toDynamicValue((ctx) => {
-        const config = ctx.container.get<Config>(Config);
-        return { address: config.imageBuilderAddr };
-    });
-    bind(CachingImageBuilderClientProvider).toSelf().inSingletonScope();
-    bind(WorkspaceClusterImagebuilderClientProvider).toSelf().inSingletonScope(); // during the transition period, we have two kinds of image builder client providers
-    bind(ImageBuilderClientProvider).toService(CachingImageBuilderClientProvider);
+    bind(WorkspaceClusterImagebuilderClientProvider).toSelf().inSingletonScope();
+    bind(ImageBuilderClientProvider).toService(WorkspaceClusterImagebuilderClientProvider);
     bind(ImageBuilderClientCallMetrics).toService(IClientCallMetrics);
 
     /* The binding order of the context parser does not configure preference/a working order. Each context parser must be able
@@ -225,7 +220,6 @@ export const productionContainerModule = new ContainerModule((bind, unbind, isBo
     bind(WorkspaceGarbageCollector).toSelf().inSingletonScope();
     bind(WorkspaceDownloadService).toSelf().inSingletonScope();
     bind(LivenessController).toSelf().inSingletonScope();
-    bind(FeatureFlagController).toSelf().inSingletonScope();
 
     bind(OneTimeSecretServer).toSelf().inSingletonScope();
 
@@ -235,8 +229,6 @@ export const productionContainerModule = new ContainerModule((bind, unbind, isBo
     bind(TermsProvider).toSelf().inSingletonScope();
 
     bind(InstallationAdminTelemetryDataProvider).toSelf().inSingletonScope();
-
-    bind(LicenseEvaluator).toSelf().inSingletonScope();
 
     // binds all content services
     contentServiceBinder((ctx) => {
@@ -263,6 +255,8 @@ export const productionContainerModule = new ContainerModule((bind, unbind, isBo
     bind(HeadlessLogController).toSelf().inSingletonScope();
 
     bind(ProjectsService).toSelf().inSingletonScope();
+
+    bind(EnvVarService).toSelf().inSingletonScope();
 
     bind(NewsletterSubscriptionController).toSelf().inSingletonScope();
 
@@ -315,6 +309,19 @@ export const productionContainerModule = new ContainerModule((bind, unbind, isBo
     bind(UsageService).toService(UsageServiceImpl);
     bind(UbpResetOnCancel).toSelf().inSingletonScope();
 
+    bind(LinkedInService).toSelf().inSingletonScope();
+
     // IAM Support
     bind(IamSessionApp).toSelf().inSingletonScope();
+
+    // Authorization & Perms
+    bind(SpiceDBClient)
+        .toDynamicValue(() => spicedbClientFromEnv())
+        .inSingletonScope();
+    bind(PermissionChecker).to(Authorizer).inSingletonScope();
+
+    // grpc / Connect API
+    bind(APIUserService).toSelf().inSingletonScope();
+    bind(APITeamsService).toSelf().inSingletonScope();
+    bind(API).toSelf().inSingletonScope();
 });

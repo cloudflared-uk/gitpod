@@ -13,11 +13,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"sync"
+	"time"
 
 	"github.com/sourcegraph/jsonrpc2"
-	"golang.org/x/xerrors"
 
 	"github.com/sirupsen/logrus"
 )
@@ -57,14 +56,15 @@ type APIInterface interface {
 	SendHeartBeat(ctx context.Context, options *SendHeartBeatOptions) (err error)
 	WatchWorkspaceImageBuildLogs(ctx context.Context, workspaceID string) (err error)
 	IsPrebuildDone(ctx context.Context, pwsid string) (res bool, err error)
-	SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration *WorkspaceTimeoutDuration) (res *SetWorkspaceTimeoutResult, err error)
+	SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration time.Duration) (res *SetWorkspaceTimeoutResult, err error)
 	GetWorkspaceTimeout(ctx context.Context, workspaceID string) (res *GetWorkspaceTimeoutResult, err error)
 	GetOpenPorts(ctx context.Context, workspaceID string) (res []*WorkspaceInstancePort, err error)
 	OpenPort(ctx context.Context, workspaceID string, port *WorkspaceInstancePort) (res *WorkspaceInstancePort, err error)
 	ClosePort(ctx context.Context, workspaceID string, port float32) (err error)
 	GetUserStorageResource(ctx context.Context, options *GetUserStorageResourceOptions) (res string, err error)
 	UpdateUserStorageResource(ctx context.Context, options *UpdateUserStorageResourceOptions) (err error)
-	GetEnvVars(ctx context.Context) (res []*UserEnvVarValue, err error)
+	GetWorkspaceEnvVars(ctx context.Context, workspaceID string) (res []*EnvVar, err error)
+	GetEnvVars(ctx context.Context) (res []*EnvVar, err error)
 	SetEnvVar(ctx context.Context, variable *UserEnvVarValue) (err error)
 	DeleteEnvVar(ctx context.Context, variable *UserEnvVarValue) (err error)
 	HasSSHPublicKey(ctx context.Context) (res bool, err error)
@@ -103,6 +103,9 @@ type APIInterface interface {
 	GetTeamProjects(ctx context.Context, teamID string) ([]*Project, error)
 
 	InstanceUpdates(ctx context.Context, instanceID string) (<-chan *WorkspaceInstance, error)
+
+	// GetIDToken doesn't actually do anything, it just authorises
+	GetIDToken(ctx context.Context) (err error)
 }
 
 // FunctionName is the name of an RPC function
@@ -252,6 +255,8 @@ const (
 
 	// FunctionOnInstanceUpdate is the name of the onInstanceUpdate callback function
 	FunctionOnInstanceUpdate = "onInstanceUpdate"
+
+	FunctionGetIDToken FunctionName = "getIDToken"
 )
 
 var errNotConnected = errors.New("not connected to Gitpod server")
@@ -261,6 +266,7 @@ type ConnectToServerOpts struct {
 	Context             context.Context
 	Token               string
 	Cookie              string
+	Origin              string
 	Log                 *logrus.Entry
 	ReconnectionHandler func()
 	CloseHandler        func(error)
@@ -273,21 +279,9 @@ func ConnectToServer(endpoint string, opts ConnectToServerOpts) (*APIoverJSONRPC
 		opts.Context = context.Background()
 	}
 
-	epURL, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, xerrors.Errorf("invalid endpoint URL: %w", err)
-	}
-
-	var protocol string
-	if epURL.Scheme == "wss:" {
-		protocol = "https"
-	} else {
-		protocol = "http"
-	}
-	origin := fmt.Sprintf("%s://%s/", protocol, epURL.Hostname())
-
 	reqHeader := http.Header{}
-	reqHeader.Set("Origin", origin)
+	reqHeader.Set("Origin", opts.Origin)
+
 	for k, v := range opts.ExtraHeaders {
 		reqHeader.Set(k, v)
 	}
@@ -949,7 +943,7 @@ func (gp *APIoverJSONRPC) IsPrebuildDone(ctx context.Context, pwsid string) (res
 }
 
 // SetWorkspaceTimeout calls setWorkspaceTimeout on the server
-func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration *WorkspaceTimeoutDuration) (res *SetWorkspaceTimeoutResult, err error) {
+func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID string, duration time.Duration) (res *SetWorkspaceTimeoutResult, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
@@ -957,7 +951,7 @@ func (gp *APIoverJSONRPC) SetWorkspaceTimeout(ctx context.Context, workspaceID s
 	var _params []interface{}
 
 	_params = append(_params, workspaceID)
-	_params = append(_params, duration)
+	_params = append(_params, fmt.Sprintf("%dm", int(duration.Minutes())))
 
 	var result SetWorkspaceTimeoutResult
 	err = gp.C.Call(ctx, "setWorkspaceTimeout", _params, &result)
@@ -1124,15 +1118,35 @@ func (gp *APIoverJSONRPC) UpdateUserStorageResource(ctx context.Context, options
 	return
 }
 
-// GetEnvVars calls getEnvVars on the server
-func (gp *APIoverJSONRPC) GetEnvVars(ctx context.Context) (res []*UserEnvVarValue, err error) {
+// GetWorkspaceEnvVars calls GetWorkspaceEnvVars on the server
+func (gp *APIoverJSONRPC) GetWorkspaceEnvVars(ctx context.Context, workspaceID string) (res []*EnvVar, err error) {
 	if gp == nil {
 		err = errNotConnected
 		return
 	}
 	var _params []interface{}
 
-	var result []*UserEnvVarValue
+	_params = append(_params, workspaceID)
+
+	var result []*EnvVar
+	err = gp.C.Call(ctx, "getWorkspaceEnvVars", _params, &result)
+	if err != nil {
+		return
+	}
+	res = result
+
+	return
+}
+
+// GetEnvVars calls getEnvVars on the server
+func (gp *APIoverJSONRPC) GetEnvVars(ctx context.Context) (res []*EnvVar, err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	var _params []interface{}
+
+	var result []*EnvVar
 	err = gp.C.Call(ctx, "getEnvVars", _params, &result)
 	if err != nil {
 		return
@@ -1574,6 +1588,16 @@ func (gp *APIoverJSONRPC) GetTeamProjects(ctx context.Context, teamID string) (r
 	return
 }
 
+func (gp *APIoverJSONRPC) GetIDToken(ctx context.Context) (err error) {
+	if gp == nil {
+		err = errNotConnected
+		return
+	}
+	_params := []interface{}{}
+	err = gp.C.Call(ctx, string(FunctionGetIDToken), _params, nil)
+	return
+}
+
 // PermissionName is the name of a permission
 type PermissionName string
 
@@ -1614,18 +1638,6 @@ const (
 	PinActionUnpin PinAction = "unpin"
 	// PinActionToggle is the "toggle" action
 	PinActionToggle PinAction = "toggle"
-)
-
-// WorkspaceTimeoutDuration is the durations one have set for the workspace timeout
-type WorkspaceTimeoutDuration string
-
-const (
-	// WorkspaceTimeoutDuration30m sets "30m" as timeout duration
-	WorkspaceTimeoutDuration30m = "30m"
-	// WorkspaceTimeoutDuration60m sets "60m" as timeout duration
-	WorkspaceTimeoutDuration60m = "60m"
-	// WorkspaceTimeoutDuration180m sets "180m" as timeout duration
-	WorkspaceTimeoutDuration180m = "180m"
 )
 
 // UserInfo is the UserInfo message type
@@ -1906,9 +1918,9 @@ type StartWorkspaceOptions struct {
 
 // GetWorkspaceTimeoutResult is the GetWorkspaceTimeoutResult message type
 type GetWorkspaceTimeoutResult struct {
-	CanChange   bool   `json:"canChange,omitempty"`
-	DurationRaw string `json:"durationRaw,omitempty"`
-	Duration    string `json:"duration,omitempty"`
+	CanChange             bool   `json:"canChange,omitempty"`
+	Duration              string `json:"duration,omitempty"`
+	HumanReadableDuration string `json:"humanReadableDuration,omitempty"`
 }
 
 // WorkspaceInstancePort is the WorkspaceInstancePort message type
@@ -1986,6 +1998,13 @@ type WhitelistedRepository struct {
 	URL         string `json:"url,omitempty"`
 }
 
+// EnvVar is the EnvVar message type
+type EnvVar struct {
+	ID    string `json:"id,omitempty"`
+	Name  string `json:"name,omitempty"`
+	Value string `json:"value,omitempty"`
+}
+
 // UserEnvVarValue is the UserEnvVarValue message type
 type UserEnvVarValue struct {
 	ID                string `json:"id,omitempty"`
@@ -2055,6 +2074,7 @@ type UpdateOwnAuthProviderParams struct {
 
 // CreateWorkspaceOptions is the CreateWorkspaceOptions message type
 type CreateWorkspaceOptions struct {
+	StartWorkspaceOptions
 	ContextURL                         string `json:"contextUrl,omitempty"`
 	IgnoreRunningWorkspaceOnSameCommit bool   `json:"ignoreRunningWorkspaceOnSameCommit,omitemopty"`
 	IgnoreRunningPrebuild              bool   `json:"ignoreRunningPrebuild,omitemopty"`
@@ -2259,6 +2279,7 @@ type GetTokenSearchOptions struct {
 // SetWorkspaceTimeoutResult is the SetWorkspaceTimeoutResult message type
 type SetWorkspaceTimeoutResult struct {
 	ResetTimeoutOnWorkspaces []string `json:"resetTimeoutOnWorkspaces,omitempty"`
+	HumanReadableDuration    string   `json:"humanReadableDuration,omitempty"`
 }
 
 // UserMessage is the UserMessage message type

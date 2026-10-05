@@ -19,18 +19,21 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/cpulimit"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Config contains all experimental configuration.
 type Config struct {
 	Workspace  *WorkspaceConfig   `json:"workspace,omitempty"`
 	WebApp     *WebAppConfig      `json:"webapp,omitempty"`
-	IDE        *IDEConfig         `json:"ide,omitempty"`
-	Common     *CommonConfig      `json:"common,omitempty"`
-	Telemetry  *TelemetryConfig   `json:"telemetry,omitempty"`
-	AgentSmith *agentSmith.Config `json:"agentSmith,omitempty"`
+	IDE        *IDEConfig         `json:"ide,omitempty"`    // @deprecated
+	Common     *CommonConfig      `json:"common,omitempty"` // @deprecated
+	Overrides  *[]Overrides       `json:"overrides,omitempty"`
+	Telemetry  *TelemetryConfig   `json:"telemetry,omitempty"`  // @deprecated
+	AgentSmith *agentSmith.Config `json:"agentSmith,omitempty"` // @deprecated
 }
 
+// @deprecated
 type TelemetryConfig struct {
 	Data struct {
 		Platform string `json:"platform"`
@@ -38,10 +41,10 @@ type TelemetryConfig struct {
 }
 
 type CommonConfig struct {
-	PodConfig                map[string]*PodConfig `json:"podConfig,omitempty"`
-	StaticMessagebusPassword string                `json:"staticMessagebusPassword"`
-	// @deprecated PodSecurityPolicies are deprecated in k8s 1.21 and removed in 1.25
-	UsePodSecurityPolicies bool `json:"usePodSecurityPolicies"`
+	// @deprecated
+	PodConfig map[string]*PodConfig `json:"podConfig,omitempty"`
+	// @deprecated use a secret instead in messageBus.credentials
+	StaticMessagebusPassword string `json:"staticMessagebusPassword"`
 }
 
 type PodConfig struct {
@@ -62,6 +65,8 @@ type WorkspaceConfig struct {
 	WorkspaceClusterHost     string   `json:"workspaceClusterHost,omitempty"`
 	WorkspaceURLTemplate     string   `json:"workspaceURLTemplate,omitempty"`
 	WorkspacePortURLTemplate string   `json:"workspacePortURLTemplate,omitempty"`
+
+	WorkspaceCIDR string `json:"workspaceCIDR,omitempty"`
 
 	CPULimits struct {
 		Enabled          bool              `json:"enabled"`
@@ -128,6 +133,8 @@ type WorkspaceConfig struct {
 	} `json:"contentService"`
 
 	EnableProtectedSecrets *bool `json:"enableProtectedSecrets"`
+	UseWsmanagerMk2        bool  `json:"useWsmanagerMk2,omitempty"`
+	UseMk2ExperimentalMode bool  `json:"useMk2ExperimentalMode,omitempty"`
 }
 
 type PersistentVolumeClaim struct {
@@ -188,21 +195,31 @@ type IAMConfig struct {
 	OIDCClientsSecretName string `json:"oidsClientsConfigSecret,omitempty"`
 }
 
+type SpiceDBConfig struct {
+	Enabled bool `json:"enabled"`
+
+	DisableMigrations bool `json:"disableMigrations"`
+
+	// Reference to a k8s secret which contains a "presharedKey" for authentication with SpiceDB
+	// Required.
+	SecretRef string `json:"secretRef"`
+}
+
 type WebAppConfig struct {
-	PublicAPI                  *PublicAPIConfig       `json:"publicApi,omitempty"`
-	Server                     *ServerConfig          `json:"server,omitempty"`
-	ProxyConfig                *ProxyConfig           `json:"proxy,omitempty"`
-	WorkspaceManagerBridge     *WsManagerBridgeConfig `json:"wsManagerBridge,omitempty"`
-	Tracing                    *Tracing               `json:"tracing,omitempty"`
-	UsePodAntiAffinity         bool                   `json:"usePodAntiAffinity"`
-	DisableMigration           bool                   `json:"disableMigration"`
-	Usage                      *UsageConfig           `json:"usage,omitempty"`
-	ConfigcatKey               string                 `json:"configcatKey"`
-	WorkspaceClasses           []WebAppWorkspaceClass `json:"workspaceClasses"`
-	Stripe                     *StripeConfig          `json:"stripe,omitempty"`
-	SlowDatabase               bool                   `json:"slowDatabase,omitempty"`
-	IAM                        *IAMConfig             `json:"iam,omitempty"`
-	WithoutWorkspaceComponents bool                   `json:"withoutWorkspaceComponents,omitempty"`
+	PublicAPI                    *PublicAPIConfig       `json:"publicApi,omitempty"`
+	Server                       *ServerConfig          `json:"server,omitempty"`
+	ProxyConfig                  *ProxyConfig           `json:"proxy,omitempty"`
+	WorkspaceManagerBridge       *WsManagerBridgeConfig `json:"wsManagerBridge,omitempty"`
+	Tracing                      *Tracing               `json:"tracing,omitempty"`
+	UsePodAntiAffinity           bool                   `json:"usePodAntiAffinity"`
+	DisableMigration             bool                   `json:"disableMigration"`
+	Usage                        *UsageConfig           `json:"usage,omitempty"`
+	ConfigcatKey                 string                 `json:"configcatKey"`
+	WorkspaceClasses             []WebAppWorkspaceClass `json:"workspaceClasses"`
+	Stripe                       *StripeConfig          `json:"stripe,omitempty"`
+	IAM                          *IAMConfig             `json:"iam,omitempty"`
+	SpiceDB                      *SpiceDBConfig         `json:"spicedb,omitempty"`
+	CertmanagerNamespaceOverride string                 `json:"certmanagerNamespaceOverride,omitempty"`
 }
 
 type WorkspaceDefaults struct {
@@ -242,11 +259,15 @@ type ServerConfig struct {
 	ChargebeeSecret                   string            `json:"chargebeeSecret"`
 	StripeSecret                      string            `json:"stripeSecret"`
 	StripeConfig                      string            `json:"stripeConfig"`
+	LinkedInSecret                    string            `json:"linkedInSecret"`
 	DisableDynamicAuthProviderLogin   bool              `json:"disableDynamicAuthProviderLogin"`
 	EnableLocalApp                    *bool             `json:"enableLocalApp"`
 	RunDbDeleter                      *bool             `json:"runDbDeleter"`
 	DisableWorkspaceGarbageCollection bool              `json:"disableWorkspaceGarbageCollection"`
+	DisableLongRunningMigrationJob    bool              `json:"disableLongRunningMigrationJob"`
+	DisableCompleteSnapshotJob        bool              `json:"disableCompleteSnapshotJob"`
 	InactivityPeriodForReposInDays    *int              `json:"inactivityPeriodForReposInDays"`
+	ShowSetupModal                    *bool             `json:"showSetupModal"`
 
 	// @deprecated use containerRegistry.privateBaseImageAllowList instead
 	DefaultBaseImageRegistryWhiteList []string `json:"defaultBaseImageRegistryWhitelist"`
@@ -260,16 +281,22 @@ type ProxyConfig struct {
 	ServiceType *corev1.ServiceType `json:"serviceType,omitempty" validate:"omitempty,service_config_type"`
 
 	Configcat *ConfigcatProxyConfig `json:"configcat,omitempty"`
+
+	FrontendDevEnabled bool `json:"frontendDevEnabled"`
 }
 
 type ConfigcatProxyConfig struct {
-	BaseUrl      string `json:"baseUrl"`
-	PollInterval string `json:"pollInterval"`
+	BaseUrl       string `json:"baseUrl"`
+	PollInterval  string `json:"pollInterval"`
+	FromConfigMap string `json:"fromConfigMap"`
 }
 
 type PublicAPIConfig struct {
 	// Name of the kubernetes secret to use for Stripe secrets
 	StripeSecretName string `json:"stripeSecretName"`
+
+	// Name of the kubernetes secret to use for signing JWTs
+	OIDCClientJWTSigningKeySecretName string `json:"oidcClientJWTSigningKeySecretName"`
 
 	// Name of the kubernetes secret to use for signature of Personal Access Tokens
 	PersonalAccessTokenSigningKeySecretName string `json:"personalAccessTokenSigningKeySecretName"`
@@ -300,6 +327,7 @@ type WorkspaceClassCredits struct {
 	PerMinute float64 `json:"perMinute,omitempty"`
 }
 
+// @deprecated
 type IDEConfig struct {
 	// Disable resolution of latest images and use bundled latest versions instead
 	ResolveLatest    *bool             `json:"resolveLatest,omitempty"`
@@ -308,14 +336,17 @@ type IDEConfig struct {
 	IDEMetricsConfig *IDEMetricsConfig `json:"ideMetrics,omitempty"`
 }
 
+// @deprecated
 type IDEProxyConfig struct {
 	ServiceAnnotations map[string]string `json:"serviceAnnotations"`
 }
 
+// @deprecated
 type IDEMetricsConfig struct {
 	EnabledErrorReporting bool `json:"enabledErrorReporting,omitempty"`
 }
 
+// @deprecated
 type VSXProxyConfig struct {
 	ServiceAnnotations map[string]string `json:"serviceAnnotations"`
 }
@@ -334,3 +365,9 @@ const (
 	TracingSampleTypeRateLimiting  TracingSampleType = "rateLimiting"
 	TracingSampleTypeRemote        TracingSampleType = "remote"
 )
+
+type Overrides struct {
+	metav1.TypeMeta `json:",inline"`
+	Metadata        metav1.ObjectMeta `json:"metadata"`
+	Override        map[string]any    `json:"override"`
+}

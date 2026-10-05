@@ -4,33 +4,30 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useContext, useEffect, useState } from "react";
-import { Team, TeamMemberInfo } from "@gitpod/gitpod-protocol";
+import { Team } from "@gitpod/gitpod-protocol";
 import { AttributionId, AttributionTarget } from "@gitpod/gitpod-protocol/lib/attribution";
-import { getGitpodService } from "../service/service";
-import { TeamsContext } from "../teams/teams-context";
-import { UserContext } from "../user-context";
+import { useContext, useEffect, useState } from "react";
 import SelectableCardSolid from "../components/SelectableCardSolid";
+import { OrganizationInfo, useOrganizations } from "../data/organizations/orgs-query";
 import { ReactComponent as Spinner } from "../icons/Spinner.svg";
+import { getGitpodService } from "../service/service";
+import { UserContext } from "../user-context";
 import Alert from "./Alert";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamMembersToProtocol, teamsService } from "../service/public-api";
+import { Subheading } from "./typography/headings";
 
 export function BillingAccountSelector(props: { onSelected?: () => void }) {
     const { user, setUser } = useContext(UserContext);
-    const { teams } = useContext(TeamsContext);
-    const [teamsAvailableForAttribution, setTeamsAvailableForAttribution] = useState<Team[] | undefined>();
-    const [membersByTeam, setMembersByTeam] = useState<Record<string, TeamMemberInfo[]>>({});
+    const orgs = useOrganizations();
+    const [teamsAvailableForAttribution, setTeamsAvailableForAttribution] = useState<OrganizationInfo[]>([]);
     const [errorMessage, setErrorMessage] = useState<string | undefined>();
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
 
     useEffect(() => {
-        if (!teams) {
-            setTeamsAvailableForAttribution(undefined);
+        if (!orgs?.data) {
+            setTeamsAvailableForAttribution([]);
             return;
         }
 
-        // Fetch the list of teams we can actually attribute to
+        // Fetch the list of orgs we can actually attribute to
         getGitpodService()
             .server.listAvailableUsageAttributionIds()
             .then((attrIds) => {
@@ -39,7 +36,7 @@ export function BillingAccountSelector(props: { onSelected?: () => void }) {
                     if (attrId?.kind !== "team") {
                         continue;
                     }
-                    const team = teams.find((t) => t.id === attrId.teamId);
+                    const team = orgs.data?.find((t) => t.id === attrId.teamId);
                     if (team) {
                         teamsAvailableForAttribution.push(team);
                     }
@@ -52,22 +49,7 @@ export function BillingAccountSelector(props: { onSelected?: () => void }) {
                 console.error("Could not get list of available billing accounts.", error);
                 setErrorMessage(`Could not get list of available billing accounts. ${error?.message || String(error)}`);
             });
-
-        const members: Record<string, TeamMemberInfo[]> = {};
-        Promise.all(
-            teams.map(async (team) => {
-                try {
-                    members[team.id] = usePublicApiTeamsService
-                        ? await publicApiTeamMembersToProtocol(
-                              (await teamsService.getTeam({ teamId: team!.id })).team?.members || [],
-                          )
-                        : await getGitpodService().server.getTeamMembers(team.id);
-                } catch (error) {
-                    console.warn("Could not get members of team", team, error);
-                }
-            }),
-        ).then(() => setMembersByTeam(members));
-    }, [teams]);
+    }, [orgs?.data]);
 
     const setUsageAttributionTeam = async (team?: Team) => {
         if (!user) {
@@ -97,10 +79,10 @@ export function BillingAccountSelector(props: { onSelected?: () => void }) {
                     {errorMessage}
                 </Alert>
             )}
-            {teamsAvailableForAttribution === undefined && <Spinner className="m-2 h-5 w-5 animate-spin" />}
-            {teamsAvailableForAttribution && (
+            {orgs.isLoading && <Spinner className="m-2 h-5 w-5 animate-spin" />}
+            {orgs.data && (
                 <div>
-                    <h2 className="text-gray-500">
+                    <Subheading className="text-gray-500">
                         Associate usage without a project to the billing account below.{" "}
                         <a
                             className="gp-link"
@@ -110,42 +92,40 @@ export function BillingAccountSelector(props: { onSelected?: () => void }) {
                         >
                             Learn more
                         </a>
-                    </h2>
+                    </Subheading>
                     <div className="mt-4 max-w-2xl grid grid-cols-3 gap-3">
-                        <SelectableCardSolid
-                            className="h-18"
-                            title="(myself)"
-                            selected={!!user && isSelected("user", user.id)}
-                            onClick={() => setUsageAttributionTeam(undefined)}
-                        >
-                            <div className="flex-grow flex items-end px-1">
-                                <span
-                                    className={`text-sm text-gray-400${
-                                        !!user && isSelected("user", user.id) ? " dark:text-gray-600" : ""
-                                    }`}
-                                >
-                                    Personal Account
-                                </span>
-                            </div>
-                        </SelectableCardSolid>
-                        {teamsAvailableForAttribution.map((t) => (
+                        {!user?.additionalData?.isMigratedToTeamOnlyAttribution && (
                             <SelectableCardSolid
                                 className="h-18"
-                                title={t.name}
-                                selected={isSelected("team", t.id)}
-                                onClick={() => setUsageAttributionTeam(t)}
+                                title="(myself)"
+                                selected={!!user && isSelected("user", user.id)}
+                                onClick={() => setUsageAttributionTeam(undefined)}
                             >
                                 <div className="flex-grow flex items-end px-1">
                                     <span
                                         className={`text-sm text-gray-400${
-                                            isSelected("team", t.id) ? " dark:text-gray-600" : ""
+                                            !!user && isSelected("user", user.id) ? " dark:text-gray-600" : ""
                                         }`}
                                     >
-                                        {!!membersByTeam[t.id]
-                                            ? `${membersByTeam[t.id].length} member${
-                                                  membersByTeam[t.id].length === 1 ? "" : "s"
-                                              }`
-                                            : "..."}
+                                        Personal Account
+                                    </span>
+                                </div>
+                            </SelectableCardSolid>
+                        )}
+                        {teamsAvailableForAttribution.map((org) => (
+                            <SelectableCardSolid
+                                className="h-18"
+                                title={org.name}
+                                selected={isSelected("team", org.id)}
+                                onClick={() => setUsageAttributionTeam(org)}
+                            >
+                                <div className="flex-grow flex items-end px-1">
+                                    <span
+                                        className={`text-sm text-gray-400${
+                                            isSelected("team", org.id) ? " dark:text-gray-600" : ""
+                                        }`}
+                                    >
+                                        {`${org.members.length} member${org.members.length === 1 ? "" : "s"}`}
                                     </span>
                                 </div>
                             </SelectableCardSolid>

@@ -19,6 +19,9 @@ interface RepositoryFinderProps {
 }
 
 function stripOffProtocol(url: string): string {
+    if (!url.startsWith("http")) {
+        return url;
+    }
     return url.substring(url.indexOf("//") + 2);
 }
 
@@ -31,7 +34,7 @@ export default function RepositoryFinder(props: RepositoryFinderProps) {
                 setSuggestedContextURLs(urls);
                 saveSearchData(urls);
             });
-    }, [suggestedContextURLs]);
+    }, []);
 
     const getElements = useCallback(
         (searchString: string) => {
@@ -105,7 +108,7 @@ function displayContextUrl(contextUrl?: string) {
     if (!contextUrl) {
         return undefined;
     }
-    return contextUrl.substring(contextUrl.indexOf("//") + 2);
+    return stripOffProtocol(contextUrl);
 }
 
 function loadSearchData(): string[] {

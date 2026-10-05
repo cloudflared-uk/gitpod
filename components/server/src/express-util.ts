@@ -7,7 +7,6 @@
 import { URL } from "url";
 import * as express from "express";
 import * as crypto from "crypto";
-import { GitpodHostUrl } from "@gitpod/gitpod-protocol/lib/util/gitpod-host-url";
 import * as session from "express-session";
 
 export const query = (...tuples: [string, string][]) => {
@@ -17,48 +16,22 @@ export const query = (...tuples: [string, string][]) => {
     return "?" + tuples.map((t) => `${t[0]}=${encodeURIComponent(t[1])}`).join("&");
 };
 
-// We do not precise UUID parsing here, we just want to distinguish three cases:
-//  - the base domain
-//  - a frontend domain (workspace domain)
-//  - a workspace port domain
-// We control all of those values and the base domain, so we don't need to much effort
-export const isAllowedWebsocketDomain = (originHeader: any, gitpodHostName: string): boolean => {
-    if (!originHeader || typeof originHeader !== "string") {
-        return false;
+// Strict: We only allow connections from the base domain, so disallow connections from all other Origins
+//      Only (current) exception: If no Origin header is set, skip the check!
+// Non-Strict: "rely" on subdomain parsing (do we still need this?)
+export const isAllowedWebsocketDomain = (originHeader: string, gitpodHostName: string): boolean => {
+    if (!originHeader) {
+        // Origin header check not applied because of empty Origin header
+        return true;
     }
 
-    var originHostname = "";
     try {
         const originUrl = new URL(originHeader);
-        originHostname = originUrl.hostname;
-        if (originHostname === gitpodHostName) {
-            return true;
-        }
-        if (looksLikeWorkspaceHostname(originUrl, gitpodHostName)) {
-            return true;
-        } else {
-            return false;
-        }
+        const originHostname = originUrl.hostname;
+        return originHostname === gitpodHostName;
     } catch (err) {
         return false;
     }
-};
-
-const looksLikeWorkspaceHostname = (originHostname: URL, gitpodHostName: string): boolean => {
-    // Is prefix a valid (looking) workspace ID?
-    const found = originHostname.toString().lastIndexOf(gitpodHostName);
-    if (found === -1) {
-        return false;
-    }
-    const url = new GitpodHostUrl(originHostname);
-    const workspaceId = url.workspaceId;
-    if (workspaceId) {
-        const hostname = url.url.hostname as string;
-        if (hostname.startsWith(workspaceId)) {
-            return true;
-        }
-    }
-    return false;
 };
 
 export function saveSession(session: session.Session): Promise<void> {
@@ -172,11 +145,9 @@ export const takeFirst = (h: string | string[] | undefined): string | undefined 
 };
 
 export function clientIp(req: express.Request): string | undefined {
-    const forwardedFor = takeFirst(req.headers["x-forwarded-for"]);
-    if (!forwardedFor) {
+    const clientIp = takeFirst(req.headers["x-real-ip"]);
+    if (!clientIp) {
         return undefined;
     }
-
-    // We now have a ,-separated string of IPs, where the first one is the (closest to) client IP
-    return forwardedFor.split(",")[0];
+    return clientIp.split(",")[0];
 }

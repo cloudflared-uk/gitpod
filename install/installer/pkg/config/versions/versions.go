@@ -40,10 +40,10 @@ type Components struct {
 	RegistryFacade        Versioned `json:"registryFacade"`
 	Server                Versioned `json:"server"`
 	ServiceWaiter         Versioned `json:"serviceWaiter"`
-	ToxicConfig           Versioned `json:"toxic-config"`
 	Usage                 Versioned `json:"usage"`
 	Workspace             struct {
 		CodeImage        Versioned `json:"codeImage"`
+		CodeHelperImage  Versioned `json:"codeHelperImage"`
 		DockerUp         Versioned `json:"dockerUp"`
 		Supervisor       Versioned `json:"supervisor"`
 		Workspacekit     Versioned `json:"workspacekit"`
@@ -76,12 +76,13 @@ type Components struct {
 
 		UserNamespaces struct {
 			SeccompProfileInstaller Versioned `json:"seccompProfileInstaller"`
-			ShiftFSModuleLoader     Versioned `json:"shiftfsModuleLoader"`
 		} `json:"userNamespaces"`
 	} `json:"wsDaemon"`
 	WSManager       Versioned `json:"wsManager"`
+	WSManagerMk2    Versioned `json:"wsManagerMk2"`
 	WSManagerBridge Versioned `json:"wsManagerBridge"`
 	WSProxy         Versioned `json:"wsProxy"`
+	NodeLabeler     Versioned `json:"node-labeler"`
 }
 
 // var embedded embed.FS

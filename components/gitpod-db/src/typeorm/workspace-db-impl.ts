@@ -449,7 +449,7 @@ export abstract class AbstractTypeORMWorkspaceDBImpl implements WorkspaceDB {
     }
 
     public async findRunningInstancesWithWorkspaces(
-        installation?: string,
+        workspaceClusterName?: string,
         userId?: string,
         includeStopping: boolean = false,
     ): Promise<RunningWorkspaceInfo[]> {
@@ -459,8 +459,8 @@ export abstract class AbstractTypeORMWorkspaceDBImpl implements WorkspaceDB {
             // This excludes instances in a 'stopping' phase
             conditions.push("wsi.phasePersisted != 'stopping'");
         }
-        if (installation) {
-            params.region = installation;
+        if (workspaceClusterName) {
+            params.region = workspaceClusterName;
             conditions.push("wsi.region = :region");
         }
         const joinParams: any = {};
@@ -521,6 +521,8 @@ export abstract class AbstractTypeORMWorkspaceDBImpl implements WorkspaceDB {
         periodStart: string,
         periodEnd: string,
     ): Promise<WorkspaceInstanceSessionWithWorkspace[]> {
+        // This is an optinmization, which also matches rules elsewhere. This is old code that's heading for the trash, so no need to couple it properly. :-)
+        const workspaceType: Workspace["type"] = "regular";
         const workspaceInstanceRepo = await this.getWorkspaceInstanceRepo();
         // The query basically selects all workspace instances for the given owner, whose startDate is within the period, and which are either:
         //  - not stopped yet, or
@@ -538,11 +540,12 @@ export abstract class AbstractTypeORMWorkspaceDBImpl implements WorkspaceDB {
                     FROM d_b_workspace_instance AS wsi
                     INNER JOIN d_b_workspace AS ws ON wsi.workspaceId = ws.id
                     WHERE ws.ownerId = ?
+                        AND ws.type = ?
                         AND wsi.startedTime < ?
                         AND (wsi.stoppedTime IS NULL OR wsi.stoppedTime = '' OR wsi.stoppedTime >= ? OR wsi.stoppingTime >= ?)
                     ORDER BY wsi.creationTime ASC;
             `,
-            [userId, periodEnd, periodStart, periodStart],
+            [userId, workspaceType, periodEnd, periodStart, periodStart],
         );
 
         const resultSessions: WorkspaceInstanceSessionWithWorkspace[] = [];
@@ -911,8 +914,8 @@ export abstract class AbstractTypeORMWorkspaceDBImpl implements WorkspaceDB {
     }
 
     /**
-     * This *hard deletes* the workspace entry and all corresponding workspace-instances, by triggering a db-sync mechanism that purges it from the DB.
-     * Note: when this function returns that doesn't mean that the entries are actually gone yet, that might still take a short while until db-sync comes
+     * This *hard deletes* the workspace entry and all corresponding workspace-instances, by triggering a periodic deleter mechanism that purges it from the DB.
+     * Note: when this function returns that doesn't mean that the entries are actually gone yet, that might still take a short while until periodic deleter comes
      *       around to deleting them.
      */
     public async hardDeleteWorkspace(workspaceId: string): Promise<void> {

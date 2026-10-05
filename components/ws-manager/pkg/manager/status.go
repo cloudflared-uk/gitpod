@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/gitpod-io/gitpod/common-go/kubernetes"
 	wsk8s "github.com/gitpod-io/gitpod/common-go/kubernetes"
@@ -219,6 +220,13 @@ func (m *Manager) getWorkspaceStatus(wso workspaceObjects) (*api.WorkspaceStatus
 	if v, ok := wso.Pod.Annotations[customTimeoutAnnotation]; ok {
 		timeout = v
 	}
+	var closedTimeout string
+	if t := m.Config.Timeouts.AfterClose; t > 0 {
+		closedTimeout = t.String()
+	}
+	if v, ok := wso.Pod.Annotations[customClosedTimeoutAnnotation]; ok {
+		closedTimeout = v
+	}
 
 	var (
 		wsImage         = workspaceContainer.Image
@@ -270,6 +278,7 @@ func (m *Manager) getWorkspaceStatus(wso workspaceObjects) (*api.WorkspaceStatus
 			Url:            wsurl,
 			Type:           tpe,
 			Timeout:        timeout,
+			ClosedTimeout:  closedTimeout,
 			Class:          wso.Pod.Labels[workspaceClassLabel],
 		},
 		Conditions: &api.WorkspaceConditions{
@@ -332,7 +341,7 @@ func (m *Manager) extractStatusFromPod(result *api.WorkspaceStatus, wso workspac
 	result.Spec.ExposedPorts = extractExposedPorts(pod).Ports
 
 	// check failure states, i.e. determine value of result.Failed
-	failure, phase := extractFailure(wso, m.metrics)
+	failure, phase := m.extractFailure(wso, m.metrics)
 	result.Conditions.Failed = failure
 	if phase != nil {
 		result.Phase = *phase
@@ -550,7 +559,9 @@ func (m *Manager) extractStatusFromPod(result *api.WorkspaceStatus, wso workspac
 
 // extractFailure returns a pod failure reason and possibly a phase. If phase is nil then
 // one should extract the phase themselves. If the pod has not failed, this function returns "", nil.
-func extractFailure(wso workspaceObjects, metrics *metrics) (string, *api.WorkspacePhase) {
+func (m *Manager) extractFailure(wso workspaceObjects, metrics *metrics) (string, *api.WorkspacePhase) {
+	log := log.WithFields(wso.GetOWI())
+
 	pod := wso.Pod
 	wsType := strings.ToUpper(pod.Labels[wsk8s.TypeLabel])
 	wsClass := pod.Labels[workspaceClassLabel]
@@ -604,6 +615,18 @@ func extractFailure(wso workspaceObjects, metrics *metrics) (string, *api.Worksp
 					// we'd be in unknown.
 					c := api.WorkspacePhase_RUNNING
 					phase = &c
+				}
+
+				if terminationState.ExitCode == containerKilledExitCode && terminationState.Reason == "ContainerStatusUnknown" {
+					// For some reason, the pod is killed with unknown container status and no taints on the underlying node.
+					// Therefore, we skip extracting the failure from the terminated message.
+					// ref: https://github.com/gitpod-io/gitpod/issues/12021
+					if m.Clientset != nil {
+						var node corev1.Node
+						if err := m.Clientset.Get(context.TODO(), types.NamespacedName{Namespace: "", Name: wso.NodeName()}, &node); err == nil && len(node.Spec.Taints) == 0 {
+							return "", nil
+						}
+					}
 				}
 
 				// the container itself told us why it was terminated - use that as failure reason
@@ -785,7 +808,24 @@ func (m *Manager) isWorkspaceTimedOut(wso workspaceObjects) (reason string, err 
 			// the workspace is up and running, but the user has never produced any activity
 			return decide(start, m.Config.Timeouts.TotalStartup, activityNone)
 		} else if isClosed {
-			return decide(*lastActivity, m.Config.Timeouts.AfterClose, activityClosed)
+			reason, err := func() (string, error) {
+				afterClosed := m.Config.Timeouts.AfterClose
+				if ctv, ok := wso.Pod.Annotations[customClosedTimeoutAnnotation]; ok {
+					if ct, err := time.ParseDuration(ctv); err == nil {
+						// skip check if closed timeout set to 0
+						if ct == 0 {
+							return "", nil
+						}
+						afterClosed = util.Duration(ct)
+					} else {
+						log.WithError(err).WithField("customClosedTimeout", ctv).WithFields(wsk8s.GetOWIFromObject(&wso.Pod.ObjectMeta)).Warn("pod had custom closed timeout annotation set, but could not parse its value. Defaulting to ws-manager config.")
+					}
+				}
+				return decide(*lastActivity, afterClosed, activityClosed)
+			}()
+			if reason != "" {
+				return reason, err
+			}
 		}
 		if ctv, ok := wso.Pod.Annotations[customTimeoutAnnotation]; ok {
 			if ct, err := time.ParseDuration(ctv); err == nil {

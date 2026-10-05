@@ -7,6 +7,7 @@
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { useEffect } from "react";
 import Alert from "../components/Alert";
+import { Heading2 } from "../components/typography/headings";
 import { UsageLimitReachedModal } from "../components/UsageLimitReachedModal";
 import gitpodIconUA from "../icons/gitpod.svg";
 import { gitpodHostUrl } from "../service/service";
@@ -105,7 +106,7 @@ export function StartPage(props: StartPageProps) {
                         error || phase === StartPhase.Stopped || phase === StartPhase.IdeReady ? "" : "animate-bounce"
                     }`}
                 />
-                <h3 className="mt-8 text-xl">{title}</h3>
+                <Heading2 className="mt-8">{title}</Heading2>
                 {typeof phase === "number" && phase < StartPhase.IdeReady && (
                     <ProgressBar phase={phase} error={!!error} />
                 )}
@@ -118,7 +119,12 @@ export function StartPage(props: StartPageProps) {
                 {props.showLatestIdeWarning && (
                     <Alert type="warning" className="mt-4 w-96">
                         This workspace is configured with the latest release (unstable) for the editor.{" "}
-                        <a className="gp-link" target="_blank" href={gitpodHostUrl.asPreferences().toString()}>
+                        <a
+                            className="gp-link"
+                            target="_blank"
+                            rel="noreferrer"
+                            href={gitpodHostUrl.asPreferences().toString()}
+                        >
                             Change Preferences
                         </a>
                     </Alert>

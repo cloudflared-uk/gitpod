@@ -5,28 +5,55 @@
  */
 
 import { useEffect } from "react";
-import Separator from "./Separator";
+import { useLocation } from "react-router";
+import { Separator } from "./Separator";
+import TabMenuItem from "./TabMenuItem";
+import { Heading1, Subheading } from "./typography/headings";
 
 export interface HeaderProps {
     title: string | React.ReactElement;
     subtitle: string | React.ReactElement;
+    tabs?: TabEntry[];
+}
+
+export interface TabEntry {
+    title: string;
+    link: string;
+    alternatives?: string[];
 }
 
 export default function Header(p: HeaderProps) {
+    const location = useLocation();
     useEffect(() => {
         if (typeof p.title !== "string") {
             return;
         }
         document.title = `${p.title} — Gitpod`;
-    }, []);
+    }, [p.title]);
     return (
         <div className="app-container border-gray-200 dark:border-gray-800">
             <div className="flex pb-8 pt-6">
                 <div className="">
-                    {typeof p.title === "string" ? <h1 className="tracking-tight">{p.title}</h1> : p.title}
-                    {typeof p.subtitle === "string" ? <h2 className="tracking-wide">{p.subtitle}</h2> : p.subtitle}
+                    {typeof p.title === "string" ? <Heading1 tracking="tight">{p.title}</Heading1> : p.title}
+                    {typeof p.subtitle === "string" ? (
+                        <Subheading tracking="wide">{p.subtitle}</Subheading>
+                    ) : (
+                        p.subtitle
+                    )}
                 </div>
             </div>
+            <nav className="flex">
+                {p.tabs?.map((entry) => (
+                    <TabMenuItem
+                        key={entry.title}
+                        name={entry.title}
+                        selected={[entry.link, ...(entry.alternatives || [])].some(
+                            (l) => location.pathname.toLowerCase() === l.toLowerCase(),
+                        )}
+                        link={entry.link}
+                    />
+                ))}
+            </nav>
             <Separator />
         </div>
     );

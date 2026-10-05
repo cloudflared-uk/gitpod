@@ -2,7 +2,7 @@
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License.AGPL.txt in the project root for license information.
 
-FROM alpine:3.16 as compress
+FROM cgr.dev/chainguard/wolfi-base@sha256:ad3c07c4f23df2a8082beae4636025dba212b4495aa9faa0b5d8acda914a2673 as compress
 
 RUN apk add brotli gzip
 
@@ -18,7 +18,7 @@ RUN find . -type f \( -name '*.html' -o -name '*.js' -o -name '*.css' -o -name '
 
 COPY components-gitpod-protocol--gitpod-schema/gitpod-schema.json /www/static/schemas/gitpod-schema.json
 
-FROM caddy/caddy:2.4.0-alpine
+FROM caddy/caddy:2.6.4-alpine
 
 COPY components-dashboard--static/conf/Caddyfile /etc/caddy/Caddyfile
 COPY --from=compress /www /www

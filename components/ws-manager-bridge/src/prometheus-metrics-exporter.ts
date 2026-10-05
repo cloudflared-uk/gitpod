@@ -7,7 +7,7 @@
 import * as prom from "prom-client";
 import { injectable } from "inversify";
 import { WorkspaceInstance } from "@gitpod/gitpod-protocol";
-import { WorkspaceClusterWoTLS } from "@gitpod/gitpod-protocol/src/workspace-cluster";
+import { WorkspaceClusterWoTLS } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
 import { WorkspaceType } from "@gitpod/ws-manager/lib/core_pb";
 
 @injectable()
@@ -67,17 +67,13 @@ export class PrometheusMetricsExporter {
         this.workspaceInstanceUpdateStartedTotal = new prom.Counter({
             name: "gitpod_ws_manager_bridge_workspace_instance_update_started_total",
             help: "Total number of workspace instance updates that started processing",
-            // we track db_write because we need to be able to distinguish between outcomes which did affect the system negatively - failed to write,
-            // and outcomes by read-only replicas.
-            labelNames: ["db_write", "workspace_cluster", "workspace_instance_type"],
+            labelNames: ["workspace_cluster", "workspace_instance_type"],
         });
 
         this.workspaceInstanceUpdateCompletedSeconds = new prom.Histogram({
             name: "gitpod_ws_manager_bridge_workspace_instance_update_completed_seconds",
             help: "Histogram of completed workspace instance updates, by outcome",
-            // we track db_write because we need to be able to distinguish between outcomes which did affect the system negatively - failed to write,
-            // and outcomes by read-only replicas.
-            labelNames: ["db_write", "workspace_cluster", "workspace_instance_type", "outcome"],
+            labelNames: ["workspace_cluster", "workspace_instance_type", "outcome"],
             buckets: prom.exponentialBuckets(0.05, 2, 8),
         });
 
@@ -149,20 +145,19 @@ export class PrometheusMetricsExporter {
         this.stalePrebuildEventsTotal.inc();
     }
 
-    reportWorkspaceInstanceUpdateStarted(dbWrite: boolean, workspaceCluster: string, type: WorkspaceType): void {
-        this.workspaceInstanceUpdateStartedTotal.labels(String(dbWrite), workspaceCluster, WorkspaceType[type]).inc();
+    reportWorkspaceInstanceUpdateStarted(workspaceCluster: string, type: WorkspaceType): void {
+        this.workspaceInstanceUpdateStartedTotal.labels(workspaceCluster, WorkspaceType[type]).inc();
     }
 
     reportWorkspaceInstanceUpdateCompleted(
         durationSeconds: number,
-        dbWrite: boolean,
         workspaceCluster: string,
         type: WorkspaceType,
         error?: Error,
     ): void {
         const outcome = error ? "error" : "success";
         this.workspaceInstanceUpdateCompletedSeconds
-            .labels(String(dbWrite), workspaceCluster, WorkspaceType[type], outcome)
+            .labels(workspaceCluster, WorkspaceType[type], outcome)
             .observe(durationSeconds);
     }
 

@@ -11,6 +11,7 @@ import meh from "../images/feedback/meh-emoji.svg";
 import crying from "../images/feedback/crying-emoji.svg";
 import { trackEvent, TrackFeedback } from "../Analytics";
 import { StartWorkspaceError } from "../start/StartPage";
+import { Heading2 } from "../components/typography/headings";
 
 function FeedbackComponent(props: {
     onClose?: () => void;
@@ -53,10 +54,10 @@ function FeedbackComponent(props: {
 
     const emojiGroup = (width: number) => {
         const emojiList = [
-            { id: 4, name: "starry", src: starry },
-            { id: 3, name: "happy", src: happy },
-            { id: 2, name: "meh", src: meh },
             { id: 1, name: "crying", src: crying },
+            { id: 2, name: "meh", src: meh },
+            { id: 3, name: "happy", src: happy },
+            { id: 4, name: "starry", src: starry },
         ];
         return emojiList.map((emoji) => (
             <button
@@ -76,7 +77,7 @@ function FeedbackComponent(props: {
 
     return (
         <>
-            {props.isModal && !isFeedbackSubmitted && <h3 className="mb-4">Send Feedback</h3>}
+            {props.isModal && !isFeedbackSubmitted && <Heading2 className="mb-4">Send Feedback</Heading2>}
             {minimisedFirstView && (
                 <div
                     className={
@@ -107,7 +108,6 @@ function FeedbackComponent(props: {
                         }
                     >
                         <div className="relative">
-                            <div className="absolute flex bottom-5 right-5 -space-x-3">{emojiGroup(24)}</div>
                             <textarea
                                 style={{ height: "160px", borderRadius: "6px" }}
                                 autoFocus
@@ -128,13 +128,16 @@ function FeedbackComponent(props: {
                                 .
                             </p>
                         </div>
-                        <div className="flex justify-end mt-6">
-                            <button className="secondary" onClick={onClose}>
-                                Cancel
-                            </button>
-                            <button className="ml-2" onClick={onSubmit}>
-                                Send Feedback
-                            </button>
+                        <div className="flex justify-between mt-6">
+                            <div className="flex bottom-5 right-5 -space-x-3">{emojiGroup(24)}</div>
+                            <div>
+                                <button className="secondary" onClick={onClose}>
+                                    Cancel
+                                </button>
+                                <button className="ml-2" onClick={onSubmit}>
+                                    Send Feedback
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </>

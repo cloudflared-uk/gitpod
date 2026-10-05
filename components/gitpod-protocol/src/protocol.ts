@@ -8,6 +8,7 @@ import { WorkspaceInstance, PortVisibility } from "./workspace-instance";
 import { RoleOrPermission } from "./permission";
 import { Project } from "./teams-projects-protocol";
 import { createHash } from "crypto";
+import { AttributionId } from "./attribution";
 
 export interface UserInfo {
     name?: string;
@@ -16,6 +17,9 @@ export interface UserInfo {
 export interface User {
     /** The user id */
     id: string;
+
+    /** The ID of the Organization this user is owned by. If undefined, the user is owned by the installation */
+    organizationId?: string;
 
     /** The timestamp when the user entry was created */
     creationDate: string;
@@ -116,6 +120,9 @@ export namespace User {
     }
 
     export function isOnboardingUser(user: User) {
+        if (!!user.organizationId) {
+            return false;
+        }
         return !hasPreferredIde(user);
     }
 
@@ -149,12 +156,22 @@ export namespace User {
         user.additionalData.ideSettings = newIDESettings;
     }
 
+    // TODO: make it more explicit that these field names are relied for our tracking purposes
+    // and decouple frontend from relying on them - instead use user.additionalData.profile object directly in FE
     export function getProfile(user: User): Profile {
         return {
             name: User.getName(user!) || "",
             email: User.getPrimaryEmail(user!) || "",
             company: user?.additionalData?.profile?.companyName,
             avatarURL: user?.avatarUrl,
+            companyWebsite: user?.additionalData?.profile?.companyWebsite,
+            jobRole: user?.additionalData?.profile?.jobRole,
+            jobRoleOther: user?.additionalData?.profile?.jobRoleOther,
+            explorationReasons: user?.additionalData?.profile?.explorationReasons,
+            signupGoals: user?.additionalData?.profile?.signupGoals,
+            signupGoalsOther: user?.additionalData?.profile?.signupGoalsOther,
+            companySize: user?.additionalData?.profile?.companySize,
+            onboardedTimestamp: user?.additionalData?.profile?.onboardedTimestamp,
         };
     }
 
@@ -175,12 +192,33 @@ export namespace User {
         return user;
     }
 
-    // The actual Profile of a User
+    export function getDefaultAttributionId(user: User): AttributionId {
+        if (user.usageAttributionId) {
+            const result = AttributionId.parse(user.usageAttributionId);
+            if (!result) {
+                throw new Error("Invalid attribution ID: " + user.usageAttributionId);
+            }
+            return result;
+        }
+        return AttributionId.create(user);
+    }
+
+    // TODO: refactor where this is referenced so it's more clearly tied to just analytics-tracking
+    // Let other places rely on the ProfileDetails type since that's what we store
+    // This is the profile data we send to our Segment analytics tracking pipeline
     export interface Profile {
         name: string;
         email: string;
         company?: string;
         avatarURL?: string;
+        companyWebsite?: string;
+        jobRole?: string;
+        jobRoleOther?: string;
+        explorationReasons?: string[];
+        signupGoals?: string[];
+        signupGoalsOther?: string;
+        onboardedTimestamp?: string;
+        companySize?: string;
     }
     export namespace Profile {
         export function hasChanges(before: Profile, after: Profile) {
@@ -188,13 +226,27 @@ export namespace User {
                 before.name !== after.name ||
                 before.email !== after.email ||
                 before.company !== after.company ||
-                before.avatarURL !== after.avatarURL
+                before.avatarURL !== after.avatarURL ||
+                before.companyWebsite !== after.companyWebsite ||
+                before.jobRole !== after.jobRole ||
+                before.jobRoleOther !== after.jobRoleOther ||
+                // not checking explorationReasons or signupGoals atm as it's an array - need to check deep equality
+                before.signupGoalsOther !== after.signupGoalsOther ||
+                before.onboardedTimestamp !== after.onboardedTimestamp ||
+                before.companySize !== after.companySize
             );
         }
     }
 }
 
-export interface AdditionalUserData {
+export interface WorkspaceTimeoutSetting {
+    // user globol workspace timeout
+    workspaceTimeout: string;
+    // control whether to enable the closed timeout of a workspace, i.e. close web ide, disconnect ssh connection
+    disabledClosedTimeout: boolean;
+}
+
+export interface AdditionalUserData extends Partial<WorkspaceTimeoutSetting> {
     platforms?: UserPlatform[];
     emailNotificationSettings?: EmailNotificationSettings;
     featurePreview?: boolean;
@@ -212,6 +264,9 @@ export interface AdditionalUserData {
     workspaceClasses?: WorkspaceClasses;
     // additional user profile data
     profile?: ProfileDetails;
+    // whether the user has been migrated to team attribution.
+    // a corresponding feature flag (team_only_attribution) triggers the migration.
+    isMigratedToTeamOnlyAttribution?: boolean;
 }
 export namespace AdditionalUserData {
     export function set(user: User, partialData: Partial<AdditionalUserData>): User {
@@ -236,6 +291,22 @@ export interface ProfileDetails {
     companyName?: string;
     // the user's email
     emailAddress?: string;
+    // the user's company website
+    companyWebsite?: string;
+    // type of role user has in their job
+    jobRole?: string;
+    // freeform entry for job role user works in (when jobRole is "other")
+    jobRoleOther?: string;
+    // Reasons user is exploring Gitpod when they signed up
+    explorationReasons?: string[];
+    // what user hopes to accomplish when they signed up
+    signupGoals?: string[];
+    // freeform entry for signup goals (when signupGoals is "other")
+    signupGoalsOther?: string;
+    // Set after a user completes the onboarding flow
+    onboardedTimestamp?: string;
+    // Onboarding question about a user's company size
+    companySize?: string;
 }
 
 export interface EmailNotificationSettings {
@@ -304,6 +375,8 @@ export namespace NamedWorkspaceFeatureFlag {
         return WORKSPACE_PERSISTED_FEATTURE_FLAGS.includes(ff);
     }
 }
+
+export type EnvVar = UserEnvVar | ProjectEnvVarWithValue | EnvVarWithValue;
 
 export interface EnvVarWithValue {
     name: string;
@@ -534,7 +607,7 @@ export interface GitpodToken {
     /** Created timestamp */
     created: string;
 
-    // token is deleted on the database and about to be collected by db-sync
+    // token is deleted on the database and about to be collected by periodic deleter
     deleted?: boolean;
 }
 
@@ -652,6 +725,10 @@ export type SnapshotState = "pending" | "available" | "error";
 export interface Workspace {
     id: string;
     creationTime: string;
+    /**
+     * undefined means it is owned by the user (legacy mode, soon to be removed)
+     */
+    organizationId?: string;
     contextURL: string;
     description: string;
     ownerId: string;
@@ -681,7 +758,7 @@ export interface Workspace {
     shareable?: boolean;
     pinned?: boolean;
 
-    // workspace is hard-deleted on the database and about to be collected by db-sync
+    // workspace is hard-deleted on the database and about to be collected by periodic deleter
     readonly deleted?: boolean;
 
     /**
@@ -820,6 +897,7 @@ export interface WorkspaceConfig {
     vscode?: VSCodeConfig;
     jetbrains?: JetBrainsConfig;
     coreDump?: CoreDumpConfig;
+    ideCredentials?: string;
 
     /** deprecated. Enabled by default **/
     experimentalNetwork?: boolean;
@@ -1394,6 +1472,7 @@ export interface AuthProviderInfo {
     readonly authProviderType: string;
     readonly host: string;
     readonly ownerId?: string;
+    readonly organizationId?: string;
     readonly verified: boolean;
     readonly isReadonly?: boolean;
     readonly hiddenOnDashboard?: boolean;
@@ -1416,6 +1495,7 @@ export interface AuthProviderEntry {
     readonly type: AuthProviderEntry.Type;
     readonly host: string;
     readonly ownerId: string;
+    readonly organizationId?: string;
 
     readonly status: AuthProviderEntry.Status;
 
@@ -1447,6 +1527,14 @@ export namespace AuthProviderEntry {
     };
     export type UpdateEntry = Pick<AuthProviderEntry, "id" | "ownerId"> &
         Pick<OAuth2Config, "clientId" | "clientSecret">;
+    export type NewOrgEntry = NewEntry & {
+        organizationId: string;
+    };
+    export type UpdateOrgEntry = Pick<AuthProviderEntry, "id"> & {
+        clientId: string;
+        clientSecret: string;
+        organizationId: string;
+    };
     export function redact(entry: AuthProviderEntry): AuthProviderEntry {
         return {
             ...entry,
@@ -1502,4 +1590,12 @@ export interface Terms {
 export interface StripeConfig {
     individualUsagePriceIds: { [currency: string]: string };
     teamUsagePriceIds: { [currency: string]: string };
+}
+
+export interface LinkedInProfile {
+    id: string;
+    firstName: string;
+    lastName: string;
+    profilePicture: string;
+    emailAddress: string;
 }

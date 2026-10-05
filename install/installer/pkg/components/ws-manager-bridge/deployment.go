@@ -11,7 +11,6 @@ import (
 	"github.com/gitpod-io/gitpod/installer/pkg/cluster"
 	"github.com/gitpod-io/gitpod/installer/pkg/common"
 	wsmanager "github.com/gitpod-io/gitpod/installer/pkg/components/ws-manager"
-	"github.com/gitpod-io/gitpod/installer/pkg/config/v1/experimental"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,14 +33,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 	var volumes []corev1.Volume
 	var volumeMounts []corev1.VolumeMount
 
-	addWsManagerTls := true
-	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
-		if cfg.WebApp != nil && cfg.WebApp.WithoutWorkspaceComponents {
-			// No ws-manager exists in the cluster, so no TLS secret to mount.
-			addWsManagerTls = false
-		}
-		return nil
-	})
+	addWsManagerTls := common.WithLocalWsManager(ctx)
 	if addWsManagerTls {
 		volumes = append(volumes, corev1.Volume{
 			Name: "ws-manager-client-tls-certs",
@@ -58,15 +50,24 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		})
 	}
 
+	msgBugSecret := corev1.LocalObjectReference{Name: common.InClusterMessageQueueName}
+	if ctx.Config.MessageBus != nil && ctx.Config.MessageBus.Credentials != nil {
+		msgBugSecret = corev1.LocalObjectReference{Name: ctx.Config.MessageBus.Credentials.Name}
+	}
+
 	hashObj = append(hashObj, &corev1.Pod{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
 				{
 					Env: []corev1.EnvVar{
 						{
-							Name:  "MESSAGEBUS_PASSWORD",
-							Value: ctx.Values.MessageBusPassword,
+							Name: "MESSAGEBUS_PASSWORD",
+							ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: msgBugSecret,
+								Key:                  "rabbitmq-password",
+							}},
 						},
+
 						{
 							// If the database type changes, this pod may stay up if no other changes are made.
 							Name: "DATABASE_TYPE",
@@ -116,22 +117,26 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						}),
 					},
 					Spec: corev1.PodSpec{
-						Affinity:                      common.NodeAffinity(cluster.AffinityLabelMeta),
+						Affinity:                      cluster.WithNodeAffinityHostnameAntiAffinity(Component, cluster.AffinityLabelMeta),
+						TopologySpreadConstraints:     cluster.WithHostnameTopologySpread(Component),
 						ServiceAccountName:            Component,
 						PriorityClassName:             common.SystemNodeCritical,
 						EnableServiceLinks:            pointer.Bool(false),
-						DNSPolicy:                     "ClusterFirst",
-						RestartPolicy:                 "Always",
+						DNSPolicy:                     corev1.DNSClusterFirst,
+						RestartPolicy:                 corev1.RestartPolicyAlways,
 						TerminationGracePeriodSeconds: pointer.Int64(30),
 						Volumes: append(
-							[]corev1.Volume{{
-								Name: "config",
-								VolumeSource: corev1.VolumeSource{
-									ConfigMap: &corev1.ConfigMapVolumeSource{
-										LocalObjectReference: corev1.LocalObjectReference{Name: fmt.Sprintf("%s-config", Component)},
+							[]corev1.Volume{
+								{
+									Name: "config",
+									VolumeSource: corev1.VolumeSource{
+										ConfigMap: &corev1.ConfigMapVolumeSource{
+											LocalObjectReference: corev1.LocalObjectReference{Name: fmt.Sprintf("%s-config", Component)},
+										},
 									},
 								},
-							}},
+								common.CAVolume(),
+							},
 							volumes...,
 						),
 						InitContainers: []corev1.Container{*common.DatabaseWaiterContainer(ctx), *common.MessageBusWaiterContainer(ctx)},
@@ -169,11 +174,14 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								},
 							},
 							VolumeMounts: append(
-								[]corev1.VolumeMount{{
-									Name:      "config",
-									MountPath: "/config",
-									ReadOnly:  true,
-								}},
+								[]corev1.VolumeMount{
+									{
+										Name:      "config",
+										MountPath: "/config",
+										ReadOnly:  true,
+									},
+									common.CAVolumeMount(),
+								},
 								volumeMounts...,
 							),
 						}, *common.KubeRBACProxyContainer(ctx)},

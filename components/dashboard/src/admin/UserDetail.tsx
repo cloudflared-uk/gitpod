@@ -16,17 +16,18 @@ import { AccountStatement, Subscription } from "@gitpod/gitpod-protocol/lib/acco
 import { Plans } from "@gitpod/gitpod-protocol/lib/plans";
 import dayjs from "dayjs";
 import { useEffect, useRef, useState } from "react";
-import CheckBox from "../components/CheckBox";
 import Modal from "../components/Modal";
 import { getGitpodService } from "../service/service";
 import { WorkspaceSearch } from "./WorkspacesSearch";
 import Property from "./Property";
-import { PageWithAdminSubMenu } from "./PageWithAdminSubMenu";
+import { AdminPageHeader } from "./AdminPageHeader";
 import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
 import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
 import CaretDown from "../icons/CaretDown.svg";
 import ContextMenu from "../components/ContextMenu";
+import { CheckboxInputField, CheckboxListField } from "../components/forms/CheckboxInputField";
 import { CostCenterJSON, CostCenter_BillingStrategy } from "@gitpod/gitpod-protocol/lib/usage";
+import { Heading2, Subheading } from "../components/typography/headings";
 
 export default function UserDetail(p: { user: User }) {
     const [activity, setActivity] = useState(false);
@@ -258,74 +259,79 @@ export default function UserDetail(p: { user: User }) {
 
     return (
         <>
-            <PageWithAdminSubMenu title="Users" subtitle="Search and manage all users.">
-                <div className="flex">
-                    <div className="flex-1">
-                        <div className="flex">
-                            <h3>{user.fullName}</h3>
-                            {user.blocked ? <Label text="Blocked" color="red" /> : null}{" "}
-                            {user.markedDeleted ? <Label text="Deleted" color="red" /> : null}
-                            {user.lastVerificationTime ? <Label text="Verified" color="green" /> : null}
+            <AdminPageHeader title="Admin" subtitle="Configure and manage instance settings.">
+                <div className="app-container">
+                    <div className="flex mt-8">
+                        <div className="flex-1">
+                            <div className="flex">
+                                <Heading2>{user.fullName}</Heading2>
+                                {user.blocked ? <Label text="Blocked" color="red" /> : null}{" "}
+                                {user.markedDeleted ? <Label text="Deleted" color="red" /> : null}
+                                {user.lastVerificationTime ? <Label text="Verified" color="green" /> : null}
+                            </div>
+                            <Subheading>
+                                {user.identities
+                                    .map((i) => i.primaryEmail)
+                                    .filter((e) => !!e)
+                                    .join(", ")}
+                                {user.verificationPhoneNumber ? ` — ${user.verificationPhoneNumber}` : null}
+                            </Subheading>
                         </div>
-                        <p>
-                            {user.identities
-                                .map((i) => i.primaryEmail)
-                                .filter((e) => !!e)
-                                .join(", ")}
-                        </p>
-                    </div>
-                    {!user.lastVerificationTime ? (
-                        <button className="secondary ml-3" disabled={activity} onClick={verifyUser}>
-                            Verify User
+                        {!user.lastVerificationTime ? (
+                            <button className="secondary ml-3" disabled={activity} onClick={verifyUser}>
+                                Verify User
+                            </button>
+                        ) : null}
+                        <button className="secondary danger ml-3" disabled={activity} onClick={toggleBlockUser}>
+                            {user.blocked ? "Unblock" : "Block"} User
                         </button>
-                    ) : null}
-                    <button className="secondary danger ml-3" disabled={activity} onClick={toggleBlockUser}>
-                        {user.blocked ? "Unblock" : "Block"} User
-                    </button>
-                    <button className="danger ml-3" disabled={activity} onClick={deleteUser}>
-                        Delete User
-                    </button>
-                </div>
-                <div className="flex mt-6">
-                    <div className="w-40">
-                        <img className="rounded-full h-28 w-28" alt={user.fullName} src={user.avatarUrl} />
+                        <button className="danger ml-3" disabled={activity} onClick={deleteUser}>
+                            Delete User
+                        </button>
                     </div>
-                    <div className="flex flex-col w-full">
-                        <div className="flex w-full mt-6">
-                            <Property name="Sign Up Date">{dayjs(user.creationDate).format("MMM D, YYYY")}</Property>
-                            <Property
-                                name="Feature Flags"
-                                actions={[
-                                    {
-                                        label: "Edit Feature Flags",
-                                        onClick: () => {
-                                            setEditFeatureFlags(true);
-                                        },
-                                    },
-                                ]}
-                            >
-                                {user.featureFlags?.permanentWSFeatureFlags?.join(", ") || "---"}
-                            </Property>
-                            <Property
-                                name="Roles"
-                                actions={[
-                                    {
-                                        label: "Edit Roles",
-                                        onClick: () => {
-                                            setEditRoles(true);
-                                        },
-                                    },
-                                ]}
-                            >
-                                {user.rolesOrPermissions?.join(", ") || "---"}
-                            </Property>
+                    <div className="flex mt-6">
+                        <div className="w-40">
+                            <img className="rounded-full h-28 w-28" alt={user.fullName} src={user.avatarUrl} />
                         </div>
-                        {renderUserBillingProperties()}
+                        <div className="flex flex-col w-full">
+                            <div className="flex w-full mt-6">
+                                <Property name="Sign Up Date">
+                                    {dayjs(user.creationDate).format("MMM D, YYYY")}
+                                </Property>
+                                <Property
+                                    name="Feature Flags"
+                                    actions={[
+                                        {
+                                            label: "Edit Feature Flags",
+                                            onClick: () => {
+                                                setEditFeatureFlags(true);
+                                            },
+                                        },
+                                    ]}
+                                >
+                                    {user.featureFlags?.permanentWSFeatureFlags?.join(", ") || "---"}
+                                </Property>
+                                <Property
+                                    name="Roles"
+                                    actions={[
+                                        {
+                                            label: "Edit Roles",
+                                            onClick: () => {
+                                                setEditRoles(true);
+                                            },
+                                        },
+                                    ]}
+                                >
+                                    {user.rolesOrPermissions?.join(", ") || "---"}
+                                </Property>
+                            </div>
+                            {renderUserBillingProperties()}
+                        </div>
                     </div>
                 </div>
 
                 <WorkspaceSearch user={user} />
-            </PageWithAdminSubMenu>
+            </AdminPageHeader>
             <Modal
                 visible={editSpendingLimit}
                 onClose={() => setEditSpendingLimit(false)}
@@ -418,12 +424,20 @@ export default function UserDetail(p: { user: User }) {
                     </button>,
                 ]}
             >
-                <p>Edit feature access by adding or removing feature flags for this user.</p>
-                <div className="flex flex-col">
+                <CheckboxListField
+                    label="Edit feature access by adding or removing feature flags for this user."
+                    className="mt-0"
+                >
                     {flags.map((e) => (
-                        <CheckBox key={e.title} title={e.title} desc="" checked={!!e.checked} onChange={e.onClick} />
+                        <CheckboxInputField
+                            key={e.title}
+                            label={e.title}
+                            checked={!!e.checked}
+                            topMargin={false}
+                            onChange={e.onClick}
+                        />
                     ))}
-                </div>
+                </CheckboxListField>
             </Modal>
             <Modal
                 visible={editRoles}
@@ -435,12 +449,20 @@ export default function UserDetail(p: { user: User }) {
                     </button>,
                 ]}
             >
-                <p>Edit user permissions by adding or removing roles for this user.</p>
-                <div className="flex flex-col">
+                <CheckboxListField
+                    label="Edit user permissions by adding or removing roles for this user."
+                    className="mt-0"
+                >
                     {rop.map((e) => (
-                        <CheckBox key={e.title} title={e.title} desc="" checked={!!e.checked} onChange={e.onClick} />
+                        <CheckboxInputField
+                            key={e.title}
+                            label={e.title}
+                            checked={!!e.checked}
+                            topMargin={false}
+                            onChange={e.onClick}
+                        />
                     ))}
-                </div>
+                </CheckboxListField>
             </Modal>
         </>
     );
@@ -467,7 +489,7 @@ function renderBillingModeProperty(billingMode?: BillingMode): JSX.Element {
                     >
                         <p className="flex justify-left text-gitpod-red">
                             <span>UBP blocked by:</span>
-                            <img className="m-2" src={CaretDown} />
+                            <img className="m-2" src={CaretDown} alt="caret icon pointing down" />
                         </p>
                     </ContextMenu>
                 )}

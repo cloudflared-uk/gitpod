@@ -49,7 +49,7 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
     protected readonly tables: TableDescription[] = [
         {
             name: "d_b_workspace_cluster",
-            primaryKeys: ["name", "applicationCluster"],
+            primaryKeys: ["name"],
             timeColumn: "_lastModified",
             deletionColumn: "deleted",
         },
@@ -117,7 +117,7 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
         },
         {
             name: "d_b_user_storage_resource",
-            primaryKeys: ["id"],
+            primaryKeys: ["userId", "uri"],
             timeColumn: "_lastModified",
             deletionColumn: "deleted",
             dependencies: ["d_b_user"],
@@ -264,12 +264,6 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
             timeColumn: "_lastModified",
         },
         {
-            name: "d_b_oss_allow_list",
-            primaryKeys: ["identity"],
-            deletionColumn: "deleted",
-            timeColumn: "_lastModified",
-        },
-        {
             name: "d_b_project_env_var",
             primaryKeys: ["id", "projectId"],
             deletionColumn: "deleted",
@@ -339,6 +333,11 @@ export class GitpodTableDescriptionProvider implements TableDescriptionProvider 
             primaryKeys: ["id"],
             timeColumn: "_lastModified",
             deletionColumn: "deleted",
+        },
+        {
+            name: "d_b_linked_in_profile",
+            primaryKeys: ["id"],
+            timeColumn: "_lastModified",
         },
     ];
 

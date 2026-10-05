@@ -21,7 +21,6 @@ import (
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/cpulimit"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/daemon"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/diskguard"
-	"github.com/gitpod-io/gitpod/ws-daemon/pkg/hosts"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/iws"
 	"github.com/gitpod-io/gitpod/ws-daemon/pkg/netlimit"
 
@@ -66,6 +65,11 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 	// default runtime mapping
 	runtimeMapping[ctx.Config.Workspace.Runtime.ContainerDRuntimeDir] = "/mnt/node0"
 
+	var wscontroller daemon.WorkspaceControllerConfig
+
+	// default workspace network CIDR (and fallback)
+	workspaceCIDR := "10.0.5.0/30"
+
 	ctx.WithExperimental(func(ucfg *experimental.Config) error {
 		if ucfg.Workspace == nil {
 			return nil
@@ -100,6 +104,14 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 
 		procLimit = ucfg.Workspace.ProcLimit
 
+		wscontroller.Enabled = ucfg.Workspace.UseWsmanagerMk2
+		wscontroller.WorkingAreaSuffix = "-mk2"
+		wscontroller.MaxConcurrentReconciles = 15
+
+		if ucfg.Workspace.WorkspaceCIDR != "" {
+			workspaceCIDR = ucfg.Workspace.WorkspaceCIDR
+		}
+
 		return nil
 	})
 
@@ -107,6 +119,7 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		Daemon: daemon.Config{
 			Runtime: daemon.RuntimeConfig{
 				KubernetesNamespace: ctx.Namespace,
+				SecretsNamespace:    common.WorkspaceSecretsNamespace,
 				Container: &container.Config{
 					Runtime: container.RuntimeContainerd,
 					Mapping: runtimeMapping,
@@ -114,9 +127,10 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 						ProcLoc: "/mnt/mounts",
 					},
 					Containerd: &container.ContainerdConfig{
-						SocketPath: "/mnt/containerd.sock",
+						SocketPath: "/mnt/containerd/containerd.sock",
 					},
 				},
+				WorkspaceCIDR: workspaceCIDR,
 			},
 			Content: content.Config{
 				WorkingArea:     "/mnt/workingarea",
@@ -150,16 +164,6 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 			ProcLimit: procLimit,
 			NetLimit:  networkLimitConfig,
 			OOMScores: oomScoreAdjConfig,
-			Hosts: hosts.Config{
-				Enabled:       true,
-				NodeHostsFile: "/mnt/hosts",
-				FixedHosts: map[string][]hosts.Host{
-					"registryFacade": {{
-						Name: fmt.Sprintf("reg.%s", ctx.Config.Domain),
-						Addr: "127.0.0.1",
-					}},
-				},
-			},
 			DiskSpaceGuard: diskguard.Config{
 				Enabled:  true,
 				Interval: util.Duration(5 * time.Minute),
@@ -168,6 +172,7 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 					MinBytesAvail: 21474836480,
 				}},
 			},
+			WorkspaceController: wscontroller,
 		},
 		Service: baseserver.ServerConfiguration{
 			Address: fmt.Sprintf("0.0.0.0:%d", ServicePort),

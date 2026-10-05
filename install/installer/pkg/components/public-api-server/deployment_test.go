@@ -57,6 +57,23 @@ func TestDeployment_ServerArguments(t *testing.T) {
 			},
 		},
 		{
+			Name: "database-config",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "gcp-db-creds-service-account-name",
+				},
+			},
+		},
+		{
+			Name: "oidc-client-jwt-signing-key",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "oidc-client-jwt-signing-key",
+					Optional:   pointer.Bool(true),
+				},
+			},
+		},
+		{
 			Name: "stripe-secret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
@@ -74,5 +91,13 @@ func TestDeployment_ServerArguments(t *testing.T) {
 				},
 			},
 		},
-	}, dpl.Spec.Template.Spec.Volumes, "must bind config as a volume")
+		{
+			Name: "auth-pki-signing",
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: "auth-pki",
+				},
+			},
+		},
+	}, dpl.Spec.Template.Spec.Volumes, "must bind volumes")
 }

@@ -4,24 +4,24 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useState, useContext, useEffect, useCallback, useMemo } from "react";
+import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
+import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { Elements, PaymentElement, useElements, useStripe } from "@stripe/react-stripe-js";
+import { Appearance, loadStripe, Stripe } from "@stripe/stripe-js";
+import dayjs from "dayjs";
+import { useCallback, useContext, useEffect, useMemo, useState } from "react";
 import { useLocation } from "react-router";
 import { Link } from "react-router-dom";
-import { Appearance, loadStripe, Stripe } from "@stripe/stripe-js";
-import { Elements, PaymentElement, useElements, useStripe } from "@stripe/react-stripe-js";
-import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
-import { ReactComponent as Spinner } from "../icons/Spinner.svg";
-import { ReactComponent as Check } from "../images/check-circle.svg";
-import { ThemeContext } from "../theme-context";
-import { PaymentContext } from "../payment-context";
-import { getGitpodService } from "../service/service";
 import DropDown from "../components/DropDown";
 import Modal from "../components/Modal";
+import { useCurrentOrg } from "../data/organizations/orgs-query";
+import { ReactComponent as Spinner } from "../icons/Spinner.svg";
+import { ReactComponent as Check } from "../images/check-circle.svg";
+import { PaymentContext } from "../payment-context";
+import { getGitpodService } from "../service/service";
+import { ThemeContext } from "../theme-context";
 import Alert from "./Alert";
-import dayjs from "dayjs";
-import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamMembersToProtocol, teamsService } from "../service/public-api";
+import { Heading2, Subheading } from "./typography/headings";
 
 const BASE_USAGE_LIMIT_FOR_STRIPE_USERS = 1000;
 
@@ -29,12 +29,15 @@ type PendingStripeSubscription = { pendingSince: number };
 
 interface Props {
     attributionId?: string;
+    hideSubheading?: boolean;
 }
 
-export default function UsageBasedBillingConfig({ attributionId }: Props) {
-    const location = useLocation();
-    const { currency } = useContext(PaymentContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
+// Guard against multiple calls to subscripe (per page load)
+let didAlreadyCallSubscribe = false;
+
+export default function UsageBasedBillingConfig({ attributionId, hideSubheading = false }: Props) {
+    const currentOrg = useCurrentOrg().data;
+    const attrId = attributionId ? AttributionId.parse(attributionId) : undefined;
     const [showUpdateLimitModal, setShowUpdateLimitModal] = useState<boolean>(false);
     const [showBillingSetupModal, setShowBillingSetupModal] = useState<boolean>(false);
     const [stripeSubscriptionId, setStripeSubscriptionId] = useState<string | undefined>();
@@ -43,13 +46,22 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
     const [usageLimit, setUsageLimit] = useState<number>(0);
     const [stripePortalUrl, setStripePortalUrl] = useState<string | undefined>();
     const [errorMessage, setErrorMessage] = useState<string | undefined>();
+    const [priceInformation, setPriceInformation] = useState<string | undefined>();
     const [pendingStripeSubscription, setPendingStripeSubscription] = useState<PendingStripeSubscription | undefined>(
         undefined,
     );
 
+    // Stripe-controlled parameters
+    const location = useLocation();
+
     const now = useMemo(() => dayjs().utc(true), []);
     const [billingCycleFrom, setBillingCycleFrom] = useState<dayjs.Dayjs>(now.startOf("month"));
     const [billingCycleTo, setBillingCycleTo] = useState<dayjs.Dayjs>(now.endOf("month"));
+    useEffect(() => {
+        if (attributionId) {
+            getGitpodService().server.getPriceInformation(attributionId).then(setPriceInformation);
+        }
+    }, [attributionId]);
 
     const refreshSubscriptionDetails = useCallback(
         async (attributionId: string) => {
@@ -83,55 +95,82 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
     }, [attributionId, refreshSubscriptionDetails]);
 
     useEffect(() => {
-        if (!attributionId) {
-            return;
-        }
         const params = new URLSearchParams(location.search);
-        if (!params.get("setup_intent") || params.get("redirect_status") !== "succeeded") {
-            return;
+        const setupIntentId = params.get("setup_intent");
+        const redirectStatus = params.get("redirect_status");
+        if (setupIntentId && redirectStatus) {
+            subscribeToStripe({
+                setupIntentId,
+                redirectStatus,
+            });
         }
-        const setupIntentId = params.get("setup_intent")!;
-        window.history.replaceState({}, "", location.pathname);
-        (async () => {
-            const pendingSubscription = { pendingSince: Date.now() };
-            try {
-                setPendingStripeSubscription(pendingSubscription);
-                // Pick a good initial value for the Stripe usage limit (base_limit * team_size)
-                // FIXME: Should we ask the customer to confirm or edit this default limit?
-                let limit = BASE_USAGE_LIMIT_FOR_STRIPE_USERS;
-                const attrId = AttributionId.parse(attributionId);
-                if (attrId?.kind === "team") {
-                    const members = usePublicApiTeamsService
-                        ? publicApiTeamMembersToProtocol(
-                              (await teamsService.getTeam({ teamId: attrId.teamId })).team?.members || [],
-                          )
-                        : await getGitpodService().server.getTeamMembers(attrId.teamId);
-                    limit = BASE_USAGE_LIMIT_FOR_STRIPE_USERS * members.length;
-                }
-                const newLimit = await getGitpodService().server.subscribeToStripe(attributionId, setupIntentId, limit);
-                if (newLimit) {
-                    setUsageLimit(newLimit);
-                }
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
-                //refresh every 5 secs until we get a subscriptionId
-                const interval = setInterval(async () => {
-                    try {
-                        const subscriptionId = await refreshSubscriptionDetails(attributionId);
-                        if (subscriptionId) {
-                            setPendingStripeSubscription(undefined);
-                            clearInterval(interval);
-                        }
-                    } catch (error) {
-                        console.error(error);
-                    }
-                }, 1000);
-            } catch (error) {
-                console.error("Could not subscribe to Stripe", error);
-                setPendingStripeSubscription(undefined);
-                setErrorMessage(`Could not subscribe to Stripe. ${error?.message || String(error)}`);
+    const subscribeToStripe = useCallback(
+        (stripeParams: { setupIntentId: string; redirectStatus: string }) => {
+            if (!attributionId) {
+                return;
             }
-        })();
-    }, [attributionId, location.pathname, location.search, refreshSubscriptionDetails, usePublicApiTeamsService]);
+            const { setupIntentId, redirectStatus } = stripeParams;
+            if (redirectStatus !== "succeeded") {
+                // TODO(gpl) We have to handle external validation errors (3DS, e.g.) here
+                return;
+            }
+
+            // Guard against multiple execution following the pattern here: https://react.dev/learn/you-might-not-need-an-effect#initializing-the-application
+            if (didAlreadyCallSubscribe) {
+                console.log("didAlreadyCallSubscribe, skipping this time.");
+                return;
+            }
+            didAlreadyCallSubscribe = true;
+            console.log("didAlreadyCallSubscribe false, first run.");
+
+            window.history.replaceState({}, "", location.pathname);
+            (async () => {
+                const pendingSubscription = { pendingSince: Date.now() };
+                try {
+                    setPendingStripeSubscription(pendingSubscription);
+                    // Pick a good initial value for the Stripe usage limit (base_limit * team_size)
+                    // FIXME: Should we ask the customer to confirm or edit this default limit?
+                    let limit = BASE_USAGE_LIMIT_FOR_STRIPE_USERS;
+                    if (attrId?.kind === "team" && currentOrg) {
+                        limit = BASE_USAGE_LIMIT_FOR_STRIPE_USERS * currentOrg.members.length;
+                    }
+                    const newLimit = await getGitpodService().server.subscribeToStripe(
+                        attributionId,
+                        setupIntentId,
+                        limit,
+                    );
+                    if (newLimit) {
+                        setUsageLimit(newLimit);
+                    }
+
+                    //refresh every 5 secs until we get a subscriptionId
+                    const interval = setInterval(async () => {
+                        try {
+                            const subscriptionId = await refreshSubscriptionDetails(attributionId);
+                            if (subscriptionId) {
+                                setPendingStripeSubscription(undefined);
+                                clearInterval(interval);
+                            }
+                        } catch (error) {
+                            console.error(error);
+                        }
+                    }, 1000);
+                } catch (error) {
+                    console.error("Could not subscribe to Stripe", error);
+                    setPendingStripeSubscription(undefined);
+                    setErrorMessage(
+                        `Could not subscribe: ${
+                            error?.message || String(error)
+                        } Contact support@gitpod.io if you believe this is a system error.`,
+                    );
+                }
+            })();
+        },
+        [attrId?.kind, attributionId, currentOrg, location.pathname, refreshSubscriptionDetails],
+    );
 
     const showSpinner = !attributionId || isLoadingStripeSubscription || !!pendingStripeSubscription;
     const showBalance = !showSpinner;
@@ -157,14 +196,22 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
 
     const balance = currentUsage * -1 + usageLimit;
     const percentage = usageLimit === 0 ? 0 : Math.max(Math.round((balance * 100) / usageLimit), 0);
+    const freePlanName = useMemo(() => {
+        if (usageLimit === 0) {
+            return "No Plan";
+        }
+        return usageLimit > 500 ? "Open Source" : "Free";
+    }, [usageLimit]);
 
     return (
         <div className="mb-16">
-            <h2 className="text-gray-500">
-                {attributionId && AttributionId.parse(attributionId)?.kind === "user"
-                    ? "Manage billing for your personal account."
-                    : "Manage billing for your team."}
-            </h2>
+            {!hideSubheading && (
+                <Subheading>
+                    {attributionId && AttributionId.parse(attributionId)?.kind === "user"
+                        ? "Manage billing for your personal account."
+                        : "Manage billing for your organization."}
+                </Subheading>
+            )}
             <div className="max-w-xl flex flex-col">
                 {errorMessage && (
                     <Alert className="max-w-xl mt-2" closable={false} showIcon={true} type="error">
@@ -220,9 +267,9 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
                             </div>
                             <div>
                                 <Link
-                                    to={`./usage#${billingCycleFrom.format("YYYY-MM-DD")}:${billingCycleTo.format(
-                                        "YYYY-MM-DD",
-                                    )}`}
+                                    to={`/usage?org=${
+                                        attrId?.kind === "team" ? attrId.teamId : "0"
+                                    }#${billingCycleFrom.format("YYYY-MM-DD")}:${billingCycleTo.format("YYYY-MM-DD")}`}
                                 >
                                     <button className="secondary">View Usage →</button>
                                 </Link>
@@ -230,72 +277,40 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
                         </div>
                     </div>
                 )}
-                {showUpgradeTeam && (
-                    <div className="flex flex-col mt-4 p-4 rounded-xl bg-gray-50 dark:bg-gray-800">
-                        <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Upgrade Plan</div>
-                        <div className="mt-1 text-xl font-semibold flex-grow text-gray-500 dark:text-gray-400">
-                            Pay-as-you-go
-                        </div>
-                        <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
-                            <Check className="m-0.5 w-5 h-5" />
-                            <div className="flex flex-col">
-                                <span>
-                                    {currency === "EUR" ? "€" : "$"}0.36 for 10 credits or 1 hour of Standard workspace
-                                    usage, excluding VAT.{" "}
-                                    <a className="gp-link" href="https://www.gitpod.io/pricing#cost-estimator">
-                                        Estimate costs
-                                    </a>
-                                </span>
-                            </div>
-                        </div>
-                        <div className="flex justify-end mt-6 space-x-2">
-                            {stripePortalUrl && (
-                                <a href={stripePortalUrl}>
-                                    <button className="secondary" disabled={!stripePortalUrl}>
-                                        View Past Invoices ↗
-                                    </button>
-                                </a>
-                            )}
-                            <button onClick={() => setShowBillingSetupModal(true)}>Upgrade Plan</button>
-                        </div>
-                    </div>
-                )}
-                {showUpgradeUser && (
-                    <div className="flex flex-col mt-4 p-4 rounded-xl bg-gray-50 dark:bg-gray-800">
-                        <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Current Plan</div>
-                        <div className="mt-1 text-xl font-semibold flex-grow text-gray-600 dark:text-gray-400">
-                            {usageLimit > 500 ? "Open Source" : "Free"}
-                        </div>
-                        <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
-                            <Check className="m-0.5 w-5 h-5 text-orange-500" />
-                            <div className="flex flex-col">
-                                <span className="font-bold text-gray-500 dark:text-gray-400">{usageLimit} credits</span>
-                                <span>
-                                    {usageLimit / 10} hours of Standard workspace usage.{" "}
-                                    <a className="gp-link" href="https://www.gitpod.io/pricing#cost-estimator">
-                                        Estimate costs
-                                    </a>
-                                </span>
-                            </div>
-                        </div>
-                        <div className="bg-gray-100 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700 -m-4 p-4 mt-8 rounded-b-xl">
-                            <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Upgrade Plan</div>
-                            <div className="mt-1 text-xl font-semibold flex-grow text-gray-500 dark:text-gray-400">
-                                {currency === "EUR" ? "€" : "$"}9 / month
+                {(showUpgradeTeam || showUpgradeUser) && (
+                    <>
+                        <div className="flex flex-col mt-4 p-4 rounded-t-xl bg-gray-50 dark:bg-gray-800">
+                            <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Current Plan</div>
+                            <div className="mt-1 text-xl font-semibold flex-grow text-gray-600 dark:text-gray-400">
+                                {freePlanName}
                             </div>
                             <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
-                                <Check className="m-0.5 w-5 h-5" />
-                                <div className="flex flex-col">
-                                    <span className="font-bold">1,000 credits</span>
+                                <div className="m-0.5 w-5 h-5 text-orange-500">
+                                    <Check />
+                                </div>
+                                <div className="flex flex-col w-96">
+                                    <span className="font-bold text-gray-500 dark:text-gray-400">
+                                        {usageLimit} credits
+                                    </span>
+                                    <span>{usageLimit / 10} hours of Standard workspace usage.</span>
                                 </div>
                             </div>
-                            <div className="mt-2 flex space-x-1 text-gray-400 dark:text-gray-500">
-                                <Check className="m-0.5 w-5 h-5" />
+                        </div>
+                        <div className="flex flex-col p-4 rounded-b-xl bg-gray-100 dark:bg-gray-800 border-t border-gray-200 dark:border-gray-700">
+                            <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Upgrade Plan</div>
+                            <div className="mt-1 text-xl font-semibold flex-grow text-gray-800 dark:text-gray-100">
+                                Pay-as-you-go
+                            </div>
+                            <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
+                                <div className="m-0.5 w-8 h-5">
+                                    <Check />
+                                </div>
                                 <div className="flex flex-col">
-                                    <span className="font-bold">Pay-as-you-go after 1,000 credits</span>
                                     <span>
-                                        {currency === "EUR" ? "€" : "$"}0.36 for 10 credits or 1 hour of Standard
-                                        workspace usage, excluding VAT.
+                                        {priceInformation}{" "}
+                                        <a className="gp-link" href="https://www.gitpod.io/pricing#cost-estimator">
+                                            Estimate costs
+                                        </a>
                                     </span>
                                 </div>
                             </div>
@@ -310,71 +325,27 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
                                 <button onClick={() => setShowBillingSetupModal(true)}>Upgrade Plan</button>
                             </div>
                         </div>
-                    </div>
+                    </>
                 )}
                 {showManageBilling && (
                     <div className="max-w-xl flex space-x-4">
                         <div className="flex-grow flex flex-col mt-4 p-4 rounded-xl bg-gray-50 dark:bg-gray-800">
                             <div className="uppercase text-sm text-gray-400 dark:text-gray-500">Current Plan</div>
-                            {AttributionId.parse(attributionId)?.kind === "user" ? (
-                                <>
-                                    <div className="mt-1 text-xl font-semibold flex-grow text-gray-800 dark:text-gray-100">
-                                        {currency === "EUR" ? "€" : "$"}9 / month
-                                    </div>
-                                    <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
-                                        <Check className="m-0.5 w-5 h-5 text-orange-500" />
-                                        <div className="flex flex-col">
-                                            <span className="font-bold text-gray-500 dark:text-gray-400">
-                                                1,000 credits
-                                            </span>
-                                            <span>
-                                                100 hours of Standard workspace usage.{" "}
-                                                <a
-                                                    className="gp-link"
-                                                    href="https://www.gitpod.io/docs/configure/billing/usage-based-billing"
-                                                    target="_blank"
-                                                    rel="noreferrer"
-                                                >
-                                                    Learn more about credits
-                                                </a>
-                                            </span>
-                                        </div>
-                                    </div>
-                                    <div className="mt-3 flex space-x-1 text-gray-400 dark:text-gray-500">
-                                        <Check className="m-0.5 w-5 h-5 text-orange-500" />
-                                        <div className="flex flex-col">
-                                            <span className="font-bold text-gray-500 dark:text-gray-400">
-                                                Pay-as-you-go after 1,000 credits
-                                            </span>
-                                            <span>
-                                                {currency === "EUR" ? "€" : "$"}0.36 for 10 credits or 1 hour of
-                                                Standard workspace usage, excluding VAT.
-                                            </span>
-                                        </div>
-                                    </div>
-                                </>
-                            ) : (
-                                <>
-                                    <div className="mt-1 text-xl font-semibold flex-grow text-gray-800 dark:text-gray-100">
-                                        Pay-as-you-go
-                                    </div>
-                                    <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
-                                        <Check className="m-0.5 w-5 h-5 text-orange-500" />
-                                        <div className="flex flex-col">
-                                            <span>
-                                                {currency === "EUR" ? "€" : "$"}0.36 for 10 credits or 1 hour of
-                                                Standard workspace usage, excluding VAT.{" "}
-                                                <a
-                                                    className="gp-link"
-                                                    href="https://www.gitpod.io/docs/configure/billing/usage-based-billing"
-                                                >
-                                                    Learn more about credits
-                                                </a>
-                                            </span>
-                                        </div>
-                                    </div>
-                                </>
-                            )}
+                            <div className="mt-1 text-xl font-semibold flex-grow text-gray-800 dark:text-gray-100">
+                                Pay-as-you-go
+                            </div>
+                            <div className="mt-4 flex space-x-1 text-gray-400 dark:text-gray-500">
+                                <Check className="m-0.5 w-8 h-5 text-orange-500" />
+                                <div className="flex flex-col">
+                                    <span>
+                                        {priceInformation}{" "}
+                                        <a className="gp-link" href="https://www.gitpod.io/pricing#cost-estimator">
+                                            Estimate costs
+                                        </a>
+                                    </span>
+                                </div>
+                            </div>
+
                             <a className="mt-5 self-end" href={stripePortalUrl}>
                                 <button className="secondary" disabled={!stripePortalUrl}>
                                     Manage Plan ↗
@@ -403,7 +374,7 @@ export default function UsageBasedBillingConfig({ attributionId }: Props) {
     );
 }
 
-function BillingSetupModal(props: { attributionId: string; onClose: () => void }) {
+export function BillingSetupModal(props: { attributionId: string; onClose: () => void }) {
     const { isDark } = useContext(ThemeContext);
     const [stripePromise, setStripePromise] = useState<Promise<Stripe | null> | undefined>();
     const [stripeSetupIntentClientSecret, setStripeSetupIntentClientSecret] = useState<string | undefined>();
@@ -418,7 +389,7 @@ function BillingSetupModal(props: { attributionId: string; onClose: () => void }
 
     return (
         <Modal visible={true} onClose={props.onClose}>
-            <h3 className="flex">Upgrade Plan</h3>
+            <Heading2 className="flex">Upgrade Plan</Heading2>
             <div className="border-t border-gray-200 dark:border-gray-700 mt-4 pt-2 -mx-6 px-6 flex flex-col">
                 {(!stripePromise || !stripeSetupIntentClientSecret) && (
                     <div className="h-80 flex items-center justify-center">
@@ -561,7 +532,7 @@ function UpdateLimitModal(props: {
 
     return (
         <Modal visible={true} onClose={props.onClose} onEnter={() => false}>
-            <h3 className="mb-4">Usage Limit</h3>
+            <Heading2 className="mb-4">Usage Limit</Heading2>
             <form onSubmit={onSubmit}>
                 <div className="border-t border-b border-gray-200 dark:border-gray-700 -mx-6 px-6 py-4 flex flex-col">
                     <p className="pb-4 text-gray-500 text-base">Set usage limit in total credits per month.</p>

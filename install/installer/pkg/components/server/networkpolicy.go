@@ -8,7 +8,6 @@ import (
 	"github.com/gitpod-io/gitpod/common-go/baseserver"
 	"github.com/gitpod-io/gitpod/installer/pkg/common"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/gitpod"
-	"github.com/gitpod-io/gitpod/installer/pkg/components/iam"
 
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,6 +42,23 @@ func Networkpolicy(ctx *common.RenderContext, component string) ([]runtime.Objec
 								PodSelector: &metav1.LabelSelector{
 									MatchLabels: map[string]string{
 										"component": common.ProxyComponent,
+									},
+								},
+							},
+						},
+					},
+					{
+						Ports: []networkingv1.NetworkPolicyPort{
+							{
+								Protocol: common.TCPProtocol,
+								Port:     &intstr.IntOrString{IntVal: ContainerPort},
+							},
+						},
+						From: []networkingv1.NetworkPolicyPeer{
+							{
+								PodSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"component": common.PublicApiComponent,
 									},
 								},
 							},
@@ -99,7 +115,33 @@ func Networkpolicy(ctx *common.RenderContext, component string) ([]runtime.Objec
 								PodSelector: &metav1.LabelSelector{
 									MatchLabels: map[string]string{
 										"app":       "gitpod",
-										"component": iam.Component,
+										"component": common.PublicApiComponent,
+									},
+								},
+							},
+						},
+					},
+					{
+						Ports: []networkingv1.NetworkPolicyPort{
+							{
+								Protocol: common.TCPProtocol,
+								Port:     &intstr.IntOrString{IntVal: GRPCAPIPort},
+							},
+						},
+						From: []networkingv1.NetworkPolicyPeer{
+							{
+								PodSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"app":       "gitpod",
+										"component": common.PublicApiComponent,
+									},
+								},
+							},
+							{
+								PodSelector: &metav1.LabelSelector{
+									MatchLabels: map[string]string{
+										"app":       "gitpod",
+										"component": common.UsageComponent,
 									},
 								},
 							},

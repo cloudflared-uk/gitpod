@@ -32,7 +32,6 @@ import {
     UpdateResponse,
     AdmissionConstraint as GRPCAdmissionConstraint,
 } from "@gitpod/ws-manager-bridge-api/lib";
-import { GetWorkspacesRequest, WorkspaceManagerClient } from "@gitpod/ws-manager/lib";
 import { WorkspaceManagerClientProvider } from "@gitpod/ws-manager/lib/client-provider";
 import {
     WorkspaceManagerClientProviderCompositeSource,
@@ -43,8 +42,10 @@ import { inject, injectable } from "inversify";
 import { BridgeController } from "./bridge-controller";
 import { getSupportedWorkspaceClasses } from "./cluster-sync-service";
 import { Configuration } from "./config";
-import { getExperimentsClientForBackend } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
 import { GRPCError } from "./rpc";
+import { isWorkspaceRegion } from "@gitpod/gitpod-protocol/lib/workspace-cluster";
+import { getExperimentsClientForBackend } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
+import { GetWorkspacesRequest, WorkspaceManagerClient } from "@gitpod/ws-manager/lib";
 
 export interface ClusterServiceServerOptions {
     port: number;
@@ -55,9 +56,6 @@ export interface ClusterServiceServerOptions {
 export class ClusterService implements IClusterServiceServer {
     // Satisfy the grpc.UntypedServiceImplementation interface.
     [name: string]: any;
-
-    @inject(Configuration)
-    protected readonly config: Configuration;
 
     @inject(WorkspaceClusterDB)
     protected readonly clusterDB: WorkspaceClusterDB;
@@ -87,10 +85,13 @@ export class ClusterService implements IClusterServiceServer {
                 // check if the name or URL are already registered/in use
                 const req = call.request.toObject();
 
-                const clusterByNamePromise = this.clusterDB.findByName(req.name, this.config.installation);
+                if (!isWorkspaceRegion(req.region)) {
+                    throw new GRPCError(grpc.status.INVALID_ARGUMENT, `Invalid value for workspace region.`);
+                }
+
+                const clusterByNamePromise = this.clusterDB.findByName(req.name);
                 const clusterByUrlPromise = this.clusterDB.findFiltered({
                     url: req.url,
-                    applicationCluster: this.config.installation,
                 });
 
                 const [clusterByName, clusterByUrl] = await Promise.all([clusterByNamePromise, clusterByUrlPromise]);
@@ -112,13 +113,10 @@ export class ClusterService implements IClusterServiceServer {
 
                 // store the ws-manager into the database
                 let perfereability = Preferability.NONE;
-                let govern = false;
+                let govern = true;
                 let state: WorkspaceClusterState = "available";
                 if (req.hints) {
                     perfereability = req.hints.perfereability;
-                    if (req.hints.govern) {
-                        govern = req.hints.govern;
-                    }
                     state = mapCordoned(req.hints.cordoned);
                 }
                 let score = mapPreferabilityToScore(perfereability);
@@ -144,7 +142,7 @@ export class ClusterService implements IClusterServiceServer {
                 const newCluster: WorkspaceCluster = {
                     name: req.name,
                     url: req.url,
-                    applicationCluster: this.config.installation,
+                    region: req.region,
                     state,
                     score,
                     maxScore: 100,
@@ -158,12 +156,7 @@ export class ClusterService implements IClusterServiceServer {
                     {},
                 );
                 if (enabled) {
-                    let classConstraints = await getSupportedWorkspaceClasses(
-                        this.clientProvider,
-                        newCluster,
-                        this.config.installation,
-                        false,
-                    );
+                    let classConstraints = await getSupportedWorkspaceClasses(this.clientProvider, newCluster, false);
                     newCluster.admissionConstraints = admissionConstraints.concat(classConstraints);
                 } else {
                     // try to connect to validate the config. Throws an exception if it fails.
@@ -203,7 +196,7 @@ export class ClusterService implements IClusterServiceServer {
         this.queue.enqueue(async () => {
             try {
                 const req = call.request.toObject();
-                const cluster = await this.clusterDB.findByName(req.name, this.config.installation);
+                const cluster = await this.clusterDB.findByName(req.name);
                 if (!cluster) {
                     throw new GRPCError(
                         grpc.status.NOT_FOUND,
@@ -280,7 +273,7 @@ export class ClusterService implements IClusterServiceServer {
                     );
                 }
 
-                await this.clusterDB.deleteByName(req.name, this.config.installation);
+                await this.clusterDB.deleteByName(req.name);
                 log.info({}, "cluster deregistered", { cluster: req.name });
                 this.triggerReconcile("deregister", req.name);
 
@@ -298,16 +291,14 @@ export class ClusterService implements IClusterServiceServer {
                 const response = new ListResponse();
 
                 const dbClusterIdx = new Map<string, boolean>();
-                const allDBClusters = await this.clusterDB.findFiltered({
-                    applicationCluster: this.config.installation,
-                });
+                const allDBClusters = await this.clusterDB.findFiltered({});
                 for (const cluster of allDBClusters) {
                     const clusterStatus = convertToGRPC(cluster);
                     response.addStatus(clusterStatus);
                     dbClusterIdx.set(cluster.name, true);
                 }
 
-                const allCluster = await this.allClientProvider.getAllWorkspaceClusters(this.config.installation);
+                const allCluster = await this.allClientProvider.getAllWorkspaceClusters();
                 for (const cluster of allCluster) {
                     if (dbClusterIdx.get(cluster.name)) {
                         continue;
@@ -342,7 +333,8 @@ function convertToGRPC(ws: WorkspaceClusterWoTLS): ClusterStatus {
     clusterStatus.setScore(ws.score);
     clusterStatus.setMaxScore(ws.maxScore);
     clusterStatus.setGoverned(ws.govern);
-    clusterStatus.setApplicationCluster(ws.applicationCluster);
+    clusterStatus.setRegion(ws.region);
+
     ws.admissionConstraints?.forEach((c) => {
         const constraint = new GRPCAdmissionConstraint();
         switch (c.type) {

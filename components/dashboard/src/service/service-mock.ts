@@ -37,7 +37,6 @@ const t1 = new Date(Date.now() - 123533).toISOString();
 const team1: Team = {
     id: "team1",
     name: "ACME",
-    slug: "ACME",
     creationTime: t1,
 };
 const pr1: Project = {
@@ -217,7 +216,7 @@ const gitpodServiceMock = createServiceMock({
                 id: "g1-standard",
                 category: "GENERAL PURPOSE",
                 displayName: "Standard",
-                description: "Up to 4 vCPU, 8GB memory, 30GB disk",
+                description: "Up to 4 cores, 8GB RAM, 30GB storage",
                 powerups: 1,
                 isDefault: true,
             },
@@ -225,7 +224,7 @@ const gitpodServiceMock = createServiceMock({
                 id: "g1-large",
                 category: "GENERAL PURPOSE",
                 displayName: "Large",
-                description: "Up to 8 vCPU, 16GB memory, 50GB disk",
+                description: "Up to 8 cores, 16GB RAM, 50GB storage",
                 powerups: 2,
                 isDefault: false,
             },

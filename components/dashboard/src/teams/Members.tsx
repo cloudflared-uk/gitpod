@@ -4,76 +4,36 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { TeamMemberInfo, TeamMemberRole } from "@gitpod/gitpod-protocol";
-import dayjs from "dayjs";
-import { useContext, useEffect, useState } from "react";
-import { useHistory, useLocation } from "react-router";
-import Header from "../components/Header";
-import DropDown from "../components/DropDown";
-import { ItemsList, Item, ItemField, ItemFieldContextMenu } from "../components/ItemsList";
-import Modal from "../components/Modal";
-import Tooltip from "../components/Tooltip";
-import copy from "../images/copy.svg";
-import { getGitpodService } from "../service/service";
-import { UserContext } from "../user-context";
-import { TeamsContext, getCurrentTeam } from "./teams-context";
-import { trackEvent } from "../Analytics";
-import { FeatureFlagContext } from "../contexts/FeatureFlagContext";
-import { publicApiTeamMembersToProtocol, publicApiTeamsToProtocol, teamsService } from "../service/public-api";
+import { TeamMemberRole } from "@gitpod/gitpod-protocol";
 import { TeamRole } from "@gitpod/public-api/lib/gitpod/experimental/v1/teams_pb";
+import dayjs from "dayjs";
+import { useMemo, useState } from "react";
+import { trackEvent } from "../Analytics";
+import DropDown from "../components/DropDown";
+import Header from "../components/Header";
+import { Item, ItemField, ItemFieldContextMenu, ItemsList } from "../components/ItemsList";
+import Modal, { ModalBody, ModalFooter, ModalHeader } from "../components/Modal";
+import Tooltip from "../components/Tooltip";
+import { useCurrentOrg, useOrganizationsInvalidator } from "../data/organizations/orgs-query";
+import searchIcon from "../icons/search.svg";
+import copy from "../images/copy.svg";
+import { teamsService } from "../service/public-api";
+import { useCurrentUser } from "../user-context";
+import { SpinnerLoader } from "../components/Loader";
 
-export default function () {
-    const { user } = useContext(UserContext);
-    const { teams, setTeams } = useContext(TeamsContext);
-    const { usePublicApiTeamsService } = useContext(FeatureFlagContext);
+export default function MembersPage() {
+    const user = useCurrentUser();
+    const org = useCurrentOrg();
+    const invalidateOrgs = useOrganizationsInvalidator();
 
-    const history = useHistory();
-    const location = useLocation();
-    const team = getCurrentTeam(location, teams);
-    const [members, setMembers] = useState<TeamMemberInfo[]>([]);
-    const [genericInviteId, setGenericInviteId] = useState<string>();
     const [showInviteModal, setShowInviteModal] = useState<boolean>(false);
     const [searchText, setSearchText] = useState<string>("");
     const [roleFilter, setRoleFilter] = useState<TeamMemberRole | undefined>();
-    const [leaveTeamEnabled, setLeaveTeamEnabled] = useState<boolean>(false);
 
-    useEffect(() => {
-        if (!team) {
-            return;
-        }
-        (async () => {
-            let members: TeamMemberInfo[];
-            let invite: string;
-
-            if (usePublicApiTeamsService) {
-                const response = await teamsService.getTeam({ teamId: team.id });
-                members = publicApiTeamMembersToProtocol(response.team?.members || []);
-                invite = response.team?.teamInvitation?.id || "";
-            } else {
-                const [teamMembers, genericInvite] = await Promise.all([
-                    getGitpodService().server.getTeamMembers(team.id),
-                    getGitpodService().server.getGenericInvite(team.id),
-                ]);
-                members = teamMembers;
-                invite = genericInvite.id;
-            }
-
-            setMembers(members);
-            setGenericInviteId(invite);
-        })();
-    }, [team]);
-
-    useEffect(() => {
-        const owners = members.filter((m) => m.role === "owner");
-        const isOwner = owners.some((o) => o.userId === user?.id);
-        setLeaveTeamEnabled(!isOwner || owners.length > 1);
-    }, [members]);
-
-    const ownMemberInfo = members.find((m) => m.userId === user?.id);
-
-    const getInviteURL = (inviteId: string) => {
+    const getInviteURL = (inviteId?: string) => {
+        if (!inviteId) return "no-invite-id";
         const link = new URL(window.location.href);
-        link.pathname = "/teams/join";
+        link.pathname = "/orgs/join";
         link.search = "?inviteId=" + inviteId;
         return link.href;
     };
@@ -94,93 +54,61 @@ export default function () {
     };
 
     const resetInviteLink = async () => {
-        // reset genericInvite first to prevent races on double click
-        if (genericInviteId) {
-            setGenericInviteId(undefined);
-            const newInviteId = usePublicApiTeamsService
-                ? (await teamsService.resetTeamInvitation({ teamId: team!.id })).teamInvitation?.id
-                : (await getGitpodService().server.resetGenericInvite(team!.id)).id;
-            setGenericInviteId(newInviteId);
-        }
+        await teamsService.resetTeamInvitation({ teamId: org.data?.id });
+        invalidateOrgs();
     };
 
     const setTeamMemberRole = async (userId: string, role: TeamMemberRole) => {
-        usePublicApiTeamsService
-            ? await teamsService.updateTeamMember({
-                  teamId: team!.id,
-                  teamMember: { userId, role: role === "owner" ? TeamRole.OWNER : TeamRole.MEMBER },
-              })
-            : await getGitpodService().server.setTeamMemberRole(team!.id, userId, role);
-
-        const members = usePublicApiTeamsService
-            ? publicApiTeamMembersToProtocol((await teamsService.getTeam({ teamId: team!.id })).team?.members || [])
-            : await getGitpodService().server.getTeamMembers(team!.id);
-
-        setMembers(members);
+        await teamsService.updateTeamMember({
+            teamId: org.data?.id,
+            teamMember: { userId, role: role === "owner" ? TeamRole.OWNER : TeamRole.MEMBER },
+        });
+        invalidateOrgs();
     };
 
     const removeTeamMember = async (userId: string) => {
-        usePublicApiTeamsService
-            ? await teamsService.deleteTeamMember({ teamId: team!.id, teamMemberId: userId })
-            : await getGitpodService().server.removeTeamMember(team!.id, userId);
-
-        const newTeams = usePublicApiTeamsService
-            ? publicApiTeamsToProtocol((await teamsService.listTeams({})).teams)
-            : await getGitpodService().server.getTeams();
-
-        if (newTeams.some((t) => t.id === team!.id)) {
-            // We're still a member of this team.
-
-            const newMembers = usePublicApiTeamsService
-                ? publicApiTeamMembersToProtocol((await teamsService.getTeam({ teamId: team!.id })).team?.members || [])
-                : await getGitpodService().server.getTeamMembers(team!.id);
-            setMembers(newMembers);
-        } else {
-            // We're no longer a member of this team (note: we navigate away first in order to avoid a 404).
-            history.push("/");
-            setTeams(newTeams);
-        }
+        await teamsService.deleteTeamMember({ teamId: org.data?.id, teamMemberId: userId });
+        invalidateOrgs();
     };
 
-    const filteredMembers = members.filter((m) => {
-        if (!!roleFilter && m.role !== roleFilter) {
-            return false;
-        }
-        const memberSearchText = `${m.fullName || ""}${m.primaryEmail || ""}`.toLocaleLowerCase();
-        if (!memberSearchText.includes(searchText.toLocaleLowerCase())) {
-            return false;
-        }
-        return true;
-    });
+    const isRemainingOwner = useMemo(() => {
+        const owners = org.data?.members.filter((m) => m.role === "owner");
+        return owners?.length === 1 && owners[0].userId === user?.id;
+    }, [org.data?.members, user?.id]);
+
+    const filteredMembers =
+        org.data?.members.filter((m) => {
+            if (!!roleFilter && m.role !== roleFilter) {
+                return false;
+            }
+            const memberSearchText = `${m.fullName || ""}${m.primaryEmail || ""}`.toLocaleLowerCase();
+            if (!memberSearchText.includes(searchText.toLocaleLowerCase())) {
+                return false;
+            }
+            return true;
+        }) || [];
 
     return (
         <>
-            <Header title="Members" subtitle="Manage team members." />
+            <Header title="Members" subtitle="Manage organization members." />
             <div className="app-container">
-                <div className="flex mt-8">
-                    <div className="flex">
-                        <div className="py-4">
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                fill="none"
-                                viewBox="0 0 16 16"
-                                width="16"
-                                height="16"
-                            >
-                                <path
-                                    fill="#A8A29E"
-                                    d="M6 2a4 4 0 100 8 4 4 0 000-8zM0 6a6 6 0 1110.89 3.477l4.817 4.816a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 010 6z"
-                                />
-                            </svg>
-                        </div>
+                <div className="flex mb-3 mt-3">
+                    <div className="flex relative h-10 my-auto">
+                        <img
+                            src={searchIcon}
+                            title="Search"
+                            className="filter-grayscale absolute top-3 left-3"
+                            alt="search icon"
+                        />
                         <input
+                            className="w-64 pl-9 border-0"
                             type="search"
-                            placeholder="Search Members"
+                            placeholder="Filter Members"
                             onChange={(e) => setSearchText(e.target.value)}
                         />
                     </div>
                     <div className="flex-1" />
-                    <div className="py-3 pl-3">
+                    <div className="py-2 pl-3">
                         <DropDown
                             prefix="Role: "
                             customClasses="w-32"
@@ -204,7 +132,7 @@ export default function () {
                     <button
                         onClick={() => {
                             trackEvent("invite_url_requested", {
-                                invite_url: getInviteURL(genericInviteId!),
+                                invite_url: getInviteURL(org.data?.invitationId),
                             });
                             setShowInviteModal(true);
                         }}
@@ -223,9 +151,9 @@ export default function () {
                             <svg xmlns="http://www.w3.org/2000/svg" fill="none" className="h-4 w-4" viewBox="0 0 16 16">
                                 <path
                                     fill="#A8A29E"
-                                    fill-rule="evenodd"
+                                    fillRule="evenodd"
                                     d="M13.366 8.234a.8.8 0 010 1.132l-4.8 4.8a.8.8 0 01-1.132 0l-4.8-4.8a.8.8 0 111.132-1.132L7.2 11.67V2.4a.8.8 0 111.6 0v9.269l3.434-3.435a.8.8 0 011.132 0z"
-                                    clip-rule="evenodd"
+                                    clipRule="evenodd"
                                 />
                             </svg>
                         </ItemField>
@@ -234,7 +162,7 @@ export default function () {
                         </ItemField>
                     </Item>
                     {filteredMembers.length === 0 ? (
-                        <p className="pt-16 text-center">No members found</p>
+                        <SpinnerLoader />
                     ) : (
                         filteredMembers.map((m) => (
                             <Item className="grid grid-cols-3" key={m.userId}>
@@ -263,9 +191,7 @@ export default function () {
                                 </ItemField>
                                 <ItemField className="flex items-center my-auto">
                                     <span className="text-gray-400 capitalize">
-                                        {ownMemberInfo?.role !== "owner" ? (
-                                            m.role
-                                        ) : (
+                                        {org.data?.isOwner ? (
                                             <DropDown
                                                 customClasses="w-32"
                                                 activeEntry={m.role}
@@ -280,6 +206,8 @@ export default function () {
                                                     },
                                                 ]}
                                             />
+                                        ) : (
+                                            m.role
                                         )}
                                     </span>
                                     <span className="flex-grow" />
@@ -288,14 +216,17 @@ export default function () {
                                             m.userId === user?.id
                                                 ? [
                                                       {
-                                                          title: leaveTeamEnabled ? "Leave Team" : "Remaining owner",
-                                                          customFontStyle: leaveTeamEnabled
+                                                          title: !isRemainingOwner
+                                                              ? "Leave Organization"
+                                                              : "Remaining owner",
+                                                          customFontStyle: !isRemainingOwner
                                                               ? "text-red-600 dark:text-red-400 hover:text-red-800 dark:hover:text-red-300"
                                                               : "text-gray-400 dark:text-gray-200",
-                                                          onClick: () => leaveTeamEnabled && removeTeamMember(m.userId),
+                                                          onClick: () =>
+                                                              !isRemainingOwner && removeTeamMember(m.userId),
                                                       },
                                                   ]
-                                                : ownMemberInfo?.role === "owner"
+                                                : org.data?.isOwner
                                                 ? [
                                                       {
                                                           title: "Remove",
@@ -313,11 +244,11 @@ export default function () {
                     )}
                 </ItemsList>
             </div>
-            {genericInviteId && showInviteModal && (
+            {org.data?.invitationId && showInviteModal && (
                 // TODO: Use title and buttons props
                 <Modal visible={true} onClose={() => setShowInviteModal(false)}>
-                    <h3 className="mb-4">Invite Members</h3>
-                    <div className="border-t border-b border-gray-200 dark:border-gray-800 -mx-6 px-6 py-4 flex flex-col">
+                    <ModalHeader>Invite Members</ModalHeader>
+                    <ModalBody>
                         <label htmlFor="inviteUrl" className="font-medium">
                             Invite URL
                         </label>
@@ -327,30 +258,32 @@ export default function () {
                                 disabled={true}
                                 readOnly={true}
                                 type="text"
-                                value={getInviteURL(genericInviteId!)}
+                                value={getInviteURL(org.data?.invitationId)}
                                 className="rounded-md w-full truncate overflow-x-scroll pr-8"
                             />
                             <div
                                 className="cursor-pointer"
-                                onClick={() => copyToClipboard(getInviteURL(genericInviteId!))}
+                                onClick={() => copyToClipboard(getInviteURL(org.data?.invitationId))}
                             >
                                 <div className="absolute top-1/3 right-3">
                                     <Tooltip content={copied ? "Copied!" : "Copy Invite URL"}>
-                                        <img src={copy} title="Copy Invite URL" />
+                                        <img src={copy} title="Copy Invite URL" alt="copy icon" />
                                     </Tooltip>
                                 </div>
                             </div>
                         </div>
-                        <p className="mt-1 text-gray-500 text-sm">Use this URL to join this team as a Member.</p>
-                    </div>
-                    <div className="flex justify-end mt-6 space-x-2">
+                        <p className="mt-1 text-gray-500 text-sm">
+                            Use this URL to join this organization as a member.
+                        </p>
+                    </ModalBody>
+                    <ModalFooter>
                         <button className="secondary" onClick={() => resetInviteLink()}>
                             Reset Invite Link
                         </button>
                         <button className="secondary" onClick={() => setShowInviteModal(false)}>
                             Close
                         </button>
-                    </div>
+                    </ModalFooter>
                 </Modal>
             )}
         </>

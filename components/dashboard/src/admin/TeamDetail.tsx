@@ -17,6 +17,8 @@ import { AttributionId } from "@gitpod/gitpod-protocol/lib/attribution";
 import { BillingMode } from "@gitpod/gitpod-protocol/lib/billing-mode";
 import { CostCenterJSON, CostCenter_BillingStrategy } from "@gitpod/gitpod-protocol/lib/usage";
 import Modal from "../components/Modal";
+import { Heading2 } from "../components/typography/headings";
+import search from "../icons/search.svg";
 
 export default function TeamDetail(props: { team: Team }) {
     const { team } = props;
@@ -69,17 +71,17 @@ export default function TeamDetail(props: { team: Team }) {
     };
     return (
         <>
-            <div className="flex">
+            <div className="flex mt-8">
                 <div className="flex-1">
                     <div className="flex">
-                        <h3>{team.name}</h3>
+                        <Heading2>{team.name}</Heading2>
                         {team.markedDeleted && (
                             <span className="mt-2">
                                 <Label text="Deleted" color="red" />
                             </span>
                         )}
                     </div>
-                    <span className="mb-6 text-gray-400">/t/{team.slug}</span>
+                    <span className="mb-6 text-gray-400">{team.id}</span>
                     <span className="text-gray-400"> · </span>
                     <span className="text-gray-400">Created on {dayjs(team.creationTime).format("MMM D, YYYY")}</span>
                 </div>
@@ -133,17 +135,22 @@ export default function TeamDetail(props: { team: Team }) {
                     </Property>
                 )}
             </div>
-            <div className="flex mt-4">
-                <div className="flex">
-                    <div className="py-4">
-                        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 16 16" width="16" height="16">
-                            <path
-                                fill="#A8A29E"
-                                d="M6 2a4 4 0 100 8 4 4 0 000-8zM0 6a6 6 0 1110.89 3.477l4.817 4.816a1 1 0 01-1.414 1.414l-4.816-4.816A6 6 0 010 6z"
-                            />
-                        </svg>
+            <div className="flex">
+                <div className="flex mt-3 pb-3">
+                    <div className="flex relative h-10 my-auto">
+                        <img
+                            src={search}
+                            title="Search"
+                            className="filter-grayscale absolute top-3 left-3"
+                            alt="search icon"
+                        />
+                        <input
+                            className="w-64 pl-9 border-0"
+                            type="search"
+                            placeholder="Search Members"
+                            onChange={(e) => setSearchText(e.target.value)}
+                        />
                     </div>
-                    <input type="search" placeholder="Search Members" onChange={(e) => setSearchText(e.target.value)} />
                 </div>
             </div>
 
@@ -157,9 +164,9 @@ export default function TeamDetail(props: { team: Team }) {
                         <svg xmlns="http://www.w3.org/2000/svg" fill="none" className="h-4 w-4" viewBox="0 0 16 16">
                             <path
                                 fill="#A8A29E"
-                                fill-rule="evenodd"
+                                fillRule="evenodd"
                                 d="M13.366 8.234a.8.8 0 010 1.132l-4.8 4.8a.8.8 0 01-1.132 0l-4.8-4.8a.8.8 0 111.132-1.132L7.2 11.67V2.4a.8.8 0 111.6 0v9.269l3.434-3.435a.8.8 0 011.132 0z"
-                                clip-rule="evenodd"
+                                clipRule="evenodd"
                             />
                         </svg>
                     </ItemField>

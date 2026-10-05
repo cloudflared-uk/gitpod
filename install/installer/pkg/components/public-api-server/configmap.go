@@ -6,8 +6,6 @@ package public_api_server
 
 import (
 	"fmt"
-	"net"
-	"strconv"
 
 	"github.com/gitpod-io/gitpod/installer/pkg/config/v1/experimental"
 	"k8s.io/utils/pointer"
@@ -16,6 +14,8 @@ import (
 	"github.com/gitpod-io/gitpod/components/public-api/go/config"
 
 	"github.com/gitpod-io/gitpod/installer/pkg/common"
+	"github.com/gitpod-io/gitpod/installer/pkg/components/redis"
+	"github.com/gitpod-io/gitpod/installer/pkg/components/server"
 	"github.com/gitpod-io/gitpod/installer/pkg/components/usage"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,8 +27,14 @@ const (
 )
 
 func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
+	var oidcClientJWTSigningSecretPath string
 	var stripeSecretPath string
 	var personalAccessTokenSigningKeyPath string
+
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		_, _, oidcClientJWTSigningSecretPath, _ = getOIDCClientJWTSecretConfig(cfg)
+		return nil
+	})
 
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
 		_, _, stripeSecretPath, _ = getStripeConfig(cfg)
@@ -40,11 +46,25 @@ func configmap(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil
 	})
 
+	_, _, databaseSecretMountPath := common.DatabaseEnvSecret(ctx.Config)
+
+	_, _, authPKI := getAuthPKI()
+
 	cfg := config.Configuration{
-		GitpodServiceURL:                  fmt.Sprintf("wss://%s", ctx.Config.Domain),
+		PublicURL:                         fmt.Sprintf("https://api.%s", ctx.Config.Domain),
+		GitpodServiceURL:                  common.ClusterURL("ws", server.Component, ctx.Namespace, server.ContainerPort),
+		OIDCClientJWTSigningSecretPath:    oidcClientJWTSigningSecretPath,
 		StripeWebhookSigningSecretPath:    stripeSecretPath,
 		PersonalAccessTokenSigningKeyPath: personalAccessTokenSigningKeyPath,
-		BillingServiceAddress:             net.JoinHostPort(fmt.Sprintf("%s.%s.svc.cluster.local", usage.Component, ctx.Namespace), strconv.Itoa(usage.GRPCServicePort)),
+		BillingServiceAddress:             common.ClusterAddress(usage.Component, ctx.Namespace, usage.GRPCServicePort),
+		SessionServiceAddress:             common.ClusterAddress(common.ServerComponent, ctx.Namespace, common.ServerIAMSessionPort),
+		DatabaseConfigPath:                databaseSecretMountPath,
+		Redis: config.RedisConfiguration{
+			Address: common.ClusterAddress(redis.Component, ctx.Namespace, redis.Port),
+		},
+		Auth: config.AuthConfiguration{
+			PKI: authPKI,
+		},
 		Server: &baseserver.Configuration{
 			Services: baseserver.ServicesConfiguration{
 				GRPC: &baseserver.ServerConfiguration{
@@ -104,6 +124,38 @@ func getStripeConfig(cfg *experimental.Config) (corev1.Volume, corev1.VolumeMoun
 		Name:      "stripe-secret",
 		MountPath: stripeSecretMountPath,
 		SubPath:   "stripe-webhook-secret",
+		ReadOnly:  true,
+	}
+
+	return volume, mount, path, true
+}
+
+func getOIDCClientJWTSecretConfig(cfg *experimental.Config) (corev1.Volume, corev1.VolumeMount, string, bool) {
+	var volume corev1.Volume
+	var mount corev1.VolumeMount
+	var path string
+
+	if cfg == nil || cfg.WebApp == nil || cfg.WebApp.PublicAPI == nil || cfg.WebApp.PublicAPI.OIDCClientJWTSigningKeySecretName == "" {
+		return volume, mount, path, false
+	}
+
+	oidcClientJWTSigningKeySecretName := cfg.WebApp.PublicAPI.OIDCClientJWTSigningKeySecretName
+	path = oidcClientJWTSigningKeyMountPath
+
+	volume = corev1.Volume{
+		Name: "oidc-client-jwt-signing-key",
+		VolumeSource: corev1.VolumeSource{
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: oidcClientJWTSigningKeySecretName,
+				Optional:   pointer.Bool(true),
+			},
+		},
+	}
+
+	mount = corev1.VolumeMount{
+		Name:      "oidc-client-jwt-signing-key",
+		MountPath: oidcClientJWTSigningKeyMountPath,
+		SubPath:   "oidc-client-jwt-signing-key",
 		ReadOnly:  true,
 	}
 

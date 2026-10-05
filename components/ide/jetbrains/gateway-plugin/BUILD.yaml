@@ -13,11 +13,13 @@ packages:
       - "src/main/resources-stable/*"
       - "*.kts"
       - "*.md"
+    argdeps:
+      - publishToJBMarketplace
     env:
       - DO_PUBLISH=${publishToJBMarketplace}
     config:
       commands:
-        - [ "./gradlew", "-PpluginVersion=0.0.1-${version}", "-PgitpodProtocolProjectPath=components-gitpod-protocol-java--lib/", "-PenvironmentName=stable", "buildFromLeeway" ]
+        - [ "./gradlew", "-PpluginVersion=0.0.1-${version}", "-PgitpodProtocolProjectPath=components-gitpod-protocol-java--lib/", "-PenvironmentName=stable", "-Dgradle.user.home=/workspace/.gradle-stable", "-Dplugin.verifier.home.dir=$HOME/.cache/pluginVerifier-stable", "buildFromLeeway" ]
   - name: publish-latest
     type: generic
     deps:
@@ -32,8 +34,10 @@ packages:
       - "src/main/resources-latest/*"
       - "*.kts"
       - "*.md"
+    argdeps:
+      - publishToJBMarketplace
     env:
       - DO_PUBLISH=${publishToJBMarketplace}
     config:
       commands:
-        - [ "./gradlew", "-PpluginVersion=0.0.1-${version}", "-PgitpodProtocolProjectPath=components-gitpod-protocol-java--lib/", "-PenvironmentName=latest", "buildFromLeeway" ]
+        - [ "./gradlew", "-PpluginVersion=0.0.1-${version}", "-PgitpodProtocolProjectPath=components-gitpod-protocol-java--lib/", "-PenvironmentName=latest", "-Dgradle.user.home=/workspace/.gradle-latest", "-Dplugin.verifier.home.dir=$HOME/.cache/pluginVerifier-latest", "buildFromLeeway" ]

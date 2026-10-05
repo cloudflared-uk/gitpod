@@ -4,15 +4,30 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { useContext } from "react";
+import React, { useContext } from "react";
 import { TelemetryData, InstallationAdminSettings } from "@gitpod/gitpod-protocol";
 import { AdminContext } from "../admin-context";
-import CheckBox from "../components/CheckBox";
+import { CheckboxInputField } from "../components/forms/CheckboxInputField";
 import { getGitpodService } from "../service/service";
 import { useEffect, useState } from "react";
 import InfoBox from "../components/InfoBox";
 import { isGitpodIo } from "../utils";
-import { PageWithAdminSubMenu } from "./PageWithAdminSubMenu";
+import { PageWithSubMenu } from "../components/PageWithSubMenu";
+import { getAdminTabs, getAdminSettingsMenu } from "./admin.routes";
+import { Heading2, Subheading } from "../components/typography/headings";
+
+export function SettingsLayout(props: { children: React.ReactNode }) {
+    return (
+        <PageWithSubMenu
+            subMenu={getAdminSettingsMenu()}
+            title="Admin"
+            subtitle="Configure and manage instance settings."
+            tabs={getAdminTabs()}
+        >
+            {props.children}
+        </PageWithSubMenu>
+    );
+}
 
 export default function Settings() {
     const { adminSettings, setAdminSettings } = useContext(AdminContext);
@@ -29,6 +44,7 @@ export default function Settings() {
             const setting = await getGitpodService().server.adminGetSettings();
             setAdminSettings(setting);
         })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const actuallySetTelemetryPrefs = async (value: InstallationAdminSettings) => {
@@ -38,53 +54,46 @@ export default function Settings() {
 
     return (
         <div>
-            <PageWithAdminSubMenu title="Settings" subtitle="Configure settings for your Gitpod cluster.">
-                <h3>Usage Statistics</h3>
-                <p className="text-base text-gray-500 pb-4 max-w-2xl">
+            <SettingsLayout>
+                <Heading2>Usage Statistics</Heading2>
+                <Subheading className="pb-4 max-w-2xl">
                     We collect usage telemetry to gain insights on how you use your Gitpod instance, so we can provide a
                     better overall experience.
-                </p>
+                </Subheading>
                 <p>
                     <a className="gp-link" href="https://www.gitpod.io/privacy">
                         Read our Privacy Policy
                     </a>
                 </p>
-                <CheckBox
-                    title="Enable usage telemetry"
-                    desc={
-                        <span>
-                            Enable usage telemetry on your Gitpod instance. A preview of your telemetry is available
-                            below.
-                        </span>
-                    }
+                <CheckboxInputField
+                    label="Enable usage telemetry"
+                    hint="Enable usage telemetry on your Gitpod instance. A preview of your telemetry is available
+                        below."
                     checked={adminSettings?.sendTelemetry ?? false}
-                    onChange={(evt) =>
+                    onChange={(checked) =>
                         actuallySetTelemetryPrefs({
                             ...adminSettings,
-                            sendTelemetry: evt.target.checked,
+                            sendTelemetry: checked,
                         } as InstallationAdminSettings)
                     }
                 />
-                <CheckBox
-                    title="Include customer ID in telemetry"
-                    desc={
-                        <span>
-                            Include an optional customer ID in usage telemetry to provide individualized support.
-                        </span>
-                    }
+
+                <CheckboxInputField
+                    label="Include customer ID in telemetry"
+                    hint="Include an optional customer ID in usage telemetry to provide individualized support."
                     checked={adminSettings?.sendCustomerID ?? false}
-                    onChange={(evt) =>
+                    onChange={(checked) =>
                         actuallySetTelemetryPrefs({
                             ...adminSettings,
-                            sendCustomerID: evt.target.checked,
+                            sendCustomerID: checked,
                         } as InstallationAdminSettings)
                     }
                 />
-                <h3 className="mt-4">Telemetry preview</h3>
+                <Heading2 className="mt-4">Telemetry preview</Heading2>
                 <InfoBox>
                     <pre>{JSON.stringify(telemetryData, null, 2)}</pre>
                 </InfoBox>
-            </PageWithAdminSubMenu>
+            </SettingsLayout>
         </div>
     );
 }

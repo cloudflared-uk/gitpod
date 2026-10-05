@@ -70,7 +70,7 @@ pod:
     - name: MYSQL_TCP_PORT
       value: 23306
   - name: build
-    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:mads-leeway-v0.7.3.4
+    image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:kylos101-prebuild-jam-gha.5832
     workingDir: /workspace
     imagePullPolicy: IfNotPresent
     resources:
@@ -115,6 +115,8 @@ pod:
     #   mountPath: /mnt/secrets/github-ssh-key
     #   readOnly: true
     env:
+    - name: DB_HOST
+      value: 127.0.0.1
     - name: LEEWAY_WORKSPACE_ROOT
       value: /workspace
     - name: LEEWAY_REMOTE_CACHE_BUCKET
