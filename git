@@ -1,0 +1,6 @@
+cd /path/to/gitpod
+git rm -r --cached .claude 2>/dev/null || true
+rm -rf .claude
+git add -A
+git commit -m "Remove Claude config"
+git push origin HEAD
