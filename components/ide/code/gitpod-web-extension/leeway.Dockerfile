@@ -1,7 +1,7 @@
 # Copyright (c) 2020 Gitpod GmbH. All rights reserved.
 # Licensed under the GNU Affero General Public License (AGPL).
 # See License.AGPL.txt in the project root for license information.
-FROM node:18 as builder
+FROM node:22.22.0 as builder
 
 ARG CODE_EXTENSION_COMMIT
 
@@ -18,7 +18,8 @@ WORKDIR /gitpod-code-web
 RUN yarn --frozen-lockfile --network-timeout 180000
 
 # update package.json
-RUN setSegmentKey="setpath([\"segmentKey\"]; \"untrusted-dummy-key\")" && \
+RUN cd gitpod-web && \
+    setSegmentKey="setpath([\"segmentKey\"]; \"untrusted-dummy-key\")" && \
     jqCommands="${setSegmentKey}" && \
     cat package.json | jq "${jqCommands}" > package.json.tmp && \
     mv package.json.tmp package.json

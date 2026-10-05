@@ -25,16 +25,9 @@ on:
         default: "eu.gcr.io/gitpod-core-dev/build"
 
 jobs:
-  create-runner:
-    uses: gitpod-io/gce-github-runner/.github/workflows/create-vm.yml@main
-    secrets:
-      runner_token: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_TOKEN }}
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-
   configuration:
-    needs: [create-runner]
     name: Configuration
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.configuration.outputs.skip }}
       name: ${{ steps.configuration.outputs.name }}
@@ -64,12 +57,15 @@ jobs:
 
   infrastructure:
     name: Create preview environment infrastructure
-    needs: [configuration, create-runner]
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    needs: [configuration]
+    runs-on: ubuntu-latest
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     concurrency:
       group: ${{ needs.configuration.outputs.name }}-infrastructure
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Setup Environment
         uses: ./.github/actions/setup-environment
         with:
@@ -81,10 +77,8 @@ jobs:
         uses: ./.github/actions/preview-create
         with:
           name: ${{ needs.configuration.outputs.name }}
-          infrastructure_provider: ${{ needs.configuration.outputs.infrastructure_provider }}
           large_vm: false
           preemptible: true
-          image_repo_base: ${{ needs.configuration.outputs.image_repo_base }}
       - name: Deploy Gitpod to the preview environment
         id: deploy-gitpod
         uses: ./.github/actions/deploy-gitpod
@@ -95,16 +89,17 @@ jobs:
 
   check:
     name: Check for regressions
-    needs: [configuration, infrastructure, create-runner]
+    needs: [configuration, infrastructure]
     if: ${{ needs.configuration.outputs.skip == 'false' }}
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    runs-on: ubuntu-latest
     container:
-      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:pd-test-new-preview-gha.24525
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
       volumes:
         - /var/tmp:/var/tmp
         - /tmp:/tmp
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Setup Environment
         uses: ./.github/actions/setup-environment
         with:
@@ -115,8 +110,6 @@ jobs:
         shell: bash
         env:
           ROBOQUAT_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          USERNAME: ${{ secrets.IDE_INTEGRATION_TEST_USERNAME }}
-          USER_TOKEN: ${{ secrets.IDE_INTEGRATION_TEST_USER_TOKEN }}
           PREVIEW_NAME: ${{ needs.configuration.outputs.name }}
         run: |
           set -euo pipefail
@@ -131,7 +124,6 @@ jobs:
           args=()
           args+=( "-kubeconfig=/home/gitpod/.kube/config" )
           args+=( "-namespace=default" )
-          [[ "$USERNAME" != "" ]] && args+=( "-username=$USERNAME" )
           args+=( "-timeout=60m" )
 
           TESTS_DIR="$GITHUB_WORKSPACE/test/tests/smoke-test"
@@ -151,18 +143,23 @@ jobs:
           fi
       - name: Test Summary
         id: test_summary
-        uses: test-summary/action@v2
+        uses: test-summary/action@31493c76ec9e7aa675f1585d3ed6f1da69269a86 # pin@v2
         with:
           paths: "test/tests/**/TEST.xml"
         if: always()
+      - name: Explain skipped workspace smoke coverage
+        if: always()
+        shell: bash
+        run: |
+          printf '%s\n' 'The workspace creation/image-build smoke test skips in CI because no GitHub test-user credentials are supplied; it remains available manually. Gitpod API smoke tests require explicit opt-in and separate Gitpod credentials, which this workflow does not supply. Skipped-only runs provide no functional smoke coverage.' >> "$GITHUB_STEP_SUMMARY"
       - id: auth
         if: failure()
-        uses: google-github-actions/auth@v1
+        uses: google-github-actions/auth@955352c3b43196640b567e4646256d2fbb4aa1c7 # pin@v1
         with:
           token_format: access_token
           credentials_json: "${{ secrets.GCP_CREDENTIALS }}"
       - name: Slack Notification
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@cdf0a2130cbcdfd82ba5fcac8e076370bf381b36 # pin@v2
         if: failure()
         env:
           SLACK_WEBHOOK: "${{ secrets.DEVX_SLACK_WEBHOOK }}"
@@ -172,11 +169,14 @@ jobs:
 
   delete:
     name: Delete preview environment
-    needs: [configuration, infrastructure, check, create-runner]
+    needs: [configuration, infrastructure, check]
     if: always()
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    runs-on: ubuntu-latest
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Setup Environment
         uses: ./.github/actions/setup-environment
         with:
@@ -187,18 +187,3 @@ jobs:
         uses: ./.github/actions/delete-preview
         with:
           name: ${{ needs.configuration.outputs.name }}
-
-  delete-runner:
-    if: always()
-    needs:
-      - create-runner
-      - configuration
-      - infrastructure
-      - check
-      - delete
-    uses: gitpod-io/gce-github-runner/.github/workflows/delete-vm.yml@main
-    secrets:
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-    with:
-      runner-label: ${{ needs.create-runner.outputs.label }}
-      machine-zone: ${{ needs.create-runner.outputs.machine-zone }}

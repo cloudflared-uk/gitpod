@@ -22,8 +22,10 @@ import {
     PortProtocol as WsManPortProtocol,
     DescribeClusterRequest,
     WorkspaceType,
+    InitializerMetrics,
+    InitializerMetric,
 } from "@gitpod/ws-manager/lib";
-import { TrustedValue } from "@gitpod/gitpod-protocol/lib/util/scrubbing";
+import { scrubber, TrustedValue } from "@gitpod/gitpod-protocol/lib/util/scrubbing";
 import { WorkspaceDB } from "@gitpod/gitpod-db/lib/workspace-db";
 import { log, LogContext } from "@gitpod/gitpod-protocol/lib/util/logging";
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
@@ -38,6 +40,7 @@ import { performance } from "perf_hooks";
 import { WorkspaceInstanceController } from "./workspace-instance-controller";
 import { PrebuildUpdater } from "./prebuild-updater";
 import { RedisPublisher } from "@gitpod/gitpod-db/lib";
+import { merge } from "ts-deepmerge";
 
 export const WorkspaceManagerBridgeFactory = Symbol("WorkspaceManagerBridgeFactory");
 
@@ -109,6 +112,7 @@ export class WorkspaceManagerBridge implements Disposable {
             controllerIntervalSeconds,
             this.config.controllerMaxDisconnectSeconds,
         );
+        this.disposables.push(this.workspaceInstanceController);
 
         const tim = setInterval(() => {
             this.updateWorkspaceClasses(cluster, clientProvider);
@@ -152,6 +156,7 @@ export class WorkspaceManagerBridge implements Disposable {
         this.disposables.push(subscriber);
 
         const onReconnect = (ctx: TraceContext, s: WorkspaceStatus[]) => {
+            log.info("ws-manager subscriber reconnected", logPayload);
             s.forEach((sx) => this.queueMessagesByInstanceId(ctx, sx));
         };
         const onStatusUpdate = (ctx: TraceContext, s: WorkspaceStatus) => {
@@ -191,7 +196,7 @@ export class WorkspaceManagerBridge implements Disposable {
     ) {
         const start = performance.now();
         const status = rawStatus.toObject();
-        log.info("Handling WorkspaceStatus update", filterStatus(status));
+        log.info("Handling WorkspaceStatus update", { status: new TrustedValue(filterStatus(status)) });
 
         if (!status.spec || !status.metadata || !status.conditions) {
             log.warn("Received invalid status update", status);
@@ -314,6 +319,11 @@ export class WorkspaceManagerBridge implements Disposable {
             }
             instance.status.conditions.pullingImages = toBool(status.conditions.pullingImages!);
             instance.status.conditions.deployed = toBool(status.conditions.deployed);
+            if (!instance.deployedTime && instance.status.conditions.deployed) {
+                // This is the first time we see the workspace pod being deployed.
+                // Like all other timestamps, it's set when bridge observes it, not when it actually happened (which only ws-manager could decide).
+                instance.deployedTime = new Date().toISOString();
+            }
             instance.status.conditions.timeout = status.conditions.timeout;
             instance.status.conditions.firstUserActivity = mapFirstUserActivity(
                 rawStatus.getConditions()!.getFirstUserActivity(),
@@ -325,6 +335,15 @@ export class WorkspaceManagerBridge implements Disposable {
             instance.status.podName = instance.status.podName || status.runtime?.podName;
             instance.status.nodeIp = instance.status.nodeIp || status.runtime?.nodeIp;
             instance.status.ownerToken = status.auth!.ownerToken;
+            // TODO(gpl): fade this our in favor of only using DBWorkspaceInstanceMetrics
+            instance.status.metrics = {
+                image: {
+                    totalSize: instance.status.metrics?.image?.totalSize || status.metadata.metrics?.image?.totalSize,
+                    workspaceImageSize:
+                        instance.status.metrics?.image?.workspaceImageSize ||
+                        status.metadata.metrics?.image?.workspaceImageSize,
+                },
+            };
 
             let lifecycleHandler: (() => Promise<void>) | undefined;
             switch (status.phase) {
@@ -392,10 +411,18 @@ export class WorkspaceManagerBridge implements Disposable {
 
             span.setTag("after", JSON.stringify(instance));
 
+            await this.workspaceDB.trace(ctx).storeInstance(instance);
+
             // now notify all prebuild listeners about updates - and update DB if needed
             await this.prebuildUpdater.updatePrebuiltWorkspace({ span }, userId, status);
 
-            await this.workspaceDB.trace(ctx).storeInstance(instance);
+            // store metrics
+            const instanceMetrics = mapInstanceMetrics(status);
+            if (instanceMetrics) {
+                await this.workspaceDB
+                    .trace(ctx)
+                    .updateMetrics(instance.id, instanceMetrics, mergeWorkspaceInstanceMetrics);
+            }
 
             // cleanup
             // important: call this after the DB update
@@ -455,11 +482,11 @@ const mapPortProtocol = (protocol: WsManPortProtocol): PortProtocol => {
 export const filterStatus = (status: WorkspaceStatus.AsObject): Partial<WorkspaceStatus.AsObject> => {
     return {
         id: status.id,
-        metadata: status.metadata,
+        metadata: scrubber.scrub(status.metadata),
         phase: status.phase,
         message: status.message,
-        conditions: new TrustedValue(status.conditions).value,
-        runtime: new TrustedValue(status.runtime).value,
+        conditions: status.conditions,
+        runtime: status.runtime,
     };
 };
 
@@ -486,4 +513,65 @@ function toWorkspaceType(type: WorkspaceType): protocol.WorkspaceType {
             return "prebuild";
     }
     throw new Error("invalid WorkspaceType: " + type);
+}
+
+function mergeWorkspaceInstanceMetrics(
+    current: protocol.WorkspaceInstanceMetrics,
+    update: protocol.WorkspaceInstanceMetrics,
+): protocol.WorkspaceInstanceMetrics {
+    const merged = merge.withOptions({ mergeArrays: false, allowUndefinedOverrides: false }, current, update);
+    return merged;
+}
+
+function mapInstanceMetrics(status: WorkspaceStatus.AsObject): protocol.WorkspaceInstanceMetrics | undefined {
+    let result: protocol.WorkspaceInstanceMetrics | undefined = undefined;
+
+    if (status.metadata?.metrics?.image) {
+        result = result || {};
+        result.image = {
+            totalSize: status.metadata.metrics.image.totalSize,
+            workspaceImageSize: status.metadata.metrics.image.workspaceImageSize,
+        };
+    }
+    if (status.initializerMetrics) {
+        result = result || {};
+        result.initializerMetrics = mapInitializerMetrics(status.initializerMetrics);
+    }
+
+    return result;
+}
+
+function mapInitializerMetrics(metrics: InitializerMetrics.AsObject): protocol.InitializerMetrics {
+    const result: protocol.InitializerMetrics = {};
+    if (metrics.git) {
+        result.git = mapInitializerMetric(metrics.git);
+    }
+    if (metrics.fileDownload) {
+        result.fileDownload = mapInitializerMetric(metrics.fileDownload);
+    }
+    if (metrics.snapshot) {
+        result.snapshot = mapInitializerMetric(metrics.snapshot);
+    }
+    if (metrics.backup) {
+        result.backup = mapInitializerMetric(metrics.backup);
+    }
+    if (metrics.prebuild) {
+        result.prebuild = mapInitializerMetric(metrics.prebuild);
+    }
+    if (metrics.composite) {
+        result.composite = mapInitializerMetric(metrics.composite);
+    }
+
+    return result;
+}
+
+function mapInitializerMetric(metric: InitializerMetric.AsObject | undefined): protocol.InitializerMetric | undefined {
+    if (!metric || !metric.duration) {
+        return undefined;
+    }
+
+    return {
+        duration: metric.duration.seconds * 1000 + metric.duration.nanos / 1000000,
+        size: metric.size,
+    };
 }

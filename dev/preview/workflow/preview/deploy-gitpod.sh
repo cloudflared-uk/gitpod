@@ -24,7 +24,7 @@ GITPOD_IMAGE_PULL_SECRET_NAME="image-pull-secret";
 GITPOD_PROXY_SECRET_NAME="proxy-config-certificates";
 GITPOD_ANALYTICS="${GITPOD_ANALYTICS:-}"
 GITPOD_WORKSPACE_FEATURE_FLAGS="${GITPOD_WORKSPACE_FEATURE_FLAGS:-}"
-GITPOD_WITH_DEDICATED_EMU="${GITPOD_WITH_DEDICATED_EMU:-false}"
+GITPOD_WITH_DEDICATED_EMU="${GITPOD_WITH_DEDICATED_EMU:-true}"
 PREVIEW_GCP_PROJECT="gitpod-dev-preview"
 
 
@@ -208,6 +208,13 @@ yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[1].descr
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[1].powerups "2"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[1].credits.perMinute "0.1666666667"
 
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[+].id "g1-large"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[2].category "GENERAL PURPOSE"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[2].displayName "Large"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[2].description "Large workspace class (50GB disk)"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[2].powerups "3"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.workspaceClasses[2].credits.perMinute "0.5"
+
 # create two workspace classes (g1-standard and g1-small) in ws-manager configmap
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-standard"].name "g1-standard"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-standard"].resources.requests.cpu "100m"
@@ -221,6 +228,11 @@ yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-small"].re
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-small"].resources.limits.storage "5Gi"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-small"].resources.limits.ephemeral-storage "5Gi"
 
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-large"].name "g1-large"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-large"].resources.requests.cpu "100m"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-large"].resources.requests.memory "16Gi"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-large"].resources.limits.storage "50Gi"
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.classes["g1-large"].resources.limits.ephemeral-storage "50Gi"
 #
 # configureObjectStorage
 #
@@ -273,7 +285,7 @@ fi
 #
 if [[ "${GITPOD_WITH_DEDICATED_EMU}" == "true" ]]
 then
-  yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.server.isSingleOrgInstallation "true"
+  yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.server.isDedicatedInstallation "true"
 fi
 
 #
@@ -446,6 +458,19 @@ yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.networkLimits.enabled 
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.networkLimits.enforce "true"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.networkLimits.connectionsPerMinute "3000"
 yq w -i "${INSTALLER_CONFIG_PATH}" experimental.workspace.networkLimits.bucketSize "3000"
+
+#
+# Enable GCP profiling in server
+#
+yq w -i "${INSTALLER_CONFIG_PATH}" experimental.webapp.server.gcpProfilerEnabled "true"
+
+#
+# Enable agent-smith filesystem scanning
+# (uncomment if needed, we don't use agent-smith by default in previews)
+# yq w -i "${INSTALLER_CONFIG_PATH}" experimental.agentsmith.filesystemScanning.enabled "true"
+# yq w -i "${INSTALLER_CONFIG_PATH}" experimental.agentsmith.filesystemScanning.scanInterval "5m"
+# yq w -i "${INSTALLER_CONFIG_PATH}" experimental.agentsmith.filesystemScanning.maxFileSize "1024"
+# yq w -i "${INSTALLER_CONFIG_PATH}" experimental.agentsmith.filesystemScanning.workingArea "/mnt/workingarea-mk2"
 
 log_success "Generated config at $INSTALLER_CONFIG_PATH"
 

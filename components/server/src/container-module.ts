@@ -45,6 +45,7 @@ import { HostContainerMapping } from "./auth/host-container-mapping";
 import { HostContextProvider, HostContextProviderFactory } from "./auth/host-context-provider";
 import { HostContextProviderImpl } from "./auth/host-context-provider-impl";
 import { AuthJWT, SignInJWT } from "./auth/jwt";
+import { NonceService } from "./auth/nonce-service";
 import { LoginCompletionHandler } from "./auth/login-completion-handler";
 import { VerificationService } from "./auth/verification-service";
 import { InstallationService } from "./auth/installation-service";
@@ -55,7 +56,7 @@ import { SpiceDBClientProvider, spiceDBConfigFromEnv } from "./authorization/spi
 import { createSpiceDBAuthorizer } from "./authorization/spicedb-authorizer";
 import { BillingModes } from "./billing/billing-mode";
 import { EntitlementService, EntitlementServiceImpl } from "./billing/entitlement-service";
-import { EntitlementServiceUBP } from "./billing/entitlement-service-ubp";
+import { EntitlementServiceUBP, LazyOrganizationService } from "./billing/entitlement-service-ubp";
 import { StripeService } from "./billing/stripe-service";
 import { CodeSyncService } from "./code-sync/code-sync-service";
 import { Config, ConfigFile } from "./config";
@@ -71,6 +72,7 @@ import { WebhookEventGarbageCollector } from "./jobs/webhook-gc";
 import { WorkspaceGarbageCollector } from "./jobs/workspace-gc";
 import { LinkedInService } from "./linkedin-service";
 import { LivenessController } from "./liveness/liveness-controller";
+import { StartupController } from "./liveness/startup-controller";
 import { RedisSubscriber } from "./messaging/redis-subscriber";
 import { MonitoringEndpointsApp } from "./monitoring-endpoints";
 import { OAuthController } from "./oauth-server/oauth-controller";
@@ -86,7 +88,7 @@ import { GitLabApp } from "./prebuilds/gitlab-app";
 import { IncrementalWorkspaceService } from "./prebuilds/incremental-workspace-service";
 import { PrebuildManager } from "./prebuilds/prebuild-manager";
 import { PrebuildStatusMaintainer } from "./prebuilds/prebuilt-status-maintainer";
-import { ProjectsService } from "./projects/projects-service";
+import { LazyPrebuildManager, ProjectsService } from "./projects/projects-service";
 import { RedisMutex } from "./redis/mutex";
 import { Server } from "./server";
 import { SessionHandler } from "./session-handler";
@@ -133,6 +135,10 @@ import { ContextService } from "./workspace/context-service";
 import { RateLimitter } from "./rate-limitter";
 import { AnalyticsController } from "./analytics-controller";
 import { InstallationAdminCleanup } from "./jobs/installation-admin-cleanup";
+import { AuditLogService } from "./audit/AuditLogService";
+import { AuditLogGarbageCollectorJob } from "./jobs/auditlog-gc";
+import { ProbesApp } from "./liveness/probes";
+import { ReadinessController } from "./liveness/readiness-controller";
 
 export const productionContainerModule = new ContainerModule(
     (bind, unbind, isBound, rebind, unbindAsync, onActivation, onDeactivation) => {
@@ -178,13 +184,21 @@ export const productionContainerModule = new ContainerModule(
 
         bind(ContextService).toSelf().inSingletonScope();
 
+        bind(AuditLogService).toSelf().inSingletonScope();
+
         bind(GitpodServerImpl).toSelf();
         bind(WebsocketConnectionManager)
             .toDynamicValue((ctx) => {
                 const serverFactory = () => ctx.container.get<GitpodServerImpl>(GitpodServerImpl);
                 const hostContextProvider = ctx.container.get<HostContextProvider>(HostContextProvider);
                 const config = ctx.container.get<Config>(Config);
-                return new WebsocketConnectionManager(serverFactory, hostContextProvider, config.rateLimiter);
+                const auditLogService = ctx.container.get<AuditLogService>(AuditLogService);
+                return new WebsocketConnectionManager(
+                    serverFactory,
+                    hostContextProvider,
+                    config.rateLimiter,
+                    auditLogService,
+                );
             })
             .inSingletonScope();
 
@@ -230,7 +244,11 @@ export const productionContainerModule = new ContainerModule(
         bind(IWorkspaceManagerClientCallMetrics).toService(IClientCallMetrics);
 
         bind(WorkspaceDownloadService).toSelf().inSingletonScope();
+
+        bind(ProbesApp).toSelf().inSingletonScope();
         bind(LivenessController).toSelf().inSingletonScope();
+        bind(StartupController).toSelf().inSingletonScope();
+        bind(ReadinessController).toSelf().inSingletonScope();
 
         bind(OneTimeSecretServer).toSelf().inSingletonScope();
 
@@ -267,6 +285,11 @@ export const productionContainerModule = new ContainerModule(
         bind(HeadlessLogController).toSelf().inSingletonScope();
 
         bind(OrganizationService).toSelf().inSingletonScope();
+        bind(LazyOrganizationService).toFactory((ctx) => {
+            return () => {
+                return ctx.container.get<OrganizationService>(OrganizationService);
+            };
+        });
         bind(ProjectsService).toSelf().inSingletonScope();
         bind(ScmService).toSelf().inSingletonScope();
 
@@ -300,7 +323,7 @@ export const productionContainerModule = new ContainerModule(
                         "*": {
                             retryBaseDelayMs: 200,
                             retryMaxAttempts: 15,
-                        },
+                        } as any,
                     });
             })
             .inSingletonScope();
@@ -344,8 +367,15 @@ export const productionContainerModule = new ContainerModule(
 
         bind(AuthJWT).toSelf().inSingletonScope();
         bind(SignInJWT).toSelf().inSingletonScope();
+        bind(NonceService).toSelf().inSingletonScope();
 
         bind(PrebuildManager).toSelf().inSingletonScope();
+        bind(LazyPrebuildManager).toFactory((ctx) => {
+            return () => {
+                const prebuildManager = ctx.container.get<PrebuildManager>(PrebuildManager);
+                return prebuildManager;
+            };
+        });
         bind(GithubApp).toSelf().inSingletonScope();
         bind(GithubAppRules).toSelf().inSingletonScope();
         bind(PrebuildStatusMaintainer).toSelf().inSingletonScope();
@@ -364,6 +394,7 @@ export const productionContainerModule = new ContainerModule(
         bind(BillingModes).toSelf().inSingletonScope();
 
         // Periodic jobs
+        bind(AuditLogGarbageCollectorJob).toSelf().inSingletonScope();
         bind(WorkspaceGarbageCollector).toSelf().inSingletonScope();
         bind(TokenGarbageCollector).toSelf().inSingletonScope();
         bind(WebhookEventGarbageCollector).toSelf().inSingletonScope();
@@ -390,9 +421,9 @@ export const productionContainerModule = new ContainerModule(
         bind<DefaultWorkspaceImageValidator>(DefaultWorkspaceImageValidator)
             .toDynamicValue((ctx) =>
                 // lazy load to avoid circular dependency
-                async (userId: string, imageRef: string) => {
+                async (userId: string, imageRef: string, organizationId?: string) => {
                     const user = await ctx.container.get(UserService).findUserById(userId, userId);
-                    await ctx.container.get(WorkspaceService).validateImageRef({}, user, imageRef);
+                    await ctx.container.get(WorkspaceService).validateImageRef({}, user, imageRef, organizationId);
                 },
             )
             .inSingletonScope();

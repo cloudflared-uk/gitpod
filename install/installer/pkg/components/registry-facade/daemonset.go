@@ -72,7 +72,6 @@ func daemonset(ctx *common.RenderContext) ([]runtime.Object, error) {
 		hashObj = append(hashObj, objs...)
 	}
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(hashObj, nil)
 	if err != nil {
 		return nil, err
@@ -189,6 +188,11 @@ func daemonset(ctx *common.RenderContext) ([]runtime.Object, error) {
 					RestartPolicy:                 corev1.RestartPolicyAlways,
 					TerminationGracePeriodSeconds: pointer.Int64(30),
 					InitContainers:                initContainers,
+					Tolerations: []corev1.Toleration{
+						{
+							Operator: "Exists",
+						},
+					},
 					Containers: []corev1.Container{{
 						Name:            Component,
 						Image:           ctx.ImageName(ctx.Config.Repository, Component, ctx.VersionManifest.Components.RegistryFacade.Version),

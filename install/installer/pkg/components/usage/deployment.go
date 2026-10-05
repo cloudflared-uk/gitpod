@@ -64,7 +64,6 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		return nil
 	})
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(configmap(ctx))
 	if err != nil {
 		return nil, err
@@ -153,6 +152,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						},
 							*common.KubeRBACProxyContainerWithConfig(ctx),
 						},
+						Tolerations: common.WithTolerationWorkspaceComponentNotReady(ctx),
 					},
 				},
 			},

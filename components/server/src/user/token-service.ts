@@ -18,7 +18,6 @@ import {
     reportScmTokenRefreshRequest,
     scmTokenRefreshLatencyHistogram,
 } from "../prometheus-metrics";
-import { getExperimentsClientForBackend } from "@gitpod/gitpod-protocol/lib/experiments/configcat-server";
 
 @injectable()
 export class TokenService implements TokenProvider {
@@ -28,7 +27,7 @@ export class TokenService implements TokenProvider {
      *
      * The default lifetime of a token if not specified otherwise.
      * Atm we only specify a different lifetime on workspace starts (for the token we pass to "git clone" during content init).
-     * Also, this value is relevant for "opportunistic token refreshes" (enabled for BitBucket only atm): It's the time we mark a token as "reserved" (= do not opportunistically refresh it).
+     * Also, this value is relevant for "opportunistic token refreshes" (enabled for Bitbucket only atm): It's the time we mark a token as "reserved" (= do not opportunistically refresh it).
      */
     static readonly DEFAULT_LIFETIME = 5;
 
@@ -94,11 +93,9 @@ export class TokenService implements TokenProvider {
                     const { authProvider } = this.hostContextProvider.get(host)!;
                     if (isValidUntil(token, requestedLifetimeDate)) {
                         const doOpportunisticRefresh =
-                            (await isOpportunisticTokenRefreshEnabled(userId)) &&
-                            !!authProvider.requiresOpportunisticRefresh &&
-                            authProvider.requiresOpportunisticRefresh();
+                            !!authProvider.requiresOpportunisticRefresh && authProvider.requiresOpportunisticRefresh();
                         if (!doOpportunisticRefresh) {
-                            // No opportunistic refresh? Update reserveation and we are done.
+                            // No opportunistic refresh? Update reservation and we are done.
                             await updateReservation(tokenEntry.uid, token, requestedLifetimeDate);
                             reportScmTokenRefreshRequest(host, opportunisticRefresh, "still_valid");
                             return token;
@@ -125,9 +122,10 @@ export class TokenService implements TokenProvider {
                     // Perform actual refresh
                     const stopTimer = scmTokenRefreshLatencyHistogram.startTimer({ host });
                     try {
-                        return await authProvider.refreshToken(user, requestedLifetimeDate);
-                    } finally {
+                        const result = await authProvider.refreshToken(user, requestedLifetimeDate);
                         reportScmTokenRefreshRequest(host, opportunisticRefresh, "success");
+                        return result;
+                    } finally {
                         stopTimer({ host });
                     }
                 },
@@ -200,14 +198,6 @@ export class TokenService implements TokenProvider {
         }
         return hostContext.authProvider.authProviderId;
     }
-}
-
-export async function isOpportunisticTokenRefreshEnabled(userId: string): Promise<boolean> {
-    return getExperimentsClientForBackend().getValueAsync("opportunistic_token_refresh", false, {
-        user: {
-            id: userId,
-        },
-    });
 }
 
 function nowPlusMins(mins: number): Date {

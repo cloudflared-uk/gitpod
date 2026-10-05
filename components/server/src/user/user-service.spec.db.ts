@@ -8,11 +8,11 @@ import { Experiments } from "@gitpod/gitpod-protocol/lib/experiments/configcat-s
 import * as chai from "chai";
 import "mocha";
 import { Container } from "inversify";
-import { createTestContainer, withTestCtx } from "../test/service-testing-container-module";
+import { createTestContainer } from "../test/service-testing-container-module";
 import { BUILTIN_INSTLLATION_ADMIN_USER_ID, TypeORM } from "@gitpod/gitpod-db/lib";
 import { resetDB } from "@gitpod/gitpod-db/lib/test/reset-db";
 import { OrganizationService } from "../orgs/organization-service";
-import { Authorizer, SYSTEM_USER } from "../authorization/authorizer";
+import { Authorizer } from "../authorization/authorizer";
 import { UserService } from "./user-service";
 import { Organization, User } from "@gitpod/gitpod-protocol";
 import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
@@ -33,16 +33,13 @@ describe("UserService", async () => {
 
     beforeEach(async () => {
         container = createTestContainer();
-        Experiments.configureTestingClient({
-            centralizedPermissions: true,
-        });
+        Experiments.configureTestingClient({});
         userService = container.get<UserService>(UserService);
         auth = container.get(Authorizer);
         orgService = container.get<OrganizationService>(OrganizationService);
         org = await orgService.createOrganization(BUILTIN_INSTLLATION_ADMIN_USER_ID, "myOrg");
-        const invite = await orgService.getOrCreateInvite(BUILTIN_INSTLLATION_ADMIN_USER_ID, org.id);
         // first not builtin user join an org will be an owner
-        owner = await userService.createUser({
+        owner = await orgService.createOrgOwnedUser({
             organizationId: org.id,
             identity: {
                 authId: "foo",
@@ -51,9 +48,8 @@ describe("UserService", async () => {
                 primaryEmail: "yolo@yolo.com",
             },
         });
-        await withTestCtx(SYSTEM_USER, () => orgService.joinOrganization(owner.id, invite.id));
 
-        user = await userService.createUser({
+        user = await orgService.createOrgOwnedUser({
             organizationId: org.id,
             identity: {
                 authId: "foo",
@@ -62,9 +58,8 @@ describe("UserService", async () => {
                 primaryEmail: "yolo@yolo.com",
             },
         });
-        await withTestCtx(SYSTEM_USER, () => orgService.joinOrganization(user.id, invite.id));
 
-        user2 = await userService.createUser({
+        user2 = await orgService.createOrgOwnedUser({
             organizationId: org.id,
             identity: {
                 authId: "foo",
@@ -73,7 +68,6 @@ describe("UserService", async () => {
                 primaryEmail: "yolo@yolo.com",
             },
         });
-        await withTestCtx(SYSTEM_USER, () => orgService.joinOrganization(user2.id, invite.id));
 
         nonOrgUser = await userService.createUser({
             identity: {
@@ -226,8 +220,8 @@ describe("UserService", async () => {
         await expectError(ErrorCodes.PERMISSION_DENIED, userService.deleteUser(user.id, user2.id));
         // user can delete themselves
         await userService.deleteUser(user.id, user.id);
-        user = await userService.findUserById(user.id, user.id);
-        expect(user.markedDeleted).to.be.true;
+        const deleted = userService.findUserById(user.id, user.id);
+        expectError(ErrorCodes.NOT_FOUND, deleted);
 
         // org owners can delete users owned by org
         const orgOwner = await userService.createUser({
@@ -243,12 +237,12 @@ describe("UserService", async () => {
 
         await expectError(ErrorCodes.NOT_FOUND, userService.deleteUser(orgOwner.id, nonOrgUser.id));
         await userService.deleteUser(orgOwner.id, user2.id);
-        user2 = await userService.findUserById(orgOwner.id, user2.id);
-        expect(user2.markedDeleted).to.be.true;
+        const deleted2 = userService.findUserById(orgOwner.id, user2.id);
+        expectError(ErrorCodes.NOT_FOUND, deleted2);
 
         // admins can delete any user
         await userService.deleteUser(BUILTIN_INSTLLATION_ADMIN_USER_ID, nonOrgUser.id);
-        nonOrgUser = await userService.findUserById(BUILTIN_INSTLLATION_ADMIN_USER_ID, nonOrgUser.id);
-        expect(nonOrgUser.markedDeleted).to.be.true;
+        const deletedNonOrg = userService.findUserById(BUILTIN_INSTLLATION_ADMIN_USER_ID, nonOrgUser.id);
+        expectError(ErrorCodes.NOT_FOUND, deletedNonOrg);
     });
 });

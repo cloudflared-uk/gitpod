@@ -4,7 +4,7 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { WorkspaceInstance, PortVisibility, PortProtocol } from "./workspace-instance";
+import { WorkspaceInstance, PortVisibility, PortProtocol, WorkspaceInstanceMetrics } from "./workspace-instance";
 import { RoleOrPermission } from "./permission";
 import { Project } from "./teams-projects-protocol";
 import { createHash } from "crypto";
@@ -73,36 +73,6 @@ export namespace User {
 
     export function isOrganizationOwned(user: User) {
         return !!user.organizationId;
-    }
-
-    export function migrationIDESettings(user: User) {
-        if (
-            !user?.additionalData?.ideSettings ||
-            Object.keys(user.additionalData.ideSettings).length === 0 ||
-            user.additionalData.ideSettings.settingVersion === "2.0"
-        ) {
-            return;
-        }
-        const newIDESettings: IDESettings = {
-            settingVersion: "2.0",
-        };
-        const ideSettings = user.additionalData.ideSettings;
-        if (ideSettings.useDesktopIde) {
-            if (ideSettings.defaultDesktopIde === "code-desktop") {
-                newIDESettings.defaultIde = "code-desktop";
-            } else if (ideSettings.defaultDesktopIde === "code-desktop-insiders") {
-                newIDESettings.defaultIde = "code-desktop";
-                newIDESettings.useLatestVersion = true;
-            } else {
-                newIDESettings.defaultIde = ideSettings.defaultDesktopIde;
-                newIDESettings.useLatestVersion = ideSettings.useLatestVersion;
-            }
-        } else {
-            const useLatest = ideSettings.defaultIde === "code-latest";
-            newIDESettings.defaultIde = "code";
-            newIDESettings.useLatestVersion = useLatest;
-        }
-        user.additionalData.ideSettings = newIDESettings;
     }
 }
 
@@ -201,6 +171,7 @@ export type IDESettings = {
     settingVersion?: string;
     defaultIde?: string;
     useLatestVersion?: boolean;
+    preferToolbox?: boolean;
     // DEPRECATED: Use defaultIde after `settingVersion: 2.0`, no more specialify desktop or browser.
     useDesktopIde?: boolean;
     // DEPRECATED: Same with useDesktopIde.
@@ -262,7 +233,7 @@ export namespace NamedWorkspaceFeatureFlag {
     }
 }
 
-export type EnvVar = UserEnvVar | ProjectEnvVarWithValue | EnvVarWithValue;
+export type EnvVar = UserEnvVar | ProjectEnvVarWithValue | OrgEnvVarWithValue | EnvVarWithValue;
 
 export interface EnvVarWithValue {
     name: string;
@@ -271,12 +242,22 @@ export interface EnvVarWithValue {
 
 export interface ProjectEnvVarWithValue extends EnvVarWithValue {
     id?: string;
+    /** If a project-scoped env var is "censored", it is only visible in Prebuilds */
     censored: boolean;
 }
 
 export interface ProjectEnvVar extends Omit<ProjectEnvVarWithValue, "value"> {
     id: string;
     projectId: string;
+}
+
+export interface OrgEnvVarWithValue extends EnvVarWithValue {
+    id?: string;
+}
+
+export interface OrgEnvVar extends Omit<OrgEnvVarWithValue, "value"> {
+    id: string;
+    orgId: string;
 }
 
 export interface UserEnvVarValue extends EnvVarWithValue {
@@ -289,6 +270,55 @@ export interface UserEnvVar extends UserEnvVarValue {
     deleted?: boolean;
 }
 
+export namespace EnvVar {
+    export const GITPOD_IMAGE_AUTH_ENV_VAR_NAME = "GITPOD_IMAGE_AUTH";
+    /**
+     * - GITPOD_IMAGE_AUTH is documented https://www.gitpod.io/docs/configure/workspaces/workspace-image#use-a-private-docker-image
+     */
+    export const WhiteListFromReserved = [GITPOD_IMAGE_AUTH_ENV_VAR_NAME];
+
+    export function is(data: any): data is EnvVar {
+        return data.hasOwnProperty("name") && data.hasOwnProperty("value");
+    }
+
+    /**
+     * Extracts the "host:credentials" pairs from the GITPOD_IMAGE_AUTH environment variable.
+     * @param envVars
+     * @returns A map of host to credentials
+     */
+    export function getGitpodImageAuth(envVars: EnvVarWithValue[]): Map<string, string> {
+        const res = new Map<string, string>();
+        const imageAuth = envVars.find((e) => e.name === EnvVar.GITPOD_IMAGE_AUTH_ENV_VAR_NAME);
+        if (!imageAuth) {
+            return res;
+        }
+
+        const parse = (parts: string[]): { host: string; auth: string } | undefined => {
+            if (parts.some((e) => e === "")) {
+                return undefined;
+            }
+            if (parts.length === 2) {
+                return { host: parts[0], auth: parts[1] };
+            } else if (parts.length === 3) {
+                return { host: `${parts[0]}:${parts[1]}`, auth: parts[2] };
+            }
+            return undefined;
+        };
+
+        (imageAuth.value || "")
+            .split(",")
+            .map((e) => e.split(":").map((part) => part.trim()))
+            .forEach((parts) => {
+                const parsed = parse(parts);
+                if (parsed) {
+                    res.set(parsed.host, parsed.auth);
+                }
+            });
+
+        return res;
+    }
+}
+
 export namespace UserEnvVar {
     export const DELIMITER = "/";
     export const WILDCARD_ASTERISK = "*";
@@ -297,13 +327,17 @@ export namespace UserEnvVar {
     const WILDCARD_SHARP = "#"; // TODO(gpl) Where does this come from? Bc we have/had patterns as part of URLs somewhere, maybe...?
     const MIN_PATTERN_SEGMENTS = 2;
 
-    /**
-     * - GITPOD_IMAGE_AUTH is documented https://www.gitpod.io/docs/configure/workspaces/workspace-image#use-a-private-docker-image
-     */
-    export const WhiteListFromReserved = ["GITPOD_IMAGE_AUTH"];
-
     function isWildcard(c: string): boolean {
         return c === WILDCARD_ASTERISK || c === WILDCARD_SHARP;
+    }
+
+    export function is(data: any): data is UserEnvVar {
+        return (
+            EnvVar.is(data) &&
+            data.hasOwnProperty("id") &&
+            data.hasOwnProperty("userId") &&
+            data.hasOwnProperty("repositoryPattern")
+        );
     }
 
     /**
@@ -313,7 +347,7 @@ export namespace UserEnvVar {
     export function validate(variable: UserEnvVarValue): string | undefined {
         const name = variable.name;
         const pattern = variable.repositoryPattern;
-        if (!WhiteListFromReserved.includes(name) && name.startsWith("GITPOD_")) {
+        if (!EnvVar.WhiteListFromReserved.includes(name) && name.startsWith("GITPOD_")) {
             return "Name with prefix 'GITPOD_' is reserved.";
         }
         if (name.trim() === "") {
@@ -593,7 +627,7 @@ export interface Identity {
     primaryEmail?: string;
     /** This is a flag that triggers the HARD DELETION of this entity */
     deleted?: boolean;
-    // The last time this entry was touched during a signin.
+    // The last time this entry was touched during a signin. It's only set for SSO identities.
     lastSigninTime?: string;
 
     // @deprecated as no longer in use since '19
@@ -724,6 +758,12 @@ export interface Workspace {
      */
     contentDeletedTime?: string;
 
+    /**
+     * The time when the workspace is eligible for soft deletion. This is the time when the workspace
+     * is marked as softDeleted earliest.
+     */
+    deletionEligibilityTime?: string;
+
     type: WorkspaceType;
 
     basedOnPrebuildId?: string;
@@ -763,6 +803,20 @@ export namespace Workspace {
         }
         return undefined;
     }
+
+    const NAME_PREFIX = "named:";
+    export function fromWorkspaceName(name?: Workspace["description"]): string | undefined {
+        if (name?.startsWith(NAME_PREFIX)) {
+            return name.slice(NAME_PREFIX.length);
+        }
+        return undefined;
+    }
+    export function toWorkspaceName(name?: Workspace["description"]): string {
+        if (!name || name?.trim().length === 0) {
+            return "no-name";
+        }
+        return `${NAME_PREFIX}${name}`;
+    }
 }
 
 export interface GuessGitTokenScopesParams {
@@ -789,6 +843,7 @@ export interface JetBrainsConfig {
     webstorm?: JetBrainsProductConfig;
     rider?: JetBrainsProductConfig;
     clion?: JetBrainsProductConfig;
+    rustrover?: JetBrainsProductConfig;
 }
 export interface JetBrainsProductConfig {
     prebuilds?: JetBrainsPrebuilds;
@@ -823,6 +878,7 @@ export interface WorkspaceConfig {
     jetbrains?: JetBrainsConfig;
     coreDump?: CoreDumpConfig;
     ideCredentials?: string;
+    env?: { [env: string]: any };
 
     /** deprecated. Enabled by default **/
     experimentalNetwork?: boolean;
@@ -912,6 +968,8 @@ export interface PrebuiltWorkspace {
     snapshot?: string;
 }
 
+export type PrebuiltWorkspaceWithWorkspace = PrebuiltWorkspace & { workspace: Workspace };
+
 export namespace PrebuiltWorkspace {
     export function isDone(pws: PrebuiltWorkspace) {
         return (
@@ -943,7 +1001,7 @@ export interface PrebuiltWorkspaceUpdatable {
     contextUrl?: string;
 }
 
-export type PortOnOpen = "open-browser" | "open-preview" | "notify" | "ignore";
+export type PortOnOpen = "open-browser" | "open-preview" | "notify" | "ignore" | "ignore-completely";
 
 export interface PortConfig {
     port: number;
@@ -994,9 +1052,7 @@ export namespace WorkspaceImageBuild {
         maxSteps?: number;
     }
     export interface LogContent {
-        text: string;
-        upToLine?: number;
-        isDiff?: boolean;
+        data: number[]; // encode with "Array.from(UInt8Array)"", decode with "new UInt8Array(data)"
     }
     export type LogCallback = (info: StateInfo, content: LogContent | undefined) => void;
     export namespace LogLine {
@@ -1039,6 +1095,8 @@ export interface WorkspaceContext {
     normalizedContextURL?: string;
     forceCreateNewWorkspace?: boolean;
     forceImageBuild?: boolean;
+    // The context can have non-blocking warnings that should be displayed to the user.
+    warnings?: string[];
 }
 
 export namespace WorkspaceContext {
@@ -1304,6 +1362,14 @@ export interface Repository {
         // The direct parent of this fork
         parent: Repository;
     };
+    /**
+     * Optional date when the repository was last pushed to.
+     */
+    pushedAt?: string;
+    /**
+     * Optional display name (e.g. for Bitbucket)
+     */
+    displayName?: string;
 }
 
 export interface RepositoryInfo {
@@ -1341,6 +1407,7 @@ export namespace WorkspaceInstancePortsChangedEvent {
 export interface WorkspaceSession {
     workspace: Workspace;
     instance: WorkspaceInstance;
+    metrics?: WorkspaceInstanceMetrics;
 }
 export interface WorkspaceInfo {
     workspace: Workspace;
@@ -1422,16 +1489,30 @@ export interface OAuth2Config {
 }
 
 export namespace AuthProviderEntry {
-    export type Type = "GitHub" | "GitLab" | "Bitbucket" | "BitbucketServer" | string;
+    export type Type = "GitHub" | "GitLab" | "Bitbucket" | "BitbucketServer" | "AzureDevOps" | string;
     export type Status = "pending" | "verified";
+
+    /**
+     * Some auth providers require additional configuration like Azure DevOps.
+     */
+    export interface OAuth2CustomConfig {
+        /**
+         * The URL to the authorize endpoint of the provider.
+         */
+        authorizationUrl?: string;
+        /**
+         * The URL to the oauth token endpoint of the provider.
+         */
+        tokenUrl?: string;
+    }
     export type NewEntry = Pick<AuthProviderEntry, "ownerId" | "host" | "type"> & {
         clientId?: string;
         clientSecret?: string;
-    };
+    } & OAuth2CustomConfig;
     export type UpdateEntry = Pick<AuthProviderEntry, "id" | "ownerId"> & {
         clientId?: string;
         clientSecret?: string;
-    };
+    } & OAuth2CustomConfig;
     export type NewOrgEntry = NewEntry & {
         organizationId: string;
     };
@@ -1439,8 +1520,8 @@ export namespace AuthProviderEntry {
         clientId?: string;
         clientSecret?: string;
         organizationId: string;
-    };
-    export type UpdateOAuth2Config = Pick<OAuth2Config, "clientId" | "clientSecret">;
+    } & OAuth2CustomConfig;
+    export type UpdateOAuth2Config = Pick<OAuth2Config, "clientId" | "clientSecret"> & OAuth2CustomConfig;
     export function redact(entry: AuthProviderEntry): AuthProviderEntry {
         return {
             ...entry,
@@ -1453,9 +1534,7 @@ export namespace AuthProviderEntry {
 }
 
 export interface Configuration {
-    readonly daysBeforeGarbageCollection: number;
-    readonly garbageCollectionStartDate: number;
-    readonly isSingleOrgInstallation: boolean;
+    readonly isDedicatedInstallation: boolean;
 }
 
 export interface StripeConfig {

@@ -6,7 +6,7 @@
 
 import { TraceContext } from "@gitpod/gitpod-protocol/lib/util/tracing";
 import { GetWorkspacesRequest } from "@gitpod/ws-manager/lib";
-import { DisposableCollection, RunningWorkspaceInfo, WorkspaceInstance } from "@gitpod/gitpod-protocol";
+import { Disposable, DisposableCollection, RunningWorkspaceInfo, WorkspaceInstance } from "@gitpod/gitpod-protocol";
 import { inject, injectable } from "inversify";
 import { Configuration } from "./config";
 import { log, LogContext } from "@gitpod/gitpod-protocol/lib/util/logging";
@@ -20,10 +20,11 @@ import { repeat } from "@gitpod/gitpod-protocol/lib/util/repeat";
 import { PrebuildUpdater } from "./prebuild-updater";
 import { RedisPublisher } from "@gitpod/gitpod-db/lib";
 import { durationLongerThanSeconds } from "@gitpod/gitpod-protocol/lib/util/timeutil";
+import { scrubber } from "@gitpod/gitpod-protocol/lib/util/scrubbing";
 
 export const WorkspaceInstanceController = Symbol("WorkspaceInstanceController");
 
-export interface WorkspaceInstanceController {
+export interface WorkspaceInstanceController extends Disposable {
     start(
         workspaceClusterName: string,
         clientProvider: ClientProvider,
@@ -47,7 +48,7 @@ export interface WorkspaceInstanceController {
  * !!! It's statful, so make sure it's bound in transient mode !!!
  */
 @injectable()
-export class WorkspaceInstanceControllerImpl implements WorkspaceInstanceController {
+export class WorkspaceInstanceControllerImpl implements WorkspaceInstanceController, Disposable {
     constructor(
         @inject(Configuration) private readonly config: Configuration,
         @inject(Metrics) private readonly prometheusExporter: Metrics,
@@ -286,17 +287,20 @@ export class WorkspaceInstanceControllerImpl implements WorkspaceInstanceControl
 
         try {
             await this.userDB.trace({ span }).deleteGitpodTokensNamedLike(ownerUserID, `${instance.id}-%`);
+            // Scrub properties that might contain sensitive data like URLs
+            const scrubbedProperties = scrubber.scrub({
+                instanceId: instance.id,
+                workspaceId: instance.workspaceId,
+                stoppingTime: new Date(instance.stoppingTime!),
+                conditions: instance.status.conditions,
+                timeout: instance.status.timeout,
+            });
+
             this.analytics.track({
                 userId: ownerUserID,
                 event: "workspace_stopped",
                 messageId: `bridge-wsstopped-${instance.id}`,
-                properties: {
-                    instanceId: instance.id,
-                    workspaceId: instance.workspaceId,
-                    stoppingTime: new Date(instance.stoppingTime!),
-                    conditions: instance.status.conditions,
-                    timeout: instance.status.timeout,
-                },
+                properties: scrubbedProperties,
                 timestamp: new Date(instance.stoppedTime!),
             });
         } catch (err) {
@@ -305,5 +309,9 @@ export class WorkspaceInstanceControllerImpl implements WorkspaceInstanceControl
         } finally {
             span.finish();
         }
+    }
+
+    public dispose() {
+        this.disposables.dispose();
     }
 }

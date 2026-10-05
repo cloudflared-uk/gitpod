@@ -1,26 +1,20 @@
 name: Code Nightly
 permissions:
   id-token: write # This is required for requesting the JWT
-  contents: read  # This is required for actions/checkout
+  contents: read # This is required for actions/checkout
 on:
   workflow_dispatch:
   schedule:
     - cron: "0 0 * * *"
 
 jobs:
-  create-runner:
-    uses: gitpod-io/gce-github-runner/.github/workflows/create-vm.yml@main
-    secrets:
-      runner_token: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_TOKEN }}
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-
   build:
-    runs-on: ${{ needs.create-runner.outputs.label }}
-    needs: [create-runner]
+    runs-on: ubuntu-latest
     container:
-      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:pd-test-new-preview-gha.24525
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - uses: ./.github/actions/setup-environment
         with:
           identity_provider: ${{ github.ref == 'refs/heads/main' && secrets.CORE_DEV_PROVIDER || secrets.DEV_PREVIEW_PROVIDER }}
@@ -32,6 +26,7 @@ jobs:
           PR_DESC: "${{ steps.pr-details.outputs.pr_body }}"
           MAIN_BRANCH: ${{ (github.head_ref || github.ref) == 'refs/heads/main' }}
           LEEWAY_REMOTE_CACHE_BUCKET: ${{ github.ref == 'refs/heads/main' && 'leeway-cache-main-c514a01' || 'leeway-cache-dev-3ac8ef5' }}
+          LEEWAY_CACHE_UPLOAD_IMMEDIATE: true
         run: |
           export LEEWAY_WORKSPACE_ROOT=$GITHUB_WORKSPACE
 
@@ -45,26 +40,14 @@ jobs:
             -DcodeCommit=$codeHeadCommit \
             -DcodeVersion=$codeVersion \
             -DcodeQuality=insider \
-            .:docker
+            .:docker-nightly
       - name: Get previous job's status
         id: lastrun
-        uses: filiptronicek/get-last-job-status@main
+        uses: filiptronicek/get-last-job-status@1c211ff20d1706ff0bc3fc8022f7bd6518b88bc4 # pin@main
       - name: Slack Notification
         if: ${{ (success() && steps.lastrun.outputs.status == 'failed') || failure() }}
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@cdf0a2130cbcdfd82ba5fcac8e076370bf381b36 # pin@v2
         env:
           SLACK_WEBHOOK: ${{ secrets.IDE_SLACK_WEBHOOK }}
           SLACK_COLOR: ${{ job.status }}
           SLACK_FOOTER: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow logs>"
-
-  delete-runner:
-    if: always()
-    needs:
-      - create-runner
-      - build
-    uses: gitpod-io/gce-github-runner/.github/workflows/delete-vm.yml@main
-    secrets:
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-    with:
-      runner-label: ${{ needs.create-runner.outputs.label }}
-      machine-zone: ${{ needs.create-runner.outputs.machine-zone }}

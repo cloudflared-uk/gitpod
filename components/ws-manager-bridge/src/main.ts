@@ -16,6 +16,7 @@ import { ClusterServiceServer } from "./cluster-service-server";
 import { BridgeController } from "./bridge-controller";
 import { AppClusterWorkspaceInstancesController } from "./app-cluster-instance-controller";
 import { redisMetricsRegistry } from "@gitpod/gitpod-db/lib";
+import { health, startHealthEndpoint } from "./healthz";
 
 log.enableJSONLogging("ws-manager-bridge", undefined, LogrusLogLevel.getFromEnv());
 installLogCountMetric();
@@ -31,6 +32,7 @@ export const start = async (container: Container) => {
     });
 
     try {
+        startHealthEndpoint();
         const db = container.get(TypeORM);
         await db.connect();
 
@@ -46,8 +48,8 @@ export const start = async (container: Container) => {
             res.send(await mergedRegistry.metrics());
         });
         const metricsPort = 9500;
-        const metricsHttpServer = metricsApp.listen(metricsPort, "localhost", () => {
-            log.info(`prometheus metrics server running on: localhost:${metricsPort}`);
+        const metricsHttpServer = metricsApp.listen(metricsPort, "127.0.0.1", () => {
+            log.info(`prometheus metrics server running on: 127.0.0.1:${metricsPort}`);
         });
 
         const debugApp = container.get<DebugApp>(DebugApp);
@@ -79,9 +81,11 @@ export const start = async (container: Container) => {
             appClusterInstanceController.dispose();
         });
         log.info("ws-manager-bridge is up and running");
+        health.isHealthy = true;
         await new Promise((rs, rj) => {});
     } catch (err) {
         log.error("Error during startup. Exiting.", err);
+        health.isHealthy = false;
         process.exit(1);
     }
 };

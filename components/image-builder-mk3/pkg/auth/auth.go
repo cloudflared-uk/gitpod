@@ -21,9 +21,11 @@ import (
 	"github.com/distribution/reference"
 	"github.com/docker/cli/cli/config/configfile"
 	"github.com/docker/docker/api/types/registry"
+	"github.com/opentracing/opentracing-go"
 	"golang.org/x/xerrors"
 
 	"github.com/gitpod-io/gitpod/common-go/log"
+	"github.com/gitpod-io/gitpod/common-go/tracing"
 	"github.com/gitpod-io/gitpod/common-go/watch"
 	"github.com/gitpod-io/gitpod/image-builder/api"
 )
@@ -277,7 +279,11 @@ type Resolver struct {
 }
 
 // ResolveRequestAuth computes the allowed authentication for a build based on its request
-func (r Resolver) ResolveRequestAuth(auth *api.BuildRegistryAuth) (authFor AllowedAuthFor) {
+func (r Resolver) ResolveRequestAuth(ctx context.Context, auth *api.BuildRegistryAuth) (authFor AllowedAuthFor) {
+	span, _ := opentracing.StartSpanFromContext(ctx, "ResolveRequestAuth")
+	var err error
+	defer tracing.FinishSpan(span, &err)
+
 	// by default we allow nothing
 	authFor = AllowedAuthForNone()
 	if auth == nil {
@@ -377,9 +383,11 @@ func (a AllowedAuthFor) additionalAuth(domain string) *Authentication {
 	dec, err := base64.StdEncoding.DecodeString(ath)
 	if err == nil {
 		segs := strings.Split(string(dec), ":")
-		if len(segs) > 1 {
-			res.Username = segs[0]
-			res.Password = strings.Join(segs[1:], ":")
+		numSegs := len(segs)
+
+		if numSegs > 1 {
+			res.Username = strings.Join(segs[:numSegs-1], ":")
+			res.Password = segs[numSegs-1]
 		}
 	} else {
 		log.Errorf("failed getting additional auth")

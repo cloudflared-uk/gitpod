@@ -20,7 +20,6 @@ import (
 func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 	labels := common.CustomizeLabel(ctx, Component, common.TypeMetaDeployment)
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(configmap(ctx))
 	if err != nil {
 		return nil, err
@@ -121,7 +120,8 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						},
 							*common.KubeRBACProxyContainerWithConfig(ctx),
 						},
-						Volumes: volumes,
+						Volumes:     volumes,
+						Tolerations: common.WithTolerationWorkspaceComponentNotReady(ctx),
 					},
 				},
 			},

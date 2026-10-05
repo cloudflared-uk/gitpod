@@ -66,7 +66,6 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		},
 	})
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(hashObj, nil)
 	if err != nil {
 		return nil, err
@@ -103,6 +102,11 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 				Name:  "WSMAN_CFG_MANAGERS",
 				Value: wsmanCfgManager,
 			},
+			// Required for node.js to pick up custom CAs
+			{
+				Name:  "NODE_EXTRA_CA_CERTS",
+				Value: common.CUSTOM_CA_MOUNT_PATH,
+			},
 		},
 	)
 
@@ -137,6 +141,16 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 						Key: "password",
 					},
 				},
+			})
+		}
+		return nil
+	})
+
+	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
+		if cfg.WebApp != nil && cfg.WebApp.Server != nil && cfg.WebApp.Server.GoogleCloudProfilerEnabled {
+			env = append(env, corev1.EnvVar{
+				Name:  "GOOGLE_CLOUD_PROFILER",
+				Value: "true",
 			})
 		}
 		return nil
@@ -354,7 +368,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 										Path: "/live",
 										Port: intstr.IntOrString{
 											Type:   intstr.Int,
-											IntVal: ContainerPort,
+											IntVal: ProbesPort,
 										},
 									},
 								},
@@ -362,35 +376,78 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								PeriodSeconds:       10,
 								FailureThreshold:    6,
 							},
+							// StartupProbe, as we are only interested in controlling the startup of the server pod, and
+							// not interferring with the readiness afterwards.
+							StartupProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/startup",
+										Port: intstr.IntOrString{
+											Type:   intstr.Int,
+											IntVal: ProbesPort,
+										},
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       10,
+								FailureThreshold:    18, // try for 180 seconds, then the Pod is restarted
+							},
+							// /ready will only return false on shutdown (SIGTERM), always true otherwise
+							ReadinessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/ready",
+										Port: intstr.IntOrString{
+											Type:   intstr.Int,
+											IntVal: ProbesPort,
+										},
+									},
+								},
+								InitialDelaySeconds: 5,
+								PeriodSeconds:       5,
+								FailureThreshold:    1, // mark as "not ready" as quick as possible after receiving SIGTERM
+							},
 							SecurityContext: &corev1.SecurityContext{
 								Privileged:               pointer.Bool(false),
 								AllowPrivilegeEscalation: pointer.Bool(false),
 							},
-							Ports: []corev1.ContainerPort{{
-								Name:          ContainerPortName,
-								ContainerPort: ContainerPort,
-							}, {
-								Name:          baseserver.BuiltinMetricsPortName,
-								ContainerPort: baseserver.BuiltinMetricsPort,
-							}, {
-								Name:          InstallationAdminName,
-								ContainerPort: InstallationAdminPort,
-							}, {
-								Name:          IAMSessionPortName,
-								ContainerPort: IAMSessionPort,
-							}, {
-								Name:          DebugPortName,
-								ContainerPort: baseserver.BuiltinDebugPort,
-							}, {
-								Name:          DebugNodePortName,
-								ContainerPort: common.DebugNodePort,
-							}, {
-								Name:          GRPCAPIName,
-								ContainerPort: GRPCAPIPort,
-							}, {
-								Name:          PublicAPIName,
-								ContainerPort: PublicAPIPort,
-							},
+							Ports: []corev1.ContainerPort{
+								{
+									Name:          ContainerPortName,
+									ContainerPort: ContainerPort,
+								},
+								{
+									Name:          baseserver.BuiltinMetricsPortName,
+									ContainerPort: baseserver.BuiltinMetricsPort,
+								},
+								{
+									Name:          InstallationAdminName,
+									ContainerPort: InstallationAdminPort,
+								},
+								{
+									Name:          IAMSessionPortName,
+									ContainerPort: IAMSessionPort,
+								},
+								{
+									Name:          DebugPortName,
+									ContainerPort: baseserver.BuiltinDebugPort,
+								},
+								{
+									Name:          DebugNodePortName,
+									ContainerPort: common.DebugNodePort,
+								},
+								{
+									Name:          GRPCAPIName,
+									ContainerPort: GRPCAPIPort,
+								},
+								{
+									Name:          PublicAPIName,
+									ContainerPort: PublicAPIPort,
+								},
+								{
+									Name:          ProbesPortName,
+									ContainerPort: ProbesPort,
+								},
 							},
 							// todo(sje): do we need to cater for serverContainer.env from values.yaml?
 							Env: common.CustomizeEnvvar(ctx, Component, env),
@@ -407,6 +464,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								volumeMounts...,
 							),
 						}, *common.KubeRBACProxyContainer(ctx)},
+						Tolerations: common.WithTolerationWorkspaceComponentNotReady(ctx),
 					},
 				},
 			},

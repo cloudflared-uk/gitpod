@@ -17,7 +17,13 @@ import { Permission } from "@gitpod/gitpod-protocol/lib/permission";
 import { parseWorkspaceIdFromHostname } from "@gitpod/gitpod-protocol/lib/util/parse-workspace-id";
 import { SessionHandler } from "../session-handler";
 import { URL } from "url";
-import { getRequestingClientInfo } from "../express-util";
+import {
+    getRequestingClientInfo,
+    validateAuthorizeReturnToUrl,
+    validateLoginReturnToUrl,
+    safeFragmentRedirect,
+    getSafeReturnToParam,
+} from "../express-util";
 import { GitpodToken, GitpodTokenType, User } from "@gitpod/gitpod-protocol";
 import { HostContextProvider } from "../auth/host-context-provider";
 import { reportJWTCookieIssued } from "../prometheus-metrics";
@@ -37,6 +43,7 @@ import { UserService } from "./user-service";
 import { WorkspaceService } from "../workspace/workspace-service";
 import { runWithSubjectId } from "../util/request-context";
 import { SubjectId } from "../auth/subject-id";
+import { isUserLoginBlockedBySunset } from "../util/featureflags";
 
 export const ServerFactory = Symbol("ServerFactory");
 export type ServerFactory = () => GitpodServerImpl;
@@ -63,9 +70,22 @@ export class UserController {
         router.get("/login", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
             if (req.isAuthenticated()) {
                 log.info("(Auth) User is already authenticated.", { "login-flow": true });
+
+                // Check if authenticated user is blocked by sunset
+                const user = req.user as User;
+                if (await isUserLoginBlockedBySunset(user, this.config.isDedicatedInstallation)) {
+                    log.info("(Auth) User blocked by Classic PAYG sunset", {
+                        userId: user.id,
+                        organizationId: user.organizationId,
+                        "login-flow": true,
+                    });
+                    res.redirect(302, "https://app.ona.com/login");
+                    return;
+                }
+
                 // redirect immediately
-                const redirectTo = this.getSafeReturnToParam(req) || this.config.hostUrl.asDashboard().toString();
-                res.redirect(redirectTo);
+                const redirectTo = this.ensureSafeReturnToParam(req) || this.config.hostUrl.asDashboard().toString();
+                safeFragmentRedirect(res, redirectTo);
                 return;
             }
             const clientInfo = getRequestingClientInfo(req);
@@ -80,11 +100,11 @@ export class UserController {
             // If there is no known auth host, we need to ask the user
             const redirectToLoginPage = !req.query.host;
             if (redirectToLoginPage) {
-                const returnTo = this.getSafeReturnToParam(req);
+                const returnTo = this.ensureSafeReturnToParam(req);
                 const search = returnTo ? `returnTo=${returnTo}` : "";
                 const loginPageUrl = this.config.hostUrl.asLogin().with({ search }).toString();
                 log.info(`Redirecting to login ${loginPageUrl}`);
-                res.redirect(loginPageUrl);
+                safeFragmentRedirect(res, loginPageUrl);
                 return;
             }
 
@@ -184,12 +204,12 @@ export class UserController {
                 // Redirect the admin-user to the Org Settings page.
                 // The dashboard is expected to render the Onboading flow instead of the regular view,
                 // but if the browser is reloaded after completion of the flow, it should be fine to see the settings.
-                res.redirect("/settings", 307);
+                safeFragmentRedirect(res, "/settings", 307);
             } catch (e) {
                 log.error("Failed to sign-in as admin with OTS Token", e);
 
                 // Always redirect to an expired token page if there's an error
-                res.redirect("/error/expired-ots", 307);
+                safeFragmentRedirect(res, "/error/expired-ots", 307);
                 return;
             }
         });
@@ -213,6 +233,14 @@ export class UserController {
                 res.cookie(cookie.name, cookie.value, cookie.opts);
                 reportJWTCookieIssued();
 
+                // If returnTo was passed and it's safe, redirect to it
+                const returnTo = this.ensureSafeReturnToParam(req);
+                if (returnTo) {
+                    log.info(`Redirecting after OTS login ${returnTo}`);
+                    safeFragmentRedirect(res, returnTo);
+                    return;
+                }
+
                 res.sendStatus(200);
             }),
         );
@@ -227,7 +255,15 @@ export class UserController {
                 return;
             }
             this.ensureSafeReturnToParam(req);
-            this.authenticator.authorize(req, res, next).catch((err) => log.error("authenticator.authorize", err));
+            this.ensureSafeReturnToParamForAuthorize(req)
+                .then(() => {
+                    this.authenticator
+                        .authorize(req, res, next)
+                        .catch((err) => log.error("authenticator.authorize", err));
+                })
+                .catch((err) => {
+                    log.error("authenticator.authorize", err);
+                });
         });
         router.get("/deauthorize", (req: express.Request, res: express.Response, next: express.NextFunction) => {
             if (!User.is(req.user)) {
@@ -239,7 +275,15 @@ export class UserController {
                 return;
             }
             this.ensureSafeReturnToParam(req);
-            this.authenticator.deauthorize(req, res, next).catch((err) => log.error("authenticator.deauthorize", err));
+            this.ensureSafeReturnToParamForAuthorize(req)
+                .then(() => {
+                    this.authenticator
+                        .deauthorize(req, res, next)
+                        .catch((err) => log.error("authenticator.deauthorize", err));
+                })
+                .catch((err) => {
+                    log.error("authenticator.deauthorize", err);
+                });
         });
         router.get("/logout", async (req: express.Request, res: express.Response, next: express.NextFunction) => {
             const logContext = LogContext.from({ user: req.user, request: req });
@@ -249,31 +293,31 @@ export class UserController {
 
             // stop all running workspaces
             const user = req.user as User;
-            await runWithSubjectId(SubjectId.fromUserId(user.id), async () => {
-                if (user) {
+            if (user) {
+                await runWithSubjectId(SubjectId.fromUserId(user.id), async () => {
                     this.workspaceService
                         .stopRunningWorkspacesForUser({}, user.id, user.id, "logout", StopWorkspacePolicy.NORMALLY)
                         .catch((error) =>
                             log.error(logContext, "cannot stop workspaces on logout", { error, ...logPayload }),
                         );
-                }
 
-                // reset the FGA state
-                await this.userService.resetFgaVersion(user.id, user.id);
-            });
+                    // reset the FGA state
+                    await this.userService.resetFgaVersion(user.id, user.id);
+                });
+            }
 
-            const redirectToUrl = this.getSafeReturnToParam(req) || this.config.hostUrl.toString();
+            const redirectToUrl = this.ensureSafeReturnToParam(req) || this.config.hostUrl.toString();
 
             if (req.isAuthenticated()) {
                 req.logout();
             }
 
             // clear cookies
-            this.sessionHandler.clearSessionCookie(res, this.config);
+            this.sessionHandler.clearSessionCookie(res);
 
             // then redirect
             log.info(logContext, "(Logout) Redirecting...", { redirectToUrl, ...logPayload });
-            res.redirect(redirectToUrl);
+            safeFragmentRedirect(res, redirectToUrl);
         });
 
         router.get("/auth/jwt-cookie", this.sessionHandler.jwtSessionConvertor());
@@ -495,7 +539,7 @@ export class UserController {
                     otsExpirationTime.setMinutes(otsExpirationTime.getMinutes() + 2);
                     const ots = await this.otsServer.serve({}, token, otsExpirationTime);
 
-                    res.redirect(`http://${rt}/?ots=${encodeURI(ots.url)}`);
+                    safeFragmentRedirect(res, `http://${rt}/?ots=${encodeURI(ots.url)}`);
                 },
             );
         }
@@ -552,7 +596,7 @@ export class UserController {
     }
 
     protected async augmentLoginRequest(req: express.Request) {
-        const returnToURL = this.getSafeReturnToParam(req);
+        const returnToURL = this.ensureSafeReturnToParam(req);
         if (req.query.host) {
             // This login request points already to an auth host
             return;
@@ -594,32 +638,24 @@ export class UserController {
         }
     }
 
-    protected ensureSafeReturnToParam(req: express.Request) {
-        req.query.returnTo = this.getSafeReturnToParam(req);
+    protected ensureSafeReturnToParam(req: express.Request): string | undefined {
+        const returnTo = getSafeReturnToParam(req, (url) => validateLoginReturnToUrl(url, this.config.hostUrl));
+        req.query.returnTo = returnTo;
+        return returnTo;
     }
 
-    protected urlStartsWith(url: string, prefixUrl: string): boolean {
-        prefixUrl += prefixUrl.endsWith("/") ? "" : "/";
-        return url.toLowerCase().startsWith(prefixUrl.toLowerCase());
-    }
-
-    protected getSafeReturnToParam(req: express.Request) {
-        // @ts-ignore Type 'ParsedQs' is not assignable
-        const returnToURL: string | undefined = req.query.redirect || req.query.returnTo;
-        if (!returnToURL) {
-            log.debug("Empty redirect URL");
-            return;
+    protected async ensureSafeReturnToParamForAuthorize(req: express.Request): Promise<string | undefined> {
+        let returnTo = getSafeReturnToParam(req);
+        if (returnTo) {
+            // Always validate returnTo URL against allowlist for authorize API
+            if (!validateAuthorizeReturnToUrl(returnTo, this.config.hostUrl)) {
+                log.warn(`Invalid returnTo URL rejected for authorize: ${returnTo}`, { "login-flow": true });
+                returnTo = undefined;
+            }
         }
 
-        if (
-            this.urlStartsWith(returnToURL, this.config.hostUrl.toString()) ||
-            this.urlStartsWith(returnToURL, "https://www.gitpod.io")
-        ) {
-            return returnToURL;
-        }
-
-        log.debug("The redirect URL does not match", { query: req.query });
-        return;
+        req.query.returnTo = returnTo;
+        return returnTo;
     }
 
     private createGitpodServer(user: User, resourceGuard: ResourceAccessGuard) {

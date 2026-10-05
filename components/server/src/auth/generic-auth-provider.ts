@@ -23,7 +23,7 @@ import {
     UnconfirmedUserException,
 } from "../auth/errors";
 import { Config } from "../config";
-import { getRequestingClientInfo } from "../express-util";
+import { getRequestingClientInfo, safeFragmentRedirect } from "../express-util";
 import { TokenProvider } from "../user/token-provider";
 import { UserAuthentication } from "../user/user-authentication";
 import { AuthProviderService } from "./auth-provider-service";
@@ -37,6 +37,7 @@ import { SignInJWT } from "./jwt";
 import { UserService } from "../user/user-service";
 import { reportLoginCompleted } from "../prometheus-metrics";
 import { TrustedValue } from "@gitpod/gitpod-protocol/lib/util/scrubbing";
+import { isUserSignupBlockedBySunset } from "../util/featureflags";
 
 /**
  * This is a generic implementation of OAuth2-based AuthProvider.
@@ -287,7 +288,8 @@ export abstract class GenericAuthProvider implements AuthProvider {
         const state = request.query.state;
         if (!state) {
             log.error(cxt, `(${strategyName}) No state present on callback request.`, { clientInfo });
-            response.redirect(
+            safeFragmentRedirect(
+                response,
                 this.getSorryUrl(`No state was present on the authentication callback. Please try again.`),
             );
             return;
@@ -298,7 +300,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
             log.error(`(${strategyName}) Auth flow state is missing.`);
 
             reportLoginCompleted("failed", "git");
-            response.redirect(this.getSorryUrl(`Auth flow state is missing.`));
+            safeFragmentRedirect(response, this.getSorryUrl(`Auth flow state is missing.`));
             return;
         }
 
@@ -309,7 +311,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
                     `(${strategyName}) User is already logged in. No auth info provided. Redirecting to dashboard.`,
                     { clientInfo },
                 );
-                response.redirect(this.config.hostUrl.asDashboard().toString());
+                safeFragmentRedirect(response, this.config.hostUrl.asDashboard().toString());
                 return;
             }
         }
@@ -320,7 +322,10 @@ export abstract class GenericAuthProvider implements AuthProvider {
             reportLoginCompleted("failed_client", "git");
 
             log.error(cxt, `(${strategyName}) No session found during auth callback.`, { clientInfo });
-            response.redirect(this.getSorryUrl(`Please allow Cookies in your browser and try to log in again.`));
+            safeFragmentRedirect(
+                response,
+                this.getSorryUrl(`Please allow Cookies in your browser and try to log in again.`),
+            );
             return;
         }
 
@@ -328,7 +333,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
             reportLoginCompleted("failed", "git");
 
             log.error(cxt, `(${strategyName}) Host does not match.`, { clientInfo });
-            response.redirect(this.getSorryUrl(`Host does not match.`));
+            safeFragmentRedirect(response, this.getSorryUrl(`Host does not match.`));
             return;
         }
 
@@ -359,7 +364,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
                 authenticate(request, response, next);
             });
         } catch (error) {
-            response.redirect(this.getSorryUrl(`OAuth2 error. (${error})`));
+            safeFragmentRedirect(response, this.getSorryUrl(`OAuth2 error. (${error})`));
             return;
         }
         const [err, userOrIdentity, flowContext] = result;
@@ -427,6 +432,13 @@ export abstract class GenericAuthProvider implements AuthProvider {
             };
 
             if (VerifyResult.WithIdentity.is(flowContext)) {
+                // Check if signup is blocked by Classic PAYG sunset
+                if (await isUserSignupBlockedBySunset("anonymous", this.config.isDedicatedInstallation)) {
+                    log.info(context, `(${strategyName}) Signup blocked by Classic PAYG sunset`, logPayload);
+                    response.redirect(302, "https://app.ona.com/login");
+                    return;
+                }
+
                 log.info(context, `(${strategyName}) Creating new user and completing login.`, logPayload);
                 // There is no current session, we need to create a new user because this
                 // identity does not yet exist.
@@ -436,6 +448,16 @@ export abstract class GenericAuthProvider implements AuthProvider {
                     token: flowContext.token,
                     authUser: flowContext.authUser,
                     isBlocked: flowContext.isBlocked,
+                });
+
+                // Set all cookies used on website for visitor preferences for .gitpod.io domain if no preference exists yet
+                ["gp-analytical", "gp-necessary", "gp-targeting"].forEach((cookieName) => {
+                    if (!request.cookies[cookieName]) {
+                        response.cookie(cookieName, "true", {
+                            maxAge: 365 * 24 * 60 * 60 * 1000, //set to a year
+                            domain: "." + request.header("Host"),
+                        });
+                    }
                 });
 
                 await this.loginCompletionHandler.complete(request, response, {
@@ -461,7 +483,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
                     );
 
                     const { returnTo } = authFlow;
-                    response.redirect(returnTo);
+                    safeFragmentRedirect(response, returnTo);
                     return;
                 } else {
                     // Complete login into an existing account
@@ -526,7 +548,7 @@ export abstract class GenericAuthProvider implements AuthProvider {
                 search: "message=error:" + Buffer.from(JSON.stringify(error), "utf-8").toString("base64"),
             })
             .toString();
-        response.redirect(url);
+        safeFragmentRedirect(response, url);
     }
 
     /**

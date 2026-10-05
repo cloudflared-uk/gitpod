@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
 )
 
@@ -75,7 +76,6 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		},
 	})
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(hashObj, nil)
 	if err != nil {
 		return nil, err
@@ -87,10 +87,17 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		common.AnalyticsEnv(&ctx.Config),
 		common.DatabaseEnv(&ctx.Config),
 		common.ConfigcatEnv(ctx),
-		[]corev1.EnvVar{{
-			Name:  "WSMAN_BRIDGE_CONFIGPATH",
-			Value: "/config/ws-manager-bridge.json",
-		}},
+		[]corev1.EnvVar{
+			{
+				Name:  "WSMAN_BRIDGE_CONFIGPATH",
+				Value: "/config/ws-manager-bridge.json",
+			},
+			// Required for node.js to pick up custom CAs
+			{
+				Name:  "NODE_EXTRA_CA_CERTS",
+				Value: common.CUSTOM_CA_MOUNT_PATH,
+			},
+		},
 	))
 
 	_ = ctx.WithExperimental(func(cfg *experimental.Config) error {
@@ -198,7 +205,18 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 								},
 								volumeMounts...,
 							),
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/healthz",
+										Port: intstr.FromInt(9090),
+									},
+								},
+								InitialDelaySeconds: 15,
+								PeriodSeconds:       20,
+							},
 						}, *common.KubeRBACProxyContainer(ctx)},
+						Tolerations: common.WithTolerationWorkspaceComponentNotReady(ctx),
 					},
 				},
 			},

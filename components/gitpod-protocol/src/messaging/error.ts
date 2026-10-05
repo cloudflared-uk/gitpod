@@ -36,6 +36,10 @@ export namespace ApplicationError {
             throw e;
         }
     }
+
+    export function isUserDeletedError(e: any): boolean {
+        return hasErrorCode(e) && e.code === ErrorCodes.NOT_FOUND && e.data?.userDeleted === true;
+    }
 }
 
 export namespace ErrorCode {
@@ -98,14 +102,14 @@ export const ErrorCodes = {
     // 470 User Blocked (custom status code)
     USER_BLOCKED: 470 as const,
 
-    // 471 User Deleted (custom status code)
-    USER_DELETED: 471 as const,
-
     // 472 Terms Acceptance Required (custom status code)
     USER_TERMS_ACCEPTANCE_REQUIRED: 472 as const,
 
     // 481 Professional plan is required for this operation
     PLAN_PROFESSIONAL_REQUIRED: 481 as const,
+
+    // 482 Cell Expired
+    CELL_EXPIRED: 482 as const,
 
     // 490 Too Many Running Workspace
     TOO_MANY_RUNNING_WORKSPACES: 490 as const,

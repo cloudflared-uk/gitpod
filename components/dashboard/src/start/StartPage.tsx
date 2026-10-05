@@ -14,6 +14,9 @@ import { VerifyModal } from "./VerifyModal";
 import { useWorkspaceDefaultImageQuery } from "../data/workspaces/default-workspace-image-query";
 import { GetWorkspaceDefaultImageResponse_Source } from "@gitpod/public-api/lib/gitpod/v1/workspace_pb";
 import { ProductLogo } from "../components/ProductLogo";
+import { useIsDataOps } from "../data/featureflag-query";
+import { isGitpodIo } from "../utils";
+import { OnaBanner } from "./OnaBanner";
 
 export enum StartPhase {
     Checking = 0,
@@ -96,8 +99,17 @@ export function StartPage(props: StartPageProps) {
     const { phase, error, workspaceId } = props;
     let title = props.title || getPhaseTitle(phase, error);
     useDocumentTitle("Starting");
+    const isDataOps = useIsDataOps();
+
     return (
-        <div className="w-screen h-screen align-middle">
+        <div className="w-screen h-screen align-middle relative">
+            {/* OnaBanner positioned on the side when workspace is running */}
+            {isGitpodIo() && (
+                <div className="fixed bottom-4 right-4 z-1 max-w-sm">
+                    <OnaBanner compact={true} />
+                </div>
+            )}
+
             <div className="flex flex-col mx-auto items-center text-center h-screen">
                 <div className="h-1/3"></div>
                 <ProductLogo
@@ -105,6 +117,7 @@ export function StartPage(props: StartPageProps) {
                         error || phase === StartPhase.Stopped || phase === StartPhase.IdeReady ? "" : "animate-bounce"
                     }`}
                 />
+                {!isDataOps && <span className="block mt-2 text-pk-content-secondary">Gitpod Classic</span>}
                 <Heading2 className="mt-8">{title}</Heading2>
                 {typeof phase === "number" && phase < StartPhase.IdeReady && (
                     <ProgressBar phase={phase} error={!!error} />
@@ -132,7 +145,7 @@ function StartError(props: { error: StartWorkspaceError }) {
 }
 
 function WarningView(props: { workspaceId?: string; showLatestIdeWarning?: boolean; error?: StartWorkspaceError }) {
-    const { data: imageInfo } = useWorkspaceDefaultImageQuery(props.workspaceId ?? "");
+    const { data: imageInfo } = useWorkspaceDefaultImageQuery(props.workspaceId);
     let useWarning: "latestIde" | "orgImage" | undefined = props.showLatestIdeWarning ? "latestIde" : undefined;
     if (
         props.error &&

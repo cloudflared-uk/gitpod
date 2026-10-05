@@ -4,9 +4,20 @@
 
 FROM gitpod/workspace-gitpod-dev:latest
 
-ENV TRIGGER_REBUILD 41
+ENV TRIGGER_REBUILD 46
 
 USER root
+
+### Go ###
+# Pin Go version explicitly to ensure all CI-built binaries use a
+# non-vulnerable toolchain (CVE-2026-27143 requires >= 1.25.9).
+ENV GO_VERSION=1.25.9
+RUN rm -rf /usr/local/go /home/gitpod/go /home/gitpod/.cache/go-build \
+    && curl -fsSL "https://dl.google.com/go/go${GO_VERSION}.linux-amd64.tar.gz" | tar -C /usr/local -xz \
+    && ln -sf /usr/local/go/bin/go /usr/bin/go \
+    && ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
+ENV GOROOT=/usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH
 
 ### cloud_sql_proxy ###
 ARG CLOUD_SQL_PROXY=/usr/local/bin/cloud_sql_proxy
@@ -22,7 +33,7 @@ RUN mkdir -p /tmp/helm/ \
     && helm completion bash > /usr/share/bash-completion/completions/helm
 
 ### kubectl ###
-RUN curl -fsSL -o /usr/bin/kubectl "https://dl.k8s.io/release/v1.28.9/bin/linux/amd64/kubectl" && chmod +x /usr/bin/kubectl \
+RUN curl -fsSL -o /usr/bin/kubectl "https://dl.k8s.io/release/v1.30.1/bin/linux/amd64/kubectl" && chmod +x /usr/bin/kubectl \
     && kubectl completion bash > /usr/share/bash-completion/completions/kubectl
 
 RUN curl -fsSL -o /usr/bin/kubectx https://raw.githubusercontent.com/ahmetb/kubectx/master/kubectx && chmod +x /usr/bin/kubectx \
@@ -42,16 +53,19 @@ RUN install-packages mysql-client
 RUN cd /usr/bin && curl -fsSL https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cmctl-linux-amd64.tar.gz | tar xzv --no-anchored cmctl
 
 # gokart
-RUN cd /usr/bin && curl -fsSL https://github.com/praetorian-inc/gokart/releases/download/v0.4.0/gokart_0.4.0_linux_x86_64.tar.gz | tar xzv --no-anchored gokart
+RUN cd /usr/bin && curl -fsSL https://github.com/praetorian-inc/gokart/releases/download/v0.5.1/gokart_0.5.1_linux_x86_64.tar.gz | tar xzv --no-anchored gokart
 
 # leeway
-ARG LEEWAY_VERSION=0.8.2
+# This version is baked into the dev-environment image; changing it does not
+# update the image used by the currently running CI job. Follow
+# dev/image/README.md for the bootstrap and promotion procedure.
+ARG LEEWAY_VERSION=0.10.9
 ENV LEEWAY_MAX_PROVENANCE_BUNDLE_SIZE=8388608
 ENV LEEWAY_WORKSPACE_ROOT=/workspace/gitpod
 ENV LEEWAY_REMOTE_CACHE_BUCKET=leeway-cache-dev-3ac8ef5
 ENV LEEWAY_CACHE_DIR=/workspace/.leeway/cache
 ENV LEEWAY_BUILD_DIR=/workspace/.leeway/build
-RUN cd /usr/bin && curl -fsSL https://github.com/gitpod-io/leeway/releases/download/v${LEEWAY_VERSION}/leeway_${LEEWAY_VERSION}_Linux_x86_64.tar.gz | tar xz
+RUN cd /usr/bin && curl -fsSL https://github.com/gitpod-io/leeway/releases/download/v${LEEWAY_VERSION}/leeway_Linux_x86_64.tar.gz | tar xz
 
 # evans (gRPC client)
 RUN cd /usr/bin && curl -fsSL https://github.com/ktr0731/evans/releases/download/v0.10.6/evans_linux_amd64.tar.gz | tar xz evans
@@ -124,11 +138,22 @@ RUN install-packages netcat
 USER gitpod
 
 # Fix node version we develop against
-ARG GITPOD_NODE_VERSION=18.20.2
+ARG GITPOD_NODE_VERSION=22.17.0
 RUN bash -c ". .nvm/nvm.sh \
-    && nvm install $GITPOD_NODE_VERSION \
-    && npm install -g typescript yarn"
+    && nvm install $GITPOD_NODE_VERSION"
 ENV PATH=/home/gitpod/.nvm/versions/node/v${GITPOD_NODE_VERSION}/bin:$PATH
+
+# Install npm-tools with locked dependencies
+COPY dev-npm-tools--pkg/package.json dev-npm-tools--pkg/package-lock.json /opt/npm-tools/
+RUN sudo chown -R gitpod:gitpod /opt/npm-tools && \
+    cd /opt/npm-tools && \
+    npm ci && \
+    for bin in /opt/npm-tools/node_modules/.bin/*; do \
+        sudo ln -sf "$bin" /usr/local/bin/$(basename "$bin"); \
+    done && \
+    rm -rf ~/.npm/_cacache
+# Install newer version of "npm" separately, so it's not overshadowed by the version installed by nvm
+RUN sudo ln -sf /opt/npm-tools/node_modules/.bin/npm /usr/local/bin/npm-11.7
 
 ## Register leeway autocompletion in bashrc
 RUN bash -c "echo . \<\(leeway bash-completion\) >> ~/.bashrc"
@@ -139,7 +164,7 @@ ARG GCS_DIR=/opt/google-cloud-sdk
 ENV PATH=$GCS_DIR/bin:$PATH
 RUN sudo chown gitpod: /opt \
     && mkdir $GCS_DIR \
-    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-472.0.0-linux-x86_64.tar.gz \
+    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-515.0.0-linux-x86_64.tar.gz \
     | tar -xzvC /opt \
     && /opt/google-cloud-sdk/install.sh --quiet --usage-reporting=false --bash-completion=true \
     --additional-components gke-gcloud-auth-plugin docker-credential-gcr alpha beta \
@@ -166,7 +191,7 @@ ENV DB_HOST=127.0.0.1
 # awscliv2
 # See also: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-version.html
 # See also: https://github.com/aws/aws-cli/blob/v2/CHANGELOG.rst
-RUN curl -L "https://awscli.amazonaws.com/awscli-exe-linux-x86_64-2.7.25.zip" -o "awscliv2.zip" \
+RUN curl -L "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
     && unzip awscliv2.zip \
     && sudo ./aws/install \
     && rm -f awscliv2.zip
@@ -195,8 +220,9 @@ RUN sudo install-packages shellcheck \
     && sudo python3 -m pip install pre-commit
 
 # gh (Github CLI) binary:
-RUN cd /usr/bin && curl -fsSL https://github.com/cli/cli/releases/download/v2.35.0/gh_2.35.0_linux_amd64.tar.gz \
-    | sudo tar xzv --strip-components=2 gh_2.35.0_linux_amd64/bin/gh
+ARG GH_VERSION="2.74.1"
+RUN cd /usr/bin && curl -fsSL https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz \
+    | sudo tar xzv --strip-components=2 gh_${GH_VERSION}_linux_amd64/bin/gh
 
 # Install observability-related binaries
 ARG PROM_VERSION="2.36.0"
@@ -236,7 +262,7 @@ RUN brew install tmux tmuxinator \
     && brew install redis \
     # Install zed & spicedb CLI
     && brew install authzed/tap/zed \
-    && brew install authzed/tap/spicedb \
+    && (brew install authzed/tap/spicedb || brew install authzed/tap/spicedb) \
     && brew cleanup
 
 # Copy our own tools
@@ -254,7 +280,10 @@ ENV PREVIEW_ENV_DEV_SA_KEY_PATH=/home/gitpod/.config/gcloud/preview-environment-
 
 # So we can parse the report.html output by leeway, and remove the output produced by this image build
 # why? it's too verbose, exceeding the Github Actions summary limit
-RUN go install github.com/ericchiang/pup@v0.4.0
+RUN curl -fsSL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_amd64.zip -o /tmp/pup.zip \
+    && sudo unzip -o /tmp/pup.zip -d /usr/local/bin \
+    && sudo chmod +x /usr/local/bin/pup \
+    && rm /tmp/pup.zip
 
 # Install oci-tool
 RUN curl -fsSL https://github.com/csweichel/oci-tool/releases/download/v0.2.0/oci-tool_0.2.0_linux_amd64.tar.gz | sudo tar xz -C /usr/local/bin \

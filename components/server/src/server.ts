@@ -36,7 +36,6 @@ import { NewsletterSubscriptionController } from "./user/newsletter-subscription
 import { Config } from "./config";
 import { DebugApp } from "@gitpod/gitpod-protocol/lib/util/debug-app";
 import { WsConnectionHandler } from "./express/ws-connection-handler";
-import { LivenessController } from "./liveness/liveness-controller";
 import { IamSessionApp } from "./iam/iam-session-app";
 import { API } from "./api/server";
 import { GithubApp } from "./prebuilds/github-app";
@@ -53,6 +52,11 @@ import {
 } from "./workspace/headless-log-service";
 import { runWithRequestContext } from "./util/request-context";
 import { AnalyticsController } from "./analytics-controller";
+import { ProbesApp } from "./liveness/probes";
+
+const MONITORING_PORT = 9500;
+const IAM_SESSION_PORT = 9876;
+const PROBES_PORT = 9400;
 
 @injectable()
 export class Server {
@@ -79,7 +83,6 @@ export class Server {
         @inject(UserController) private readonly userController: UserController,
         @inject(WebsocketConnectionManager) private readonly websocketConnectionHandler: WebsocketConnectionManager,
         @inject(WorkspaceDownloadService) private readonly workspaceDownloadService: WorkspaceDownloadService,
-        @inject(LivenessController) private readonly livenessController: LivenessController,
         @inject(MonitoringEndpointsApp) private readonly monitoringEndpointsApp: MonitoringEndpointsApp,
         @inject(CodeSyncService) private readonly codeSyncService: CodeSyncService,
         @inject(HeadlessLogController) private readonly headlessLogController: HeadlessLogController,
@@ -100,6 +103,7 @@ export class Server {
         @inject(API) private readonly api: API,
         @inject(RedisSubscriber) private readonly redisSubscriber: RedisSubscriber,
         @inject(AnalyticsController) private readonly analyticsController: AnalyticsController,
+        @inject(ProbesApp) private readonly probesApp: ProbesApp,
     ) {}
 
     public async init(app: express.Application) {
@@ -319,7 +323,6 @@ export class Server {
         // Authorization: none
         app.use(this.oneTimeSecretServer.apiRouter);
         app.use(this.newsletterSubscriptionController.apiRouter);
-        app.use("/live", this.livenessController.apiRouter);
         app.use("/version", (req: express.Request, res: express.Response, next: express.NextFunction) => {
             res.send(this.config.version);
         });
@@ -351,6 +354,10 @@ export class Server {
             throw new Error("server cannot start, not initialized");
         }
 
+        this.probesApp.start(PROBES_PORT).then((port) => {
+            log.info(`probes server listening on port: ${port}`);
+        });
+
         const httpServer = this.app.listen(port, () => {
             this.eventEmitter.emit(Server.EVENT_ON_START, httpServer);
             log.info(`server listening on port: ${(<AddressInfo>httpServer.address()).port}`);
@@ -358,7 +365,7 @@ export class Server {
         this.httpServer = httpServer;
 
         if (this.monitoringApp) {
-            this.monitoringHttpServer = this.monitoringApp.listen(9500, "localhost", () => {
+            this.monitoringHttpServer = this.monitoringApp.listen(MONITORING_PORT, "127.0.0.1", () => {
                 log.info(
                     `monitoring app listening on port: ${(<AddressInfo>this.monitoringHttpServer!.address()).port}`,
                 );
@@ -366,7 +373,7 @@ export class Server {
         }
 
         if (this.iamSessionApp) {
-            this.iamSessionAppServer = this.iamSessionApp.listen(9876, () => {
+            this.iamSessionAppServer = this.iamSessionApp.listen(IAM_SESSION_PORT, () => {
                 log.info(
                     `IAM session server listening on port: ${(<AddressInfo>this.iamSessionAppServer!.address()).port}`,
                 );
@@ -380,6 +387,9 @@ export class Server {
     }
 
     public async stop() {
+        // mark as not-ready
+        this.probesApp.notifyShutdown();
+
         // run each stop with a timeout of 30s
         async function race(workLoad: Promise<any>, task: string, ms: number = 30 * 1000): Promise<void> {
             const before = Date.now();
@@ -408,6 +418,10 @@ export class Server {
             race(this.stopServer(this.publicApiServer), "stop public api server"),
             race((async () => this.disposables.dispose())(), "dispose disposables"),
         ]);
+
+        this.probesApp.stop().catch(() => {
+            /* ignore */
+        });
 
         log.info("server stopped.");
     }

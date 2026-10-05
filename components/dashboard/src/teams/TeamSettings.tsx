@@ -4,54 +4,58 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
+import { PlainMessage } from "@bufbuild/protobuf";
+import { EnvVar } from "@gitpod/gitpod-protocol";
+import { ErrorCode } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { OrganizationSettings } from "@gitpod/public-api/lib/gitpod/v1/organization_pb";
+import { Button } from "@podkit/buttons/Button";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@podkit/select/Select";
+import { SwitchInputField } from "@podkit/switch/Switch";
+import { Heading2, Heading3, Subheading } from "@podkit/typography/Headings";
 import React, { Children, ReactNode, useCallback, useMemo, useState } from "react";
 import Alert from "../components/Alert";
 import ConfirmationModal from "../components/ConfirmationModal";
 import { InputWithCopy } from "../components/InputWithCopy";
 import Modal, { ModalBody, ModalFooter, ModalHeader } from "../components/Modal";
-import { CheckboxInputField } from "../components/forms/CheckboxInputField";
 import { InputField } from "../components/forms/InputField";
 import { TextInputField } from "../components/forms/TextInputField";
-import { Heading2, Heading3, Subheading } from "../components/typography/headings";
+import { useToast } from "../components/toasts/Toasts";
+import { useFeatureFlag } from "../data/featureflag-query";
+import { useInstallationDefaultWorkspaceImageQuery } from "../data/installation/default-workspace-image-query";
 import { useIsOwner } from "../data/organizations/members-query";
+import { useListOrganizationEnvironmentVariables } from "../data/organizations/org-envvar-queries";
 import { useOrgSettingsQuery } from "../data/organizations/org-settings-query";
 import { useCurrentOrg, useOrganizationsInvalidator } from "../data/organizations/orgs-query";
 import { useUpdateOrgMutation } from "../data/organizations/update-org-mutation";
 import { useUpdateOrgSettingsMutation } from "../data/organizations/update-org-settings-mutation";
+import { useDocumentTitle } from "../hooks/use-document-title";
 import { useOnBlurError } from "../hooks/use-onblur-error";
 import { ReactComponent as Stack } from "../icons/Stack.svg";
+import { ConfigurationSettingsField } from "../repositories/detail/ConfigurationSettingsField";
 import { organizationClient } from "../service/public-api";
 import { gitpodHostUrl } from "../service/service";
 import { useCurrentUser } from "../user-context";
 import { OrgSettingsPage } from "./OrgSettingsPage";
-import { ErrorCode } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import { Button } from "@podkit/buttons/Button";
-import { useInstallationDefaultWorkspaceImageQuery } from "../data/installation/default-workspace-image-query";
-import { useAllowedWorkspaceClassesMemo } from "../data/workspaces/workspace-classes-query";
-import { ConfigurationSettingsField } from "../repositories/detail/ConfigurationSettingsField";
-import {
-    WorkspaceClassesModifyModal,
-    WorkspaceClassesModifyModalProps,
-    WorkspaceClassesOptions,
-} from "../components/WorkspaceClassesOptions";
-import { useMutation } from "@tanstack/react-query";
-import { useAllowedWorkspaceEditorsMemo } from "../data/ide-options/ide-options-query";
-import { IdeOptions, IdeOptionsModifyModal, IdeOptionsModifyModalProps } from "../components/IdeOptions";
-import { useFeatureFlag } from "../data/featureflag-query";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@podkit/select/Select";
+import { NamedOrganizationEnvvarItem } from "./variables/NamedOrganizationEnvvarItem";
 
 export default function TeamSettingsPage() {
+    useDocumentTitle("Organization Settings - General");
+    const { toast } = useToast();
     const user = useCurrentUser();
     const org = useCurrentOrg().data;
     const isOwner = useIsOwner();
     const invalidateOrgs = useOrganizationsInvalidator();
+
     const [modal, setModal] = useState(false);
     const [teamNameToDelete, setTeamNameToDelete] = useState("");
     const [teamName, setTeamName] = useState(org?.name || "");
     const [updated, setUpdated] = useState(false);
+
+    const orgEnvVars = useListOrganizationEnvironmentVariables(org?.id || "");
+    const gitpodImageAuthEnvVar = orgEnvVars.data?.find((v) => v.name === EnvVar.GITPOD_IMAGE_AUTH_ENV_VAR_NAME);
+
     const updateOrg = useUpdateOrgMutation();
-    const orgLevelEditorRestrictionEnabled = useFeatureFlag("org_level_editor_restriction_enabled");
+    const isCommitAnnotationEnabled = useFeatureFlag("commit_annotation_setting_enabled");
 
     const close = () => setModal(false);
 
@@ -103,7 +107,7 @@ export default function TeamSettingsPage() {
     const [showImageEditModal, setShowImageEditModal] = useState(false);
 
     const handleUpdateTeamSettings = useCallback(
-        async (newSettings: Partial<OrganizationSettings>, options?: { throwMutateError?: boolean }) => {
+        async (newSettings: Partial<PlainMessage<OrganizationSettings>>, options?: { throwMutateError?: boolean }) => {
             if (!org?.id) {
                 throw new Error("no organization selected");
             }
@@ -115,23 +119,38 @@ export default function TeamSettingsPage() {
                     ...settings,
                     ...newSettings,
                 });
+                toast("Organization settings updated");
             } catch (error) {
                 if (options?.throwMutateError) {
                     throw error;
                 }
+                toast(`Failed to update organization settings: ${error.message}`);
                 console.error(error);
             }
         },
-        [updateTeamSettings, org?.id, isOwner, settings],
+        [updateTeamSettings, org?.id, isOwner, settings, toast],
+    );
+
+    const handleUpdateAnnotatedCommits = useCallback(
+        async (value: boolean) => {
+            try {
+                await handleUpdateTeamSettings({ annotateGitCommits: value });
+            } catch (error) {
+                console.error(error);
+            }
+        },
+        [handleUpdateTeamSettings],
     );
 
     return (
         <>
             <OrgSettingsPage>
-                <div className="space-y-4">
+                <div className="space-y-8">
                     <div>
-                        <Heading2>Organization Details</Heading2>
-                        <Subheading>Details of your organization within Gitpod.</Subheading>
+                        <Heading2>General</Heading2>
+                        <Subheading>
+                            Set the default role and workspace image, name or delete your organization.
+                        </Subheading>
                     </div>
                     <ConfigurationSettingsField>
                         {updateOrg.isError && (
@@ -197,25 +216,6 @@ export default function TeamSettingsPage() {
                     </ConfigurationSettingsField>
 
                     <ConfigurationSettingsField>
-                        <Heading3>Collaboration and sharing</Heading3>
-
-                        {updateTeamSettings.isError && (
-                            <Alert type="error" closable={true} className="mb-2 max-w-xl rounded-md">
-                                <span>Failed to update organization settings: </span>
-                                <span>{updateTeamSettings.error.message || "unknown error"}</span>
-                            </Alert>
-                        )}
-
-                        <CheckboxInputField
-                            label="Workspace Sharing"
-                            hint="Allow workspaces created within an Organization to share the workspace with any authenticated user."
-                            checked={!settings?.workspaceSharingDisabled}
-                            onChange={(checked) => handleUpdateTeamSettings({ workspaceSharingDisabled: !checked })}
-                            disabled={isLoading || !isOwner}
-                        />
-                    </ConfigurationSettingsField>
-
-                    <ConfigurationSettingsField>
                         <Heading3>Workspace images</Heading3>
                         <Subheading>Choose a default image for all workspaces in the organization.</Subheading>
 
@@ -227,6 +227,20 @@ export default function TeamSettingsPage() {
                         />
                     </ConfigurationSettingsField>
 
+                    {org?.id && (
+                        <ConfigurationSettingsField>
+                            <Heading3>Docker Registry authentication</Heading3>
+                            <Subheading>Configure Docker registry permissions for the whole organization.</Subheading>
+
+                            <NamedOrganizationEnvvarItem
+                                disabled={!isOwner}
+                                name={EnvVar.GITPOD_IMAGE_AUTH_ENV_VAR_NAME}
+                                organizationId={org.id}
+                                variable={gitpodImageAuthEnvVar}
+                            />
+                        </ConfigurationSettingsField>
+                    )}
+
                     {showImageEditModal && (
                         <OrgDefaultWorkspaceImageModal
                             settings={settings}
@@ -235,18 +249,32 @@ export default function TeamSettingsPage() {
                         />
                     )}
 
-                    <OrgWorkspaceClassesOptions
-                        isOwner={isOwner}
-                        settings={settings}
-                        handleUpdateTeamSettings={handleUpdateTeamSettings}
-                    />
+                    {isCommitAnnotationEnabled && (
+                        <ConfigurationSettingsField>
+                            <Heading3>Insights</Heading3>
+                            <Subheading className="mb-4">
+                                Configure insights into usage of Gitpod in your organization.
+                            </Subheading>
 
-                    {orgLevelEditorRestrictionEnabled && (
-                        <EditorOptions
-                            isOwner={isOwner}
-                            settings={settings}
-                            handleUpdateTeamSettings={handleUpdateTeamSettings}
-                        />
+                            <InputField
+                                label="Annotate git commits"
+                                hint={
+                                    <>
+                                        Add a <code>Tool:</code> field to all git commit messages created from
+                                        workspaces in your organization to associate them with this Gitpod instance.
+                                    </>
+                                }
+                                id="annotate-git-commits"
+                            >
+                                <SwitchInputField
+                                    id="annotate-git-commits"
+                                    checked={settings?.annotateGitCommits || false}
+                                    disabled={!isOwner || isLoading}
+                                    onCheckedChange={handleUpdateAnnotatedCommits}
+                                    label=""
+                                />
+                            </InputField>
+                        </ConfigurationSettingsField>
                     )}
 
                     {user?.organizationId !== org?.id && isOwner && (
@@ -275,32 +303,56 @@ export default function TeamSettingsPage() {
                 onClose={close}
                 onConfirm={deleteTeam}
             >
-                <p className="text-base text-gray-500">
-                    You are about to permanently delete <b>{org?.name}</b> including all associated data.
-                </p>
-                <ol className="text-gray-500 text-m list-outside list-decimal">
-                    <li className="ml-5">
-                        All <b>projects</b> added in this organization will be deleted and cannot be restored
-                        afterwards.
-                    </li>
-                    <li className="ml-5">
-                        All <b>members</b> of this organization will lose access to this organization, associated
-                        projects and workspaces.
-                    </li>
-                    <li className="ml-5">Any free credit allowances granted to this organization will be lost.</li>
-                </ol>
-                <p className="pt-4 pb-2 text-gray-600 dark:text-gray-400 text-base font-semibold">
-                    Type <code>{org?.name}</code> to confirm
-                </p>
-                <input
-                    autoFocus
-                    className="w-full"
-                    type="text"
-                    onChange={(e) => setTeamNameToDelete(e.target.value)}
-                ></input>
+                <div className="text-pk-content-secondary">
+                    <p className="text-base">
+                        You are about to permanently delete <b>{org?.name}</b> including all associated data.
+                    </p>
+                    <ol className="text-m list-outside list-decimal">
+                        <li className="ml-5">
+                            All <b>projects</b> added in this organization will be deleted and cannot be restored
+                            afterwards.
+                        </li>
+                        <li className="ml-5">
+                            All <b>members</b> of this organization will lose access to this organization, associated
+                            projects and workspaces.
+                        </li>
+                        <li className="ml-5">Any free credit allowances granted to this organization will be lost.</li>
+                    </ol>
+                    <p className="pt-4 pb-2 text-base font-semibold text-pk-content-secondary">
+                        Type <code>{org?.name}</code> to confirm
+                    </p>
+                    <input
+                        autoFocus
+                        className="w-full"
+                        type="text"
+                        onChange={(e) => setTeamNameToDelete(e.target.value)}
+                    ></input>
+                </div>
             </ConfirmationModal>
         </>
     );
+}
+function parseDockerImage(image: string) {
+    // https://docs.docker.com/registry/spec/api/
+    let registry, repository, tag;
+    let parts = image.split("/");
+
+    if (parts.length > 1 && parts[0].includes(".")) {
+        registry = parts.shift();
+    } else {
+        registry = "docker.io";
+    }
+
+    const remaining = parts.join("/");
+    [repository, tag] = remaining.split(":");
+    if (!tag) {
+        tag = "latest";
+    }
+    return {
+        registry,
+        repository,
+        tag,
+    };
 }
 
 function WorkspaceImageButton(props: {
@@ -309,29 +361,6 @@ function WorkspaceImageButton(props: {
     onClick: () => void;
     disabled?: boolean;
 }) {
-    function parseDockerImage(image: string) {
-        // https://docs.docker.com/registry/spec/api/
-        let registry, repository, tag;
-        let parts = image.split("/");
-
-        if (parts.length > 1 && parts[0].includes(".")) {
-            registry = parts.shift();
-        } else {
-            registry = "docker.io";
-        }
-
-        const remaining = parts.join("/");
-        [repository, tag] = remaining.split(":");
-        if (!tag) {
-            tag = "latest";
-        }
-        return {
-            registry,
-            repository,
-            tag,
-        };
-    }
-
     const image = props.settings?.defaultWorkspaceImage || props.installationDefaultWorkspaceImage || "";
 
     const descList = useMemo(() => {
@@ -358,17 +387,17 @@ function WorkspaceImageButton(props: {
 
     return (
         <InputField disabled={props.disabled} className="w-full max-w-lg">
-            <div className="flex flex-col bg-gray-50 dark:bg-gray-800 p-3 rounded-lg">
+            <div className="flex flex-col bg-pk-surface-secondary p-3 rounded-lg">
                 <div className="flex items-center justify-between">
                     <div className="flex-1 flex items-center overflow-hidden h-8" title={image}>
                         <span className="w-5 h-5 mr-1">
                             <Stack />
                         </span>
-                        <span className="truncate font-medium text-gray-700 dark:text-gray-200">
+                        <span className="truncate font-medium text-pk-content-secondary">
                             {parseDockerImage(image).repository}
                         </span>
                         &nbsp;&middot;&nbsp;
-                        <span className="truncate text-gray-500 dark:text-gray-400">{parseDockerImage(image).tag}</span>
+                        <span className="truncate text-pk-content-tertiary">{parseDockerImage(image).tag}</span>
                     </div>
                     {!props.disabled && (
                         <Button variant="link" onClick={props.onClick}>
@@ -377,7 +406,7 @@ function WorkspaceImageButton(props: {
                     )}
                 </div>
                 {descList.length > 0 && (
-                    <div className="mx-6 text-gray-400 dark:text-gray-500 truncate">{renderedDescription}</div>
+                    <div className="mx-6 text-pk-content-tertiary truncate">{renderedDescription}</div>
                 )}
             </div>
         </InputField>
@@ -447,164 +476,3 @@ function OrgDefaultWorkspaceImageModal(props: OrgDefaultWorkspaceImageModalProps
         </Modal>
     );
 }
-
-interface OrgWorkspaceClassesOptionsProps {
-    isOwner: boolean;
-    settings?: OrganizationSettings;
-    handleUpdateTeamSettings: (
-        newSettings: Partial<OrganizationSettings>,
-        options?: { throwMutateError?: boolean },
-    ) => Promise<void>;
-}
-const OrgWorkspaceClassesOptions = ({
-    isOwner,
-    settings,
-    handleUpdateTeamSettings,
-}: OrgWorkspaceClassesOptionsProps) => {
-    const [showModal, setShowModal] = useState(false);
-    const { data: allowedClassesInOrganization, isLoading: isLoadingClsInOrg } = useAllowedWorkspaceClassesMemo(
-        undefined,
-        {
-            filterOutDisabled: true,
-            ignoreScope: ["configuration"],
-        },
-    );
-    const { data: allowedClassesInInstallation, isLoading: isLoadingClsInInstall } = useAllowedWorkspaceClassesMemo(
-        undefined,
-        {
-            filterOutDisabled: true,
-            ignoreScope: ["organization", "configuration"],
-        },
-    );
-
-    const restrictedWorkspaceClasses = useMemo(() => {
-        const allowedList = settings?.allowedWorkspaceClasses ?? [];
-        if (allowedList.length === 0) {
-            return [];
-        }
-        return allowedClassesInInstallation.filter((cls) => !allowedList.includes(cls.id)).map((cls) => cls.id);
-    }, [settings?.allowedWorkspaceClasses, allowedClassesInInstallation]);
-
-    const updateMutation: WorkspaceClassesModifyModalProps["updateMutation"] = useMutation({
-        mutationFn: async ({ restrictedWorkspaceClasses }) => {
-            let allowedWorkspaceClasses = allowedClassesInInstallation.map((e) => e.id);
-            if (restrictedWorkspaceClasses.length > 0) {
-                allowedWorkspaceClasses = allowedWorkspaceClasses.filter(
-                    (e) => !restrictedWorkspaceClasses.includes(e),
-                );
-            }
-            const allAllowed = allowedClassesInInstallation.every((e) => allowedWorkspaceClasses.includes(e.id));
-            if (allAllowed) {
-                // empty means allow all classes
-                allowedWorkspaceClasses = [];
-            }
-            await handleUpdateTeamSettings({ allowedWorkspaceClasses }, { throwMutateError: true });
-        },
-    });
-
-    return (
-        <ConfigurationSettingsField>
-            <Heading3>Available workspace classes</Heading3>
-            <Subheading>
-                Limit the available workspace classes in your organization. Requires{" "}
-                <span className="font-medium">Owner</span> permissions to change.
-            </Subheading>
-
-            <WorkspaceClassesOptions
-                isLoading={isLoadingClsInOrg}
-                className="mt-4"
-                classes={allowedClassesInOrganization}
-            />
-
-            {isOwner && (
-                <Button className="mt-6" onClick={() => setShowModal(true)}>
-                    Manage Classes
-                </Button>
-            )}
-
-            {showModal && (
-                <WorkspaceClassesModifyModal
-                    isLoading={isLoadingClsInInstall}
-                    showSetDefaultButton={false}
-                    showSwitchTitle={false}
-                    restrictedWorkspaceClasses={restrictedWorkspaceClasses}
-                    allowedClasses={allowedClassesInInstallation}
-                    updateMutation={updateMutation}
-                    onClose={() => setShowModal(false)}
-                />
-            )}
-        </ConfigurationSettingsField>
-    );
-};
-
-interface EditorOptionsProps {
-    settings: OrganizationSettings | undefined;
-    isOwner: boolean;
-    handleUpdateTeamSettings: (
-        newSettings: Partial<OrganizationSettings>,
-        options?: { throwMutateError?: boolean },
-    ) => Promise<void>;
-}
-const EditorOptions = ({ isOwner, settings, handleUpdateTeamSettings }: EditorOptionsProps) => {
-    const [showModal, setShowModal] = useState(false);
-    const { data: installationOptions, isLoading: installationOptionsIsLoading } = useAllowedWorkspaceEditorsMemo(
-        undefined,
-        {
-            filterOutDisabled: true,
-            ignoreScope: ["organization", "configuration"],
-        },
-    );
-    const { data: orgOptions, isLoading: orgOptionsIsLoading } = useAllowedWorkspaceEditorsMemo(undefined, {
-        filterOutDisabled: true,
-        ignoreScope: ["configuration"],
-    });
-
-    const updateMutation: IdeOptionsModifyModalProps["updateMutation"] = useMutation({
-        mutationFn: async ({ restrictedEditors, pinnedEditorVersions }) => {
-            const updatedRestrictedEditors = [...restrictedEditors.keys()];
-            const updatedPinnedEditorVersions = Object.fromEntries(pinnedEditorVersions.entries());
-
-            await handleUpdateTeamSettings(
-                { restrictedEditorNames: updatedRestrictedEditors, pinnedEditorVersions: updatedPinnedEditorVersions },
-                { throwMutateError: true },
-            );
-        },
-    });
-
-    const restrictedEditors = new Set<string>(settings?.restrictedEditorNames || []);
-    const pinnedEditorVersions = new Map<string, string>(Object.entries(settings?.pinnedEditorVersions || {}));
-
-    return (
-        <ConfigurationSettingsField>
-            <Heading3>Available editors</Heading3>
-            <Subheading>
-                Limit the available editors in your organization. Requires <span className="font-medium">Owner</span>{" "}
-                permissions to change.
-            </Subheading>
-
-            <IdeOptions
-                isLoading={orgOptionsIsLoading}
-                className="mt-4"
-                ideOptions={orgOptions}
-                pinnedEditorVersions={pinnedEditorVersions}
-            />
-
-            {isOwner && (
-                <Button className="mt-6" onClick={() => setShowModal(true)}>
-                    Manage Editors
-                </Button>
-            )}
-
-            {showModal && (
-                <IdeOptionsModifyModal
-                    isLoading={installationOptionsIsLoading}
-                    ideOptions={installationOptions}
-                    restrictedEditors={restrictedEditors}
-                    pinnedEditorVersions={pinnedEditorVersions}
-                    updateMutation={updateMutation}
-                    onClose={() => setShowModal(false)}
-                />
-            )}
-        </ConfigurationSettingsField>
-    );
-};

@@ -16,6 +16,7 @@ import { IAnalyticsWriter } from "@gitpod/gitpod-protocol/lib/analytics";
 import { trackLogin } from "../analytics";
 import { SessionHandler } from "../session-handler";
 import { AuthJWT } from "./jwt";
+import { safeFragmentRedirect } from "../express-util";
 
 /**
  * The login completion handler pulls the strings between the OAuth2 flow, the ToS flow, and the session management.
@@ -49,12 +50,17 @@ export class LoginCompletionHandler {
         } catch (err) {
             reportLoginCompleted("failed", "git");
             log.error(logContext, `Failed to login user. Redirecting to /sorry on login.`, err);
-            response.redirect(this.config.hostUrl.asSorry("Oops! Something went wrong during login.").toString());
+            safeFragmentRedirect(
+                response,
+                this.config.hostUrl.asSorry("Oops! Something went wrong during login.").toString(),
+            );
             return;
         }
 
         // Update session info
-        let returnTo = returnToUrl || this.config.hostUrl.asDashboard().toString();
+        const returnToParam = returnToUrl || this.config.hostUrl.asDashboard().toString();
+        let returnTo = returnToParam;
+
         if (elevateScopes) {
             const elevateScopesUrl = this.config.hostUrl
                 .withApi({
@@ -78,13 +84,15 @@ export class LoginCompletionHandler {
             );
         }
 
+        // (default case) If we got redirected here onto the base domain of the Gitpod installation, we can just issue the cookie right away.
         const cookie = await this.session.createJWTSessionCookie(user.id);
         response.cookie(cookie.name, cookie.value, cookie.opts);
+        this.session.setHashedUserIdCookie(request, response);
         reportJWTCookieIssued();
 
         log.info(logContext, `User is logged in successfully. Redirect to: ${returnTo}`);
         reportLoginCompleted("succeeded", "git");
-        response.redirect(returnTo);
+        safeFragmentRedirect(response, returnTo);
     }
 
     public async updateAuthProviderAsVerified(hostname: string, user: User) {

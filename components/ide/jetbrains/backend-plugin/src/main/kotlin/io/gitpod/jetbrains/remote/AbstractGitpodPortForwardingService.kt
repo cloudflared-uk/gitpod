@@ -9,11 +9,11 @@ import com.intellij.openapi.components.service
 import com.intellij.openapi.diagnostic.thisLogger
 import com.intellij.remoteDev.util.onTerminationOrNow
 import com.intellij.ui.RowIcon
+import com.intellij.util.Alarm
 import com.intellij.util.application
 import com.jetbrains.rd.platform.codeWithMe.portForwarding.*
 import com.jetbrains.rd.util.URI
 import com.jetbrains.rd.util.lifetime.Lifetime
-import com.jetbrains.rd.util.threading.coroutines.launch
 import io.gitpod.supervisor.api.Status
 import io.gitpod.supervisor.api.Status.PortsStatus
 import io.gitpod.supervisor.api.StatusServiceGrpc
@@ -36,10 +36,19 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
     private val ignoredPortsForNotificationService = service<GitpodIgnoredPortsForNotificationService>()
     private val lifetime = Lifetime.Eternal.createNested()
 
+    // Throttling mechanism to prevent rapid successive port updates using IntelliJ Alarm
+    private var pendingUpdate: Status.PortsStatusResponse? = null
+    private val updateAlarm = Alarm(Alarm.ThreadToUse.SWING_THREAD, this)
+    private val updateThrottleMs = 100 // 100ms throttle
+
     init { start() }
 
     private fun start() {
         if (application.isHeadlessEnvironment) return
+
+        if (isLocalPortForwardingDisabled()) {
+            thisLogger().warn("gitpod: Local port forwarding is disabled.")
+        }
 
         observePortsListWhileProjectIsOpen()
     }
@@ -77,13 +86,13 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
         val portsStatusRequest = Status.PortsStatusRequest.newBuilder().setObserve(true).build()
 
         val portsStatusResponseObserver = object :
-                ClientResponseObserver<Status.PortsStatusRequest, Status.PortsStatusResponse> {
+            ClientResponseObserver<Status.PortsStatusRequest, Status.PortsStatusResponse> {
             override fun beforeStart(request: ClientCallStreamObserver<Status.PortsStatusRequest>) {
                 lifetime.onTerminationOrNow { request.cancel("gitpod: Service lifetime terminated.", null) }
             }
 
             override fun onNext(response: Status.PortsStatusResponse) {
-                application.invokeLater { syncPortsListWithClient(response) }
+                application.invokeLater { throttledSyncPortsListWithClient(response) }
             }
 
             override fun onCompleted() {
@@ -100,6 +109,24 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
         return completableFuture
     }
 
+    private fun throttledSyncPortsListWithClient(response: Status.PortsStatusResponse) {
+        // Store the latest update (overwrites any pending update)
+        pendingUpdate = response
+
+        // Cancel any existing scheduled update and schedule a new one
+        if (!updateAlarm.isEmpty) {
+            updateAlarm.cancelAllRequests()
+        }
+        updateAlarm.addRequest({
+            pendingUpdate?.let { syncPortsListWithClient(it) }
+            pendingUpdate = null
+        }, updateThrottleMs)
+    }
+
+    private fun isLocalPortForwardingDisabled(): Boolean {
+        return System.getenv("GITPOD_DISABLE_JETBRAINS_LOCAL_PORT_FORWARDING")?.toBoolean() ?: false
+    }
+
     private fun syncPortsListWithClient(response: Status.PortsStatusResponse) {
         val ignoredPorts = ignoredPortsForNotificationService.getIgnoredPorts()
         val portsList = response.portsList.filter { !ignoredPorts.contains(it.localPort) }
@@ -114,11 +141,11 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
             perClientPortForwardingManager.getPorts(it.localPort).none { p -> p.labels.contains(EXPOSED_PORT_LABEL) }
         }
         val forwardedPortsToStopForwarding = perClientPortForwardingManager.getPorts(FORWARDED_PORT_LABEL)
-                .map { it.hostPortNumber }
-                .filter { portsNumbersFromNonServedPorts.contains(it) || !portsNumbersFromPortsList.contains(it) }
+            .map { it.hostPortNumber }
+            .filter { portsNumbersFromNonServedPorts.contains(it) || !portsNumbersFromPortsList.contains(it) }
         val exposedPortsToStopExposingOnClient = perClientPortForwardingManager.getPorts(EXPOSED_PORT_LABEL)
-                .map { it.hostPortNumber }
-                .filter { portsNumbersFromNonServedPorts.contains(it) || !portsNumbersFromPortsList.contains(it) }
+            .map { it.hostPortNumber }
+            .filter { portsNumbersFromNonServedPorts.contains(it) || !portsNumbersFromPortsList.contains(it) }
 
         servedPortsToStartForwarding.forEach { startForwarding(it) }
 
@@ -132,11 +159,14 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
     }
 
     private fun startForwarding(portStatus: PortsStatus) {
+        if (isLocalPortForwardingDisabled()) {
+            return
+        }
         try {
             perClientPortForwardingManager.forwardPort(
-                    portStatus.localPort,
-                    PortType.TCP,
-                    setOf(FORWARDED_PORT_LABEL),
+                portStatus.localPort,
+                PortType.TCP,
+                setOf(FORWARDED_PORT_LABEL),
             )
         } catch (throwable: Throwable) {
             if (throwable !is PortAlreadyForwardedException) {
@@ -147,22 +177,22 @@ abstract class AbstractGitpodPortForwardingService : GitpodPortForwardingService
 
     private fun stopForwarding(hostPort: Int) {
         perClientPortForwardingManager.getPorts(hostPort)
-                .filter { it.labels.contains(FORWARDED_PORT_LABEL) }
-                .forEach { perClientPortForwardingManager.removePort(it) }
+            .filter { it.labels.contains(FORWARDED_PORT_LABEL) }
+            .forEach { perClientPortForwardingManager.removePort(it) }
     }
 
     private fun startExposingOnClient(portStatus: PortsStatus) {
         perClientPortForwardingManager.exposePort(
-                portStatus.localPort,
-                portStatus.exposed.url,
-                setOf(EXPOSED_PORT_LABEL),
+            portStatus.localPort,
+            portStatus.exposed.url,
+            setOf(EXPOSED_PORT_LABEL),
         )
     }
 
     private fun stopExposingOnClient(hostPort: Int) {
         perClientPortForwardingManager.getPorts(hostPort)
-                .filter { it.labels.contains(EXPOSED_PORT_LABEL) }
-                .forEach { perClientPortForwardingManager.removePort(it) }
+            .filter { it.labels.contains(EXPOSED_PORT_LABEL) }
+            .forEach { perClientPortForwardingManager.removePort(it) }
     }
 
     private fun updatePortsPresentation(portStatus: PortsStatus) {

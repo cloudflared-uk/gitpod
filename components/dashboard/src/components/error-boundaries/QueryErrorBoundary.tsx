@@ -4,7 +4,7 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
+import { ApplicationError, ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
 import { QueryErrorResetBoundary, useQueryClient } from "@tanstack/react-query";
 import { FC } from "react";
 import { ErrorBoundary, FallbackProps } from "react-error-boundary";
@@ -13,6 +13,7 @@ import { isGitpodIo } from "../../utils";
 import { CaughtError } from "./ReloadPageErrorBoundary";
 import { gitpodHostUrl } from "../../service/service";
 import QuickStart from "../QuickStart";
+import { DisabledCell } from "../../cell-disabled/DisabledCell";
 
 // Error boundary intended to catch and handle expected errors from api calls
 export const QueryErrorBoundary: FC = ({ children }) => {
@@ -35,7 +36,7 @@ const ExpectedQueryErrorsFallback: FC<FallbackProps> = ({ error, resetErrorBound
     const caughtError = error as CaughtError;
 
     // user deleted needs a n explicit logout to destroy the session
-    if (caughtError.code === ErrorCodes.USER_DELETED) {
+    if (ApplicationError.isUserDeletedError(caughtError)) {
         console.log("clearing query cache for deleted user");
         client.clear();
 
@@ -57,6 +58,10 @@ const ExpectedQueryErrorsFallback: FC<FallbackProps> = ({ error, resetErrorBound
         return <div></div>;
     }
 
+    if (caughtError.code === ErrorCodes.CELL_EXPIRED) {
+        return <DisabledCell />;
+    }
+
     // User needs to Login
     if (caughtError.code === ErrorCodes.NOT_AUTHENTICATED) {
         console.log("clearing query cache for unauthenticated user");
@@ -68,10 +73,15 @@ const ExpectedQueryErrorsFallback: FC<FallbackProps> = ({ error, resetErrorBound
             return <QuickStart />;
         }
 
-        // Before we show a Login screen, check to see if we need to redirect to www site
-        // Redirects if it's the root, no user, and no gp cookie present (has logged in recently)
-        if (isGitpodIo() && window.location.pathname === "/" && window.location.hash === "") {
-            // If there's no gp cookie, bounce to www site
+        // Before we show a Login screen, check to see if we need to redirect
+        if (isGitpodIo() && window.location.pathname === "/") {
+            // If there's a hash fragment, redirect to app.ona.com preserving the hash
+            if (window.location.hash !== "") {
+                const hashFragment = window.location.hash;
+                window.location.href = `https://app.ona.com/${hashFragment}`;
+                return <div></div>;
+            }
+            // If there's no hash and no gp cookie, bounce to www site
             if (!hasLoggedInBefore()) {
                 window.location.href = `https://www.gitpod.io`;
                 return <div></div>;

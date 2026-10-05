@@ -1,5 +1,7 @@
 FROM ubuntu:jammy
 
+ENV REBUILD_TRIGGER=1
+
 ADD https://raw.githubusercontent.com/gitpod-io/workspace-images/main/base/install-packages /usr/bin/install-packages
 RUN chmod +x /usr/bin/install-packages
 
@@ -58,6 +60,9 @@ RUN yes | unminimize \
     pigz \
     ### MySQL client ###
     mysql-client \
+    ### Network tools ###
+    netcat-openbsd \
+    redis-tools \
     ### Cypress deps
     libgtk2.0-0 \
     libgtk-3-0 \
@@ -90,7 +95,10 @@ ARG TARGETOS
 
 # Install dependencies
 USER root
-ARG LEEWAY_VERSION=0.8.2
+# This version is baked into the dev-environment image; changing it does not
+# update the image used by the currently running CI job. Follow
+# dev/image/README.md for the bootstrap and promotion procedure.
+ARG LEEWAY_VERSION=0.10.9
 ENV LEEWAY_MAX_PROVENANCE_BUNDLE_SIZE=8388608
 ENV LEEWAY_WORKSPACE_ROOT=/workspace/gitpod
 ENV LEEWAY_REMOTE_CACHE_BUCKET=leeway-cache-dev-3ac8ef5
@@ -103,10 +111,10 @@ RUN arch=$(uname -m); \
     *) echo "Unsupported architecture: $arch"; exit 1 ;; \
     esac; \
     cd /tmp && \
-    curl -OsSL https://github.com/gitpod-io/leeway/releases/download/v${LEEWAY_VERSION}/leeway_${LEEWAY_VERSION}_Linux_${arch}.tar.gz && \
-    tar -xzf leeway_${LEEWAY_VERSION}_Linux_${arch}.tar.gz && \
+    curl -OsSL https://github.com/gitpod-io/leeway/releases/download/v${LEEWAY_VERSION}/leeway_Linux_${arch}.tar.gz && \
+    tar -xzf leeway_Linux_${arch}.tar.gz && \
     mv leeway /usr/local/bin/leeway && \
-    rm leeway_${LEEWAY_VERSION}_Linux_${arch}.tar.gz
+    rm leeway_Linux_${arch}.tar.gz
 
 
 ### cloud_sql_proxy ###
@@ -123,7 +131,7 @@ RUN mkdir -p /tmp/helm/ \
     && helm completion bash > /usr/share/bash-completion/completions/helm
 
 ### kubectl ###
-RUN curl -fsSL -o /usr/bin/kubectl "https://dl.k8s.io/release/v1.28.9/bin/linux/${TARGETARCH}/kubectl" && chmod +x /usr/bin/kubectl \
+RUN curl -fsSL -o /usr/bin/kubectl "https://dl.k8s.io/release/v1.31.0/bin/linux/${TARGETARCH}/kubectl" && chmod +x /usr/bin/kubectl \
     && kubectl completion bash > /usr/share/bash-completion/completions/kubectl
 
 RUN curl -fsSL -o /usr/bin/kubectx https://raw.githubusercontent.com/ahmetb/kubectx/master/kubectx && chmod +x /usr/bin/kubectx \
@@ -140,7 +148,7 @@ RUN curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/focal.gpg | sudo apt-key
 RUN cd /usr/bin && curl -fsSL https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cmctl-linux-amd64.tar.gz | tar xzv --no-anchored cmctl
 
 # gokart
-RUN cd /usr/bin && curl -fsSL https://github.com/praetorian-inc/gokart/releases/download/v0.4.0/gokart_0.4.0_linux_x86_64.tar.gz | tar xzv --no-anchored gokart
+RUN cd /usr/bin && curl -fsSL https://github.com/praetorian-inc/gokart/releases/download/v0.5.1/gokart_0.5.1_linux_x86_64.tar.gz | tar xzv --no-anchored gokart
 
 # evans (gRPC client)
 RUN cd /usr/bin && curl -fsSL https://github.com/ktr0731/evans/releases/download/v0.10.6/evans_linux_${TARGETARCH}.tar.gz | tar xz evans
@@ -158,9 +166,14 @@ RUN cd /usr/bin && curl -fsSL https://github.com/mikefarah/yq/releases/download/
 RUN cd /usr/bin && curl -fsSL https://github.com/c4milo/github-release/releases/download/v1.1.0/github-release_v1.1.0_linux_${TARGETARCH}.tar.gz | tar xz
 
 ### Protobuf
-RUN set -ex \
-    && tmpdir=$(mktemp -d) \
-    && curl -fsSL -o $tmpdir/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v3.20.1/protoc-3.20.1-linux-x86_64.zip \
+RUN arch=$(uname -m); \
+    case $arch in \
+    x86_64) arch=x86_64 ;; \
+    aarch64|arm64) arch=aarch_64 ;; \
+    *) echo "Unsupported architecture: $arch"; exit 1 ;; \
+    esac; \
+    tmpdir=$(mktemp -d) \
+    && curl -fsSL -o $tmpdir/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v3.20.1/protoc-3.20.1-linux-${arch}.zip \
     && mkdir -p /usr/lib/protoc && cd /usr/lib/protoc && unzip $tmpdir/protoc.zip \
     && chmod -R o+r+x /usr/lib/protoc/include \
     && chmod -R +x /usr/lib/protoc/bin \
@@ -183,7 +196,7 @@ RUN curl -sSL "https://awscli.amazonaws.com/awscli-exe-linux-$(arch).zip" -o aws
     ./aws/install --bin-dir /usr/local/bin --install-dir /usr/local/aws-cli --update && \
     rm -rf awscliv2.zip ./aws
 
-ENV GO_VERSION=1.22.2
+ENV GO_VERSION=1.25.9
 ENV GOPATH=/root/go-packages
 ENV GOROOT=/root/go
 ENV PATH=$GOROOT/bin:$GOPATH/bin:$PATH
@@ -191,6 +204,7 @@ ENV PATH=$GOROOT/bin:$GOPATH/bin:$PATH
 RUN mkdir -p $GOROOT && \
     cd /root && \
     curl -fsSL https://dl.google.com/go/go$GO_VERSION.${TARGETOS}-${TARGETARCH}.tar.gz | tar xzs
+RUN go install github.com/go-delve/delve/cmd/dlv@latest
 
 # Install codecov uploader
 # https://about.codecov.io/blog/introducing-codecovs-new-uploader
@@ -231,7 +245,10 @@ RUN curl -fsSLO https://github.com/brancz/gojsontoyaml/releases/download/v${GOJS
 
 # So we can parse the report.html output by leeway, and remove the output produced by this image build
 # why? it's too verbose, exceeding the Github Actions summary limit
-RUN go install github.com/ericchiang/pup@v0.4.0
+RUN curl -fsSL https://github.com/ericchiang/pup/releases/download/v0.4.0/pup_v0.4.0_linux_${TARGETARCH}.zip -o /tmp/pup.zip \
+    && unzip -o /tmp/pup.zip -d /usr/local/bin \
+    && chmod +x /usr/local/bin/pup \
+    && rm /tmp/pup.zip
 
 # Install oci-tool
 RUN curl -fsSL https://github.com/csweichel/oci-tool/releases/download/v0.2.0/oci-tool_0.2.0_linux_${TARGETARCH}.tar.gz | tar xz -C /usr/local/bin \
@@ -264,7 +281,7 @@ RUN arch=$(uname -m); \
     *) echo "Unsupported architecture: $arch"; exit 1 ;; \
     esac; \
     mkdir -p $GCS_DIR \
-    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-472.0.0-linux-${arch}.tar.gz \
+    && curl -fsSL https://dl.google.com/dl/cloudsdk/channels/rapid/downloads/google-cloud-sdk-515.0.0-linux-${arch}.tar.gz \
     | tar -xzC /opt \
     && /opt/google-cloud-sdk/install.sh --quiet --usage-reporting=false --bash-completion=true \
     --additional-components gke-gcloud-auth-plugin docker-credential-gcr alpha beta \
@@ -287,40 +304,75 @@ RUN mkdir -p ~/.terraform \
     && printf "terraform -install-autocomplete 2> /dev/null\n" >>~/.bashrc
 
 ## Java
-ENV JAVA_VERSION=11.0.23.fx-zulu
+ENV JAVA_VERSION=11.0.27.fx-zulu
+# Install SDKMAN as root first (working approach), then create gitpod user and symlink
 RUN curl -fsSL "https://get.sdkman.io" | bash \
-&& bash -c ". /root/.sdkman/bin/sdkman-init.sh \
-            && sed -i 's/sdkman_selfupdate_enable=true/sdkman_selfupdate_enable=false/g' /root/.sdkman/etc/config \
-            && sed -i 's/sdkman_selfupdate_feature=true/sdkman_selfupdate_feature=false/g' /root/.sdkman/etc/config \
-            && sdk install java ${JAVA_VERSION} \
-            && sdk default java ${JAVA_VERSION} \
-            && sdk install gradle \
-            && sdk install maven \
-            && sdk flush archives \
-            && sdk flush temp \
-            && mkdir /root/.m2 \
-            && printf '<settings>\n  <localRepository>/workspace/m2-repository/</localRepository>\n</settings>\n' > /root/.m2/settings.xml \
-            && echo 'export SDKMAN_DIR=\"/root/.sdkman\"' >> /root/.bashrc.d/99-java \
-            && echo '[[ -s \"/root/.sdkman/bin/sdkman-init.sh\" ]] && source \"/root/.sdkman/bin/sdkman-init.sh\"' >> /root/.bashrc.d/99-java"
+    && bash -c ". /root/.sdkman/bin/sdkman-init.sh \
+    && sed -i 's/sdkman_selfupdate_enable=true/sdkman_selfupdate_enable=false/g' /root/.sdkman/etc/config \
+    && sed -i 's/sdkman_selfupdate_feature=true/sdkman_selfupdate_feature=false/g' /root/.sdkman/etc/config \
+    && sdk install java ${JAVA_VERSION} \
+    && sdk default java ${JAVA_VERSION} \
+    && sdk install gradle \
+    && sdk install maven 3.9.10 \
+    && sdk flush archives \
+    && sdk flush temp \
+    && mkdir /root/.m2 \
+    && printf '<settings>\n  <localRepository>/workspace/m2-repository/</localRepository>\n</settings>\n' > /root/.m2/settings.xml \
+    && echo 'export SDKMAN_DIR=\"/root/.sdkman\"' >> /root/.bashrc.d/99-java \
+    && echo '[[ -s \"/root/.sdkman/bin/sdkman-init.sh\" ]] && source \"/root/.sdkman/bin/sdkman-init.sh\"' >> /root/.bashrc.d/99-java"
+
+# Create gitpod user and set up symlinks for SDKMAN compatibility with BUILD.yaml files
+RUN useradd -m -s /bin/bash gitpod && \
+    usermod -aG sudo gitpod && \
+    echo 'gitpod ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers && \
+    mkdir -p /home/gitpod/.bashrc.d && \
+    ln -sf /root/.sdkman /home/gitpod/.sdkman && \
+    ln -sf /root/.m2 /home/gitpod/.m2 && \
+    echo 'export SDKMAN_DIR="/home/gitpod/.sdkman"' >> /home/gitpod/.bashrc.d/99-java && \
+    echo '[[ -s "/home/gitpod/.sdkman/bin/sdkman-init.sh" ]] && source "/home/gitpod/.sdkman/bin/sdkman-init.sh"' >> /home/gitpod/.bashrc.d/99-java
+
 # above, we are adding the sdkman init to .bashrc (executing sdkman-init.sh does that), because one is executed on interactive shells, the other for non-interactive shells (e.g. plugin-host)
 ENV GRADLE_USER_HOME=/workspace/.gradle/
 
-ENV NODE_VERSION=18.18.2
+ENV NODE_VERSION=22.17.0
 
 ENV PNPM_HOME=/root/.pnpm
 ENV PATH=/root/.nvm/versions/node/v${NODE_VERSION}/bin:/root/.yarn/bin:${PNPM_HOME}:$PATH
 ENV HOME=/root
 RUN curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.3/install.sh | bash \
     && bash -c ". $HOME/.nvm/nvm.sh \
-        && nvm install v${NODE_VERSION} \
-        && nvm alias default v${NODE_VERSION} \
-        && npm install -g typescript yarn pnpm node-gyp"
+    && nvm install v${NODE_VERSION} \
+    && nvm alias default v${NODE_VERSION}"
+
+# Install npm-tools with locked dependencies
+COPY dev/npm-tools/package.json dev/npm-tools/package-lock.json /opt/npm-tools/
+RUN cd /opt/npm-tools && \
+    npm ci && \
+    for bin in /opt/npm-tools/node_modules/.bin/*; do \
+        ln -sf "$bin" /usr/local/bin/$(basename "$bin"); \
+    done && \
+    rm -rf ~/.npm/_cacache
+# Install newer version of "npm" separately, so it's not overshadowed by the version installed by nvm
+RUN ln -sf /opt/npm-tools/node_modules/.bin/npm /usr/local/bin/npm-11.7
 
 ENV PATH=$PATH:/root/.aws-iam:/root/.terraform:/workspace/bin
+
+### Telepresence ###
+RUN curl -fsSL https://packagecloud.io/datawireio/telepresence/gpgkey | apt-key add - \
+    # 'cosmic' not supported
+    && add-apt-repository -yu "deb https://packagecloud.io/datawireio/telepresence/ubuntu/ bionic main" \
+    # 0.95 (current at the time of this commit) is broken
+    && install-packages \
+    iproute2 \
+    iptables \
+    net-tools \
+    socat \
+    telepresence=0.109
 
 # Install pre-commit hooks under /workspace during prebuilds
 ENV PRE_COMMIT_HOME=/workspace/.pre-commit
 
 # Setting the environment variable here so that it will be accessible to all tasks and
 # terminal sessions in Gitpod workspaces.
-ENV PREVIEW_ENV_DEV_SA_KEY_PATH=
+ENV PREVIEW_ENV_DEV_SA_KEY_PATH=/root/.config/gcloud/sa.json
+ENV GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES=1

@@ -4,6 +4,7 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
+import parse from "parse-duration";
 import {
     User,
     WorkspaceInfo,
@@ -166,7 +167,10 @@ export interface GitpodServer extends JsonRpcServer<GitpodClient>, AdminServer, 
 
     // Teams
     getTeam(teamId: string): Promise<Team>;
-    updateTeam(teamId: string, team: Pick<Team, "name">): Promise<Team>;
+    updateTeam(
+        teamId: string,
+        team: Partial<Pick<Team, "name" | "maintenanceMode" | "maintenanceNotification">>,
+    ): Promise<Team>;
     getTeams(): Promise<Team[]>;
     getTeamMembers(teamId: string): Promise<TeamMemberInfo[]>;
     createTeam(name: string): Promise<Team>;
@@ -311,8 +315,6 @@ export interface GetDefaultWorkspaceImageResult {
 
 export interface CreateProjectParams {
     name: string;
-    /** @deprecated unused */
-    slug: string;
     cloneUrl: string;
     teamId: string;
     appInstallationId: string;
@@ -354,22 +356,41 @@ const WORKSPACE_MAXIMUM_TIMEOUT_HOURS = 24;
 export type WorkspaceTimeoutDuration = string;
 export namespace WorkspaceTimeoutDuration {
     export function validate(duration: string): WorkspaceTimeoutDuration {
-        duration = duration.toLowerCase();
-        const unit = duration.slice(-1);
-        if (!["m", "h"].includes(unit)) {
-            throw new Error(`Invalid timeout unit: ${unit}`);
+        duration = duration.trim().toLowerCase();
+
+        try {
+            // Keep this strict: ws-manager validates with Go's time.ParseDuration, so aliases like
+            // "hr" or "hrs" must not be accepted here.
+            if (!/^(?:\d+(?:ns|us|µs|ms|s|m|h))+$/.test(duration)) {
+                throw new Error("Invalid duration format");
+            }
+
+            const milliseconds = parse(duration);
+
+            if (milliseconds === undefined || milliseconds === null) {
+                throw new Error("Invalid duration format");
+            }
+
+            // Validate the parsed duration is within limits
+            const maxMs = WORKSPACE_MAXIMUM_TIMEOUT_HOURS * 60 * 60 * 1000;
+            if (milliseconds > maxMs) {
+                throw new Error("Workspace inactivity timeout cannot exceed 24h");
+            }
+
+            if (milliseconds <= 0) {
+                throw new Error(`Invalid timeout value: ${duration}. Timeout must be greater than 0`);
+            }
+
+            // Return the original duration string - Go's time.ParseDuration will handle it correctly
+            return duration;
+        } catch (error) {
+            // If it's our validation error, re-throw it
+            if (error.message.includes("cannot exceed 24h") || error.message.includes("must be greater than 0")) {
+                throw error;
+            }
+            // Otherwise, it's a parsing error from the library
+            throw new Error(`Invalid timeout format: ${duration}. Use Go duration format (e.g., "30m", "1h30m", "2h")`);
         }
-        const value = parseInt(duration.slice(0, -1), 10);
-        if (isNaN(value) || value <= 0) {
-            throw new Error(`Invalid timeout value: ${duration}`);
-        }
-        if (
-            (unit === "h" && value > WORKSPACE_MAXIMUM_TIMEOUT_HOURS) ||
-            (unit === "m" && value > WORKSPACE_MAXIMUM_TIMEOUT_HOURS * 60)
-        ) {
-            throw new Error("Workspace inactivity timeout cannot exceed 24h");
-        }
-        return value + unit;
     }
 }
 
@@ -378,6 +399,9 @@ export const WORKSPACE_TIMEOUT_DEFAULT_LONG: WorkspaceTimeoutDuration = "60m";
 export const WORKSPACE_TIMEOUT_EXTENDED: WorkspaceTimeoutDuration = "180m";
 export const WORKSPACE_LIFETIME_SHORT: WorkspaceTimeoutDuration = "8h";
 export const WORKSPACE_LIFETIME_LONG: WorkspaceTimeoutDuration = "36h";
+
+export const MAX_PARALLEL_WORKSPACES_FREE = 4;
+export const MAX_PARALLEL_WORKSPACES_PAID = 16;
 
 export const createServiceMock = function <C extends GitpodClient, S extends GitpodServer>(
     methods: Partial<JsonRpcProxy<S>>,
@@ -491,11 +515,10 @@ export namespace GitpodServer {
          * Whether this Gitpod instance is already configured with SSO.
          */
         readonly isCompleted: boolean;
-
         /**
-         * Whether this Gitpod instance has at least one org.
+         * Total number of organizations.
          */
-        readonly hasAnyOrg: boolean;
+        readonly organizationCountTotal: number;
     }
 }
 

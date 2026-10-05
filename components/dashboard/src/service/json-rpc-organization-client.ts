@@ -4,7 +4,7 @@
  * See License.AGPL.txt in the project root for license information.
  */
 
-import { PartialMessage } from "@bufbuild/protobuf";
+import { PartialMessage, PlainMessage } from "@bufbuild/protobuf";
 import { CallOptions, PromiseClient } from "@connectrpc/connect";
 import { OrganizationService } from "@gitpod/public-api/lib/gitpod/v1/organization_connect";
 import {
@@ -16,10 +16,14 @@ import {
     DeleteOrganizationResponse,
     GetOrganizationInvitationRequest,
     GetOrganizationInvitationResponse,
+    GetOrganizationMaintenanceModeRequest,
+    GetOrganizationMaintenanceModeResponse,
     GetOrganizationRequest,
     GetOrganizationResponse,
     GetOrganizationSettingsRequest,
     GetOrganizationSettingsResponse,
+    GetMaintenanceNotificationRequest,
+    GetMaintenanceNotificationResponse,
     JoinOrganizationRequest,
     JoinOrganizationResponse,
     ListOrganizationMembersRequest,
@@ -31,6 +35,10 @@ import {
     OrganizationSettings,
     ResetOrganizationInvitationRequest,
     ResetOrganizationInvitationResponse,
+    SetOrganizationMaintenanceModeRequest,
+    SetOrganizationMaintenanceModeResponse,
+    SetMaintenanceNotificationRequest,
+    SetMaintenanceNotificationResponse,
     UpdateOrganizationMemberRequest,
     UpdateOrganizationMemberResponse,
     UpdateOrganizationRequest,
@@ -41,7 +49,6 @@ import {
 import { getGitpodService } from "./service";
 import { converter } from "./public-api";
 import { ApplicationError, ErrorCodes } from "@gitpod/gitpod-protocol/lib/messaging/error";
-import { OrgMemberRole } from "@gitpod/gitpod-protocol";
 
 export class JsonRpcOrganizationClient implements PromiseClient<typeof OrganizationService> {
     async createOrganization(
@@ -228,33 +235,123 @@ export class JsonRpcOrganizationClient implements PromiseClient<typeof Organizat
         if (!request.organizationId) {
             throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId is required");
         }
-        const update: Partial<OrganizationSettings> = {
-            workspaceSharingDisabled: request?.workspaceSharingDisabled,
-            defaultWorkspaceImage: request?.defaultWorkspaceImage,
-            allowedWorkspaceClasses: request?.allowedWorkspaceClasses,
-            restrictedEditorNames: request?.restrictedEditorNames,
-            defaultRole: request?.defaultRole,
-        };
-        if (request.updatePinnedEditorVersions) {
-            update.pinnedEditorVersions = request.pinnedEditorVersions;
-        } else if (request.pinnedEditorVersions && Object.keys(request.pinnedEditorVersions).length > 0) {
-            throw new ApplicationError(
-                ErrorCodes.BAD_REQUEST,
-                "updatePinnedEditorVersions is required to be true to update pinnedEditorVersions",
-            );
-        }
-        if (request.updateRestrictedEditorNames) {
-            update.restrictedEditorNames = request.restrictedEditorNames;
-        } else if (request.restrictedEditorNames && request.restrictedEditorNames.length > 0) {
+
+        if (
+            request.restrictedEditorNames &&
+            request.restrictedEditorNames.length > 0 &&
+            !request.updateRestrictedEditorNames
+        ) {
             throw new ApplicationError(
                 ErrorCodes.BAD_REQUEST,
                 "updateRestrictedEditorNames is required to be true to update restrictedEditorNames",
             );
         }
-        await getGitpodService().server.updateOrgSettings(request.organizationId, {
-            ...update,
-            defaultRole: request.defaultRole as OrgMemberRole,
-        });
+
+        if (
+            request.allowedWorkspaceClasses &&
+            request.allowedWorkspaceClasses.length > 0 &&
+            !request.updateAllowedWorkspaceClasses
+        ) {
+            throw new ApplicationError(
+                ErrorCodes.BAD_REQUEST,
+                "updateAllowedWorkspaceClasses is required to be true to update allowedWorkspaceClasses",
+            );
+        }
+
+        if (
+            request.pinnedEditorVersions &&
+            Object.keys(request.pinnedEditorVersions).length > 0 &&
+            !request.updatePinnedEditorVersions
+        ) {
+            throw new ApplicationError(
+                ErrorCodes.BAD_REQUEST,
+                "updatePinnedEditorVersions is required to be true to update pinnedEditorVersions",
+            );
+        }
+
+        if (request.roleRestrictions && request.roleRestrictions.length > 0 && !request.updateRoleRestrictions) {
+            throw new ApplicationError(
+                ErrorCodes.BAD_REQUEST,
+                "updateRoleRestrictions is required to be true when updating roleRestrictions",
+            );
+        }
+        if (
+            request.onboardingSettings?.recommendedRepositories &&
+            request.onboardingSettings.recommendedRepositories.length > 0 &&
+            !request.onboardingSettings.updateRecommendedRepositories
+        ) {
+            throw new ApplicationError(
+                ErrorCodes.BAD_REQUEST,
+                "recommendedRepositories can only be set when updateRecommendedRepositories is true",
+            );
+        }
+
+        // gpl: We accept the little bit of uncertainty here because a) the partial/not-partial mismatch is only about
+        // technical/private fields and b) this path should not be exercised anymore anyway.
+        const update = converter.fromOrganizationSettings(request as PlainMessage<OrganizationSettings>);
+
+        await getGitpodService().server.updateOrgSettings(request.organizationId, update);
         return new UpdateOrganizationSettingsResponse();
+    }
+
+    async getOrganizationMaintenanceMode(
+        request: PartialMessage<GetOrganizationMaintenanceModeRequest>,
+        options?: CallOptions | undefined,
+    ): Promise<GetOrganizationMaintenanceModeResponse> {
+        if (!request.organizationId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId is required");
+        }
+        const result = await getGitpodService().server.getTeam(request.organizationId);
+        return new GetOrganizationMaintenanceModeResponse({
+            enabled: !!result.maintenanceMode,
+        });
+    }
+
+    async setOrganizationMaintenanceMode(
+        request: PartialMessage<SetOrganizationMaintenanceModeRequest>,
+        options?: CallOptions | undefined,
+    ): Promise<SetOrganizationMaintenanceModeResponse> {
+        if (!request.organizationId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId is required");
+        }
+        const result = await getGitpodService().server.updateTeam(request.organizationId, {
+            maintenanceMode: request.enabled,
+        });
+        return new SetOrganizationMaintenanceModeResponse({
+            enabled: !!result.maintenanceMode,
+        });
+    }
+
+    async getMaintenanceNotification(
+        request: PartialMessage<GetMaintenanceNotificationRequest>,
+        options?: CallOptions | undefined,
+    ): Promise<GetMaintenanceNotificationResponse> {
+        if (!request.organizationId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId is required");
+        }
+        const result = await getGitpodService().server.getTeam(request.organizationId);
+        return new GetMaintenanceNotificationResponse({
+            isEnabled: result.maintenanceNotification?.enabled || false,
+            message: result.maintenanceNotification?.message || "",
+        });
+    }
+
+    async setMaintenanceNotification(
+        request: PartialMessage<SetMaintenanceNotificationRequest>,
+        options?: CallOptions | undefined,
+    ): Promise<SetMaintenanceNotificationResponse> {
+        if (!request.organizationId) {
+            throw new ApplicationError(ErrorCodes.BAD_REQUEST, "organizationId is required");
+        }
+        const result = await getGitpodService().server.updateTeam(request.organizationId, {
+            maintenanceNotification: {
+                enabled: !!request.isEnabled,
+                message: request.customMessage,
+            },
+        });
+        return new SetMaintenanceNotificationResponse({
+            isEnabled: result.maintenanceNotification?.enabled || false,
+            message: result.maintenanceNotification?.message || "",
+        });
     }
 }

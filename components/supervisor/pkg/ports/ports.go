@@ -125,7 +125,7 @@ type managedPort struct {
 // Subscription is a Subscription to status updates
 type Subscription struct {
 	updates chan []*api.PortsStatus
-	Close   func() error
+	Close   func(lock bool) error
 }
 
 // Updates returns the updates channel
@@ -151,7 +151,7 @@ func (pm *Manager) Run(ctx context.Context, wg *sync.WaitGroup) {
 		pm.mu.Unlock()
 
 		for _, s := range subs {
-			_ = s.Close()
+			_ = s.Close(true)
 		}
 	}()
 	defer cancel()
@@ -272,6 +272,12 @@ func (pm *Manager) updateState(ctx context.Context, exposed []ExposedPort, serve
 				continue
 			}
 
+			config, _, exists := pm.configs.Get(port.Port)
+			// don't serve ports that are configured to be ignored-completely
+			if exists && config.OnOpen == "ignore-completely" {
+				continue
+			}
+
 			current, exists := servedMap[port.Port]
 			if !exists || (!port.BoundToLocalhost && current.BoundToLocalhost) {
 				servedMap[port.Port] = port
@@ -318,7 +324,7 @@ func (pm *Manager) updateState(ctx context.Context, exposed []ExposedPort, serve
 		case sub.updates <- status:
 		case <-time.After(5 * time.Second):
 			log.Error("ports subscription droped out")
-			_ = sub.Close()
+			_ = sub.Close(false)
 		}
 	}
 }
@@ -624,6 +630,9 @@ func getOnOpenAction(config *gitpod.PortConfig, port uint32) api.PortsStatus_OnO
 		}
 		return api.PortsStatus_notify_private
 	}
+	if config.OnOpen == "ignore-completely" {
+		return api.PortsStatus_ignore_completely
+	}
 	if config.OnOpen == "ignore" {
 		return api.PortsStatus_ignore
 	}
@@ -757,20 +766,21 @@ func (pm *Manager) Subscribe() (*Subscription, error) {
 	}
 
 	if len(pm.subscriptions) > maxSubscriptions {
-		return nil, ErrTooManySubscriptions
+		return nil, fmt.Errorf("too many subscriptions: %d", len(pm.subscriptions))
+		// return nil, ErrTooManySubscriptions
 	}
 
 	sub := &Subscription{updates: make(chan []*api.PortsStatus, 5)}
 	var once sync.Once
-	sub.Close = func() error {
-		pm.mu.Lock()
-		defer pm.mu.Unlock()
-
+	sub.Close = func(lock bool) error {
+		if lock {
+			pm.mu.Lock()
+			defer pm.mu.Unlock()
+		}
 		once.Do(func() {
 			close(sub.updates)
 		})
 		delete(pm.subscriptions, sub)
-
 		return nil
 	}
 	pm.subscriptions[sub] = struct{}{}
@@ -785,7 +795,12 @@ func (pm *Manager) Subscribe() (*Subscription, error) {
 func (pm *Manager) getStatus() []*api.PortsStatus {
 	res := make([]*api.PortsStatus, 0, len(pm.state))
 	for port := range pm.state {
-		res = append(res, pm.getPortStatus(port))
+		status := pm.getPortStatus(port)
+		// make sure they are not listed in ports list
+		if status.OnOpen == api.PortsStatus_ignore_completely {
+			continue
+		}
+		res = append(res, status)
 	}
 	sort.SliceStable(res, func(i, j int) bool {
 		// Max number of port 65536

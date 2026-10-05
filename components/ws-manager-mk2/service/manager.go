@@ -23,6 +23,7 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -53,7 +54,7 @@ import (
 const (
 	// stopWorkspaceNormallyGracePeriod is the grace period we use when stopping a pod with StopWorkspaceNormally policy
 	stopWorkspaceNormallyGracePeriod = 30 * time.Second
-	// stopWorkspaceImmediatelyGracePeriod is the grace period we use when stopping a pod as soon as possbile
+	// stopWorkspaceImmediatelyGracePeriod is the grace period we use when stopping a pod as soon as possible
 	stopWorkspaceImmediatelyGracePeriod = 1 * time.Second
 )
 
@@ -194,7 +195,7 @@ func (wsm *WorkspaceManagerServer) StartWorkspace(ctx context.Context, req *wsma
 	storage, err := class.Container.Limits.StorageQuantity()
 	if err != nil {
 		msg := fmt.Sprintf("workspace class %s has invalid storage quantity: %v", class.Name, err)
-		return nil, status.Errorf(codes.InvalidArgument, msg)
+		return nil, status.Errorf(codes.InvalidArgument, "%s", msg)
 	}
 
 	annotations := make(map[string]string)
@@ -689,7 +690,7 @@ func (wsm *WorkspaceManagerServer) TakeSnapshot(ctx context.Context, req *wsmana
 		}
 
 		if sso.Status.Error != "" {
-			return true, fmt.Errorf(sso.Status.Error)
+			return true, fmt.Errorf("%s", sso.Status.Error)
 		}
 
 		if sso.Status.URL != "" {
@@ -1105,6 +1106,21 @@ func (wsm *WorkspaceManagerServer) extractWorkspaceStatus(ws *workspacev1.Worksp
 		})
 	}
 
+	var metrics *wsmanapi.WorkspaceMetadata_Metrics
+	if ws.Status.ImageInfo != nil {
+		metrics = &wsmanapi.WorkspaceMetadata_Metrics{
+			Image: &wsmanapi.WorkspaceMetadata_ImageInfo{
+				TotalSize:          ws.Status.ImageInfo.TotalSize,
+				WorkspaceImageSize: ws.Status.ImageInfo.WorkspaceImageSize,
+			},
+		}
+	}
+
+	var initializerMetrics *wsmanapi.InitializerMetrics
+	if ws.Status.InitializerMetrics != nil {
+		initializerMetrics = mapInitializerMetrics(ws.Status.InitializerMetrics)
+	}
+
 	res := &wsmanapi.WorkspaceStatus{
 		Id:            ws.Name,
 		StatusVersion: version,
@@ -1113,6 +1129,7 @@ func (wsm *WorkspaceManagerServer) extractWorkspaceStatus(ws *workspacev1.Worksp
 			MetaId:      ws.Spec.Ownership.WorkspaceID,
 			StartedAt:   timestamppb.New(ws.CreationTimestamp.Time),
 			Annotations: ws.Annotations,
+			Metrics:     metrics,
 		},
 		Spec: &wsmanapi.WorkspaceSpec{
 			Class:          ws.Spec.Class,
@@ -1146,10 +1163,71 @@ func (wsm *WorkspaceManagerServer) extractWorkspaceStatus(ws *workspacev1.Worksp
 			Admission:  admissionLevel,
 			OwnerToken: ws.Status.OwnerToken,
 		},
-		Repo: convertGitStatus(ws.Status.GitStatus),
+		Repo:               convertGitStatus(ws.Status.GitStatus),
+		InitializerMetrics: initializerMetrics,
 	}
 
 	return res
+}
+
+func mapInitializerMetrics(in *workspacev1.InitializerMetrics) *wsmanapi.InitializerMetrics {
+	result := &wsmanapi.InitializerMetrics{}
+	// Convert Git metrics
+	if in.Git != nil {
+		result.Git = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.Git.Duration),
+			Size:     uint64(in.Git.Size),
+		}
+	}
+
+	// Convert FileDownload metrics
+	if in.FileDownload != nil {
+		result.FileDownload = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.FileDownload.Duration),
+			Size:     uint64(in.FileDownload.Size),
+		}
+	}
+
+	// Convert Snapshot metrics
+	if in.Snapshot != nil {
+		result.Snapshot = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.Snapshot.Duration),
+			Size:     uint64(in.Snapshot.Size),
+		}
+	}
+
+	// Convert Backup metrics
+	if in.Backup != nil {
+		result.Backup = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.Backup.Duration),
+			Size:     uint64(in.Backup.Size),
+		}
+	}
+
+	// Convert Prebuild metrics
+	if in.Prebuild != nil {
+		result.Prebuild = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.Prebuild.Duration),
+			Size:     uint64(in.Prebuild.Size),
+		}
+	}
+
+	// Convert Composite metrics
+	if in.Composite != nil {
+		result.Composite = &wsmanapi.InitializerMetric{
+			Duration: durationToProto(in.Composite.Duration),
+			Size:     uint64(in.Composite.Size),
+		}
+	}
+
+	return result
+}
+
+func durationToProto(d *metav1.Duration) *durationpb.Duration {
+	if d == nil {
+		return nil
+	}
+	return durationpb.New(d.Duration)
 }
 
 func getConditionMessageIfTrue(conds []metav1.Condition, tpe string) string {

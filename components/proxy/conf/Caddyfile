@@ -22,6 +22,7 @@
 
 	servers {
 		protocols h1 h2 h2c
+		metrics
 	}
 }
 
@@ -70,6 +71,16 @@
 	log {
 		output stdout
 		format jsonselect "{severity:level} {timestamp:ts} {logName:logger} {httpRequest>requestMethod:request>method} {httpRequest>protocol:request>proto} {httpRequest>status:status} {httpRequest>responseSize:size} {httpRequest>userAgent:request>headers>User-Agent>[0]} {httpRequest>requestUrl:request>uri} {httpRequest>requestHost:request>host} {cacheStatus:resp_headers>X-Cache-Status>[0]}" {
+			level_format "upper"
+			time_format "rfc3339_nano"
+		}
+	}
+}
+
+(enable_redirect_log) {
+	log {
+		output stdout
+		format if "status >= 300 && status < 400" jsonselect "{type:\"redirect\"} {severity:level} {timestamp:ts} {httpRequest>status:status} {httpRequest>requestUrl:request>uri} {httpRequest>requestHost:request>host} {redirectLocation:resp_headers>Location>[0]} {httpRequest>userAgent:request>headers>User-Agent>[0]}" {
 			level_format "upper"
 			time_format "rfc3339_nano"
 		}
@@ -142,6 +153,7 @@
 
 # TODO: refactor once we can listen only in localhost
 :9545 {
+
 	metrics /metrics {
 		disable_openmetrics
 	}
@@ -190,6 +202,7 @@ api.{$GITPOD_DOMAIN} {
 
 # always redirect to HTTPS
 http:// {
+	import enable_redirect_log
 	redir https://{host}{uri} permanent
 }
 
@@ -212,6 +225,7 @@ https://services.{$GITPOD_DOMAIN} {
 
 https://{$GITPOD_DOMAIN} {
 	import enable_log
+	import enable_redirect_log
 	import remove_server_header
 	import ssl_configuration
 	import security_headers
@@ -417,6 +431,7 @@ https://{$GITPOD_DOMAIN} {
 # workspaces
 https://*.*.{$GITPOD_DOMAIN} {
 	import enable_log
+	import enable_redirect_log
 	import workspace_security_headers
 	import remove_server_header
 	import ssl_configuration

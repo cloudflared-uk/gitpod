@@ -23,7 +23,6 @@ import (
 func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 	labels := common.CustomizeLabel(ctx, Component, common.TypeMetaDeployment)
 
-	//nolint:typecheck
 	configHash, err := common.ObjectHash(configmap(ctx))
 	if err != nil {
 		return nil, err
@@ -142,6 +141,8 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 				common.DefaultEnv(&ctx.Config),
 				common.WorkspaceTracingEnv(ctx, Component),
 				common.AnalyticsEnv(&ctx.Config),
+				// ws-proxy and proxy may not in the same cluster
+				common.ConfigcatEnvOutOfCluster(ctx),
 			)),
 			ReadinessProbe: &corev1.Probe{
 				InitialDelaySeconds: int32(2),
@@ -183,6 +184,7 @@ func deployment(ctx *common.RenderContext) ([]runtime.Object, error) {
 		},
 			*common.KubeRBACProxyContainer(ctx),
 		},
+		Tolerations: common.WithTolerationWorkspaceComponentNotReady(ctx),
 	}
 
 	return []runtime.Object{

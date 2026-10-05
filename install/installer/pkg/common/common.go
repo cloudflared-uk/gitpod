@@ -122,6 +122,11 @@ func DefaultEnv(cfg *config.Config) []corev1.EnvVar {
 			}},
 			{Name: "KUBE_DOMAIN", Value: "svc.cluster.local"},
 			{Name: "LOG_LEVEL", Value: strings.ToLower(logLevel)},
+			// TODO(gpl): This is our bandaid for https:://tldr.fail
+			// See these issues for details:
+			//  - https://linear.app/gitpod/issue/CLC-1264/investigate-public-api-server-connectivity-issues-during-sso-login#comment-f2daa302
+			//  - https://linear.app/gitpod/issue/CLC-1067/go-upgrade-from-123x-to-124x-once-available for details
+			{Name: "GODEBUG", Value: "tlsmlkem=0"},
 		},
 		ProxyEnv(cfg),
 	)
@@ -409,6 +414,19 @@ func ConfigcatEnv(ctx *RenderContext) []corev1.EnvVar {
 	}
 }
 
+func ConfigcatEnvOutOfCluster(ctx *RenderContext) []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{
+			Name:  "CONFIGCAT_SDK_KEY",
+			Value: "gitpod",
+		},
+		{
+			Name:  "CONFIGCAT_BASE_URL",
+			Value: fmt.Sprintf("https://%s/configcat", ctx.Config.Domain),
+		},
+	}
+}
+
 func ConfigcatProxyEnv(ctx *RenderContext) []corev1.EnvVar {
 	var (
 		sdkKey        string
@@ -532,10 +550,6 @@ func componentWaiterContainer(ctx *RenderContext, component, labels, image strin
 		Args: []string{
 			"-v",
 			"component",
-			"--gitpod-host",
-			ctx.Config.Domain,
-			"--ide-metrics-host",
-			ClusterURL("http", IDEProxyComponent, ctx.Namespace, IDEProxyPort),
 			"--namespace",
 			ctx.Namespace,
 			"--component",

@@ -48,26 +48,18 @@ on:
     - cron: "0 3,12 * * *"
 
 jobs:
-  create-runner:
-    uses: gitpod-io/gce-github-runner/.github/workflows/create-vm.yml@main
-    secrets:
-      runner_token: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_TOKEN }}
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-    with:
-      task: workspace-integration-tests
-
   configuration:
     name: Configuration
-    runs-on: ${{ needs.create-runner.outputs.label }}
-    needs: [create-runner]
+    runs-on: ubuntu-latest
     container:
-      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:pd-test-new-preview-gha.24525
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     outputs:
       name: ${{ steps.configuration.outputs.name }}
       version: ${{ steps.configuration.outputs.version }}
       image_repo_base: ${{ steps.configuration.outputs.image_repo_base }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: "Set outputs"
         id: configuration
         shell: bash
@@ -89,10 +81,10 @@ jobs:
                   echo "version=${{ inputs.version }}"
               } >> $GITHUB_OUTPUT
           else
-              # Search the last 10 builds regardless of status (success and failed)
-              RUNID=$(gh run list --repo gitpod-io/gitpod --branch main --workflow build.yml --limit 10 --json createdAt,conclusion,databaseId --jq 'map(select(.conclusion == "success")) | sort_by(.createdAt) | .[-1] | .databaseId')
+              # Search the last 10 completed builds (any conclusion except null/in-progress)
+              RUNID=$(gh run list --repo gitpod-io/gitpod --branch main --workflow build.yml --limit 10 --json createdAt,conclusion,databaseId --jq 'map(select(.conclusion != null)) | sort_by(.createdAt) | .[-1] | .databaseId')
               if [ "$RUNID" == "" ]; then
-                echo no successful build found on main branch in the last 10 commits, see https://github.com/gitpod-io/gitpod/actions/workflows/build.yml for details | tee -a $GITHUB_STEP_SUMMARY
+                echo no completed build found on main branch in the last 10 commits, see https://github.com/gitpod-io/gitpod/actions/workflows/build.yml for details | tee -a $GITHUB_STEP_SUMMARY
                 # if we got here, it means in the last 10 builds on main, there wasn't a success, and then we'll keep getting this message
                 # to fix, manually trigger the tests with the latest main-gha asset till we get a success
                 # you might have to fix or disable flakey tests to do this
@@ -102,8 +94,12 @@ jobs:
                 exit 1
               fi
 
+              echo "Using RUNID $RUNID" | tee -a $GITHUB_STEP_SUMMARY
+              MAIN_VERSION=$(gh run view "$RUNID" --log -R gitpod-io/gitpod | grep "leeway build --cache remote -Dversion=" | grep 'main-gha.[0-9]*' -o | head -n 1)
+              echo "Using version $MAIN_VERSION" | tee -a $GITHUB_STEP_SUMMARY
+
               {
-                  echo "version=$(gh run view "$RUNID" --log -R gitpod-io/gitpod | grep 'main-gha.[0-9]*' -o | head -n 1)"
+                  echo "version=$MAIN_VERSION"
               } >> $GITHUB_OUTPUT
           fi
           if [[ '${{ inputs.image_repo_base }}' != '' ]]; then
@@ -116,7 +112,7 @@ jobs:
               } >> $GITHUB_OUTPUT
           fi
       - name: Slack Notification
-        uses: rtCamp/action-slack-notify@v2
+        uses: rtCamp/action-slack-notify@cdf0a2130cbcdfd82ba5fcac8e076370bf381b36 # pin@v2
         if: failure()
         env:
           SLACK_WEBHOOK: ${{ secrets.WORKSPACE_SLACK_WEBHOOK }}
@@ -127,12 +123,15 @@ jobs:
           SLACK_FOOTER: "<https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|Workflow logs>"
 
   infrastructure:
-    needs: [configuration, create-runner]
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    needs: [configuration]
+    runs-on: ubuntu-latest
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     concurrency:
       group: ${{ needs.configuration.outputs.name }}-infrastructure
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Setup Environment
         uses: ./.github/actions/setup-environment
         with:
@@ -144,10 +143,8 @@ jobs:
         uses: ./.github/actions/preview-create
         with:
           name: ${{ needs.configuration.outputs.name }}
-          infrastructure_provider: gce
           large_vm: true
           preemptible: true
-          image_repo_base: ${{ needs.configuration.outputs.image_repo_base }}
       - name: Deploy Gitpod to the preview environment
         if: inputs.skip_deploy != 'true'
         id: deploy-gitpod
@@ -159,12 +156,13 @@ jobs:
 
   check:
     name: Check for regressions
-    needs: [configuration, infrastructure, create-runner]
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    needs: [configuration, infrastructure]
+    runs-on: ubuntu-latest
     container:
-      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:pd-test-new-preview-gha.24525
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Integration Test
         id: integration-test
         uses: ./.github/actions/integration-tests
@@ -176,16 +174,17 @@ jobs:
           identity_provider: ${{ secrets.DEV_PREVIEW_PROVIDER }}
           service_account: ${{ secrets.DEV_PREVIEW_SA }}
           leeway_segment_key: ${{ secrets.LEEWAY_SEGMENT_KEY }}
-          integration_test_username: ${{ secrets.WORKSPACE_INTEGRATION_TEST_USERNAME }}
-          integration_test_usertoken: ${{ secrets.WORKSPACE_INTEGRATION_TEST_USER_TOKEN }}
 
   delete:
     name: Delete preview environment
-    needs: [configuration, infrastructure, check, create-runner]
+    needs: [configuration, infrastructure, check]
     if: inputs.skip_delete != 'true' && always()
-    runs-on: ${{ needs.create-runner.outputs.label }}
+    runs-on: ubuntu-latest
+    container:
+      image: eu.gcr.io/gitpod-core-dev/dev/dev-environment:main-gha.34488
+      options: --user root
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # pin@v4
       - name: Setup Environment
         uses: ./.github/actions/setup-environment
         with:
@@ -196,18 +195,3 @@ jobs:
         uses: ./.github/actions/delete-preview
         with:
           name: ${{ needs.configuration.outputs.name }}
-
-  delete-runner:
-    if: always()
-    needs:
-      - create-runner
-      - configuration
-      - infrastructure
-      - check
-      - delete
-    uses: gitpod-io/gce-github-runner/.github/workflows/delete-vm.yml@main
-    secrets:
-      gcp_credentials: ${{ secrets.SELF_HOSTED_GITHUB_RUNNER_GCP_CREDENTIALS }}
-    with:
-      runner-label: ${{ needs.create-runner.outputs.label }}
-      machine-zone: ${{ needs.create-runner.outputs.machine-zone }}

@@ -7,74 +7,76 @@
 import { getPrimaryEmail } from "@gitpod/public-api-common/lib/user-utils";
 import { useQuery } from "@tanstack/react-query";
 import { getExperimentsClient } from "../experiments/client";
-import { useCurrentProject } from "../projects/project-context";
 import { useCurrentUser } from "../user-context";
 import { useCurrentOrg } from "./organizations/orgs-query";
+import { ClassicPaygSunsetConfig } from "@gitpod/gitpod-protocol/lib/experiments/configcat";
+
+const defaultClassicPaygSunsetConfig: ClassicPaygSunsetConfig = { enabled: false, exemptedOrganizations: [] };
 
 const featureFlags = {
-    personalAccessTokensEnabled: false,
     oidcServiceEnabled: false,
     // Default to true to enable on gitpod dedicated until ff support is added for dedicated
     orgGitAuthProviders: true,
     userGitAuthProviders: false,
-    linkedinConnectionForOnboarding: false,
-    enableDedicatedOnboardingFlow: false,
-    phoneVerificationByCall: false,
-    doRetryUserLoader: true,
     // Local SSH feature of VS Code Desktop Extension
     gitpod_desktop_use_local_ssh_proxy: false,
     enabledOrbitalDiscoveries: "",
-    newProjectIncrementalRepoSearchBBS: false,
-    repositoryFinderSearch: false,
-    createProjectModal: false,
-    configurationsAndPrebuilds: false,
-    showPrebuildsMenuItem: false,
-    // Whether to enable workspace class restrictions for configurations
-    configuration_workspace_class_restrictions: false,
-    org_level_editor_restriction_enabled: false,
-    org_level_editor_version_pinning_enabled: false,
     // dummy specified dataops feature, default false
     dataops: false,
-    // Logging tracing for added for investigate hanging issue
-    dashboard_logging_tracing: false,
+    enable_multi_org: false,
     showBrowserExtensionPromotion: false,
-    usage_update_scheduler_duration: "15m",
+    enable_experimental_jbtb: false,
+    enabled_configuration_prebuild_full_clone: false,
+    enterprise_onboarding_enabled: false,
+    commit_annotation_setting_enabled: false,
+    classic_payg_sunset_enabled: defaultClassicPaygSunsetConfig,
 };
 
 type FeatureFlags = typeof featureFlags;
 
+// Helper to parse JSON feature flags
+function parseFeatureFlagValue<T>(flagName: string, rawValue: any, defaultValue: T): T {
+    // Special handling for JSON-based feature flags
+    if (flagName === "classic_payg_sunset_enabled") {
+        try {
+            if (typeof rawValue === "string") {
+                return JSON.parse(rawValue) as T;
+            }
+            // If it's already an object, return as-is
+            if (typeof rawValue === "object" && rawValue !== null) {
+                return rawValue as T;
+            }
+        } catch (error) {
+            console.error(`Failed to parse feature flag ${flagName}:`, error);
+            return defaultValue;
+        }
+    }
+    return rawValue;
+}
+
 export const useFeatureFlag = <K extends keyof FeatureFlags>(featureFlag: K): FeatureFlags[K] | boolean => {
     const user = useCurrentUser();
     const org = useCurrentOrg().data;
-    const project = useCurrentProject().project;
 
-    const queryKey = ["featureFlag", featureFlag, user?.id || "", org?.id || "", project?.id || ""];
+    const queryKey = ["featureFlag", featureFlag, user?.id || "", org?.id || ""];
 
     const query = useQuery(queryKey, async () => {
-        const flagValue = await getExperimentsClient().getValueAsync(featureFlag, featureFlags[featureFlag], {
+        const defaultValue = featureFlags[featureFlag];
+        // For JSON flags, send stringified default to ConfigCat
+        const configCatDefault =
+            featureFlag === "classic_payg_sunset_enabled" ? JSON.stringify(defaultValue) : defaultValue;
+
+        const rawValue = await getExperimentsClient().getValueAsync(featureFlag, configCatDefault, {
             user: user && {
                 id: user.id,
                 email: getPrimaryEmail(user),
             },
-            projectId: project?.id,
             teamId: org?.id,
             teamName: org?.name,
             gitpodHost: window.location.host,
         });
-        return flagValue;
-    });
 
-    return query.data !== undefined ? query.data : featureFlags[featureFlag];
-};
-
-export const useDedicatedFeatureFlag = <K extends keyof FeatureFlags>(featureFlag: K): FeatureFlags[K] | boolean => {
-    const queryKey = ["dedicatedFeatureFlag", featureFlag];
-
-    const query = useQuery(queryKey, async () => {
-        const flagValue = await getExperimentsClient().getValueAsync(featureFlag, featureFlags[featureFlag], {
-            gitpodHost: window.location.host,
-        });
-        return flagValue;
+        return parseFeatureFlagValue(featureFlag, rawValue, defaultValue);
     });
 
     return query.data !== undefined ? query.data : featureFlags[featureFlag];
@@ -82,36 +84,4 @@ export const useDedicatedFeatureFlag = <K extends keyof FeatureFlags>(featureFla
 
 export const useIsDataOps = () => {
     return useFeatureFlag("dataops");
-};
-
-export const useHasConfigurationsAndPrebuildsEnabled = () => {
-    return useFeatureFlag("configurationsAndPrebuilds");
-};
-
-export const useReportDashboardLoggingTracing = () => {
-    const enabled = useDedicatedFeatureFlag("dashboard_logging_tracing");
-
-    if (!enabled) {
-        return async <T>(fn: () => Promise<T>, _msg: string, _meta?: Record<string, any>) => {
-            return await fn();
-        };
-    }
-    return async <T>(fn: () => Promise<T>, msg: string, meta?: Record<string, any>) => {
-        try {
-            const result = await fn();
-            console.error("[dashboard_tracing] " + msg, {
-                ...meta,
-                time: performance.now(),
-            });
-            return result;
-        } catch (err) {
-            console.error("[dashboard_tracing] " + msg, {
-                ...meta,
-                err: err.toString(),
-                errorCode: (err as any)?.code,
-                time: performance.now(),
-            });
-            throw err;
-        }
-    };
 };
