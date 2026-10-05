@@ -1,0 +1,7 @@
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: ":warning: Hey reviewer! BE CAREFUL :warning:\nReview the code before opening in your Gitpod. `.gitpod.yml` was changed and it might be harmful."
+            })
